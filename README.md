@@ -1,4 +1,4 @@
-# Yu-Gi-Oh! Deck Builder
+# YGODBR
 
 一个基于 **GTK4** 和 **libadwaita** 的桌面端游戏王卡组编辑器。
 
@@ -18,24 +18,23 @@
 - sqlite3
 
 ## 构建与运行
+简单运行方法如下：
+
 1. 安装依赖（以 Debian/Ubuntu 为例）：
 	```bash
 	sudo apt install libgtk-4-dev libadwaita-1-dev libjson-glib-dev libsoup-3.0-dev libgdk-pixbuf-2.0-dev libarchive-dev libsqlite3-dev meson ninja-build
 	```
-2. 初始化构建目录：
-	```bash
+2. 	```bash
 	meson setup build
 	```
-3. 编译项目：
-	```bash
+3. 	```bash
 	meson compile -C build
 	```
-4. 运行程序：
-	```bash
+4. 	```bash
 	./build/src/ygo-deck-builder
 	```
 
-详细的安装说明（包括系统级安装和便携模式）请参见 [INSTALL.md](INSTALL.md)。
+安装方法（包括系统级安装和便携模式）参见 [INSTALL.md](INSTALL.md)。
 
 ## 使用说明
 - 启动后可通过搜索栏检索卡片并自由编辑自己的卡组，支持类似 YGOPro 的点击和拖拽互动
