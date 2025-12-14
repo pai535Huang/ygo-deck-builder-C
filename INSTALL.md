@@ -58,12 +58,6 @@ sudo meson install -C builddir
   - 先行卡：`~/.local/share/ygo-deck-builder/pre-release/`
 - **图片缓存**：`~/.cache/ygo-deck-builder/images/`
 
-**优点：**
-- 符合 Linux 文件系统标准
-- 支持多用户，每个用户有独立的配置和数据
-- 可以从任何位置运行程序
-- 遵循 XDG Base Directory 规范
-
 **卸载：**
 ```bash
 # 删除程序文件
