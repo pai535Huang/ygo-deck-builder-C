@@ -5,6 +5,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include "app_path.h"
 
 #define OCG_FORBIDDEN_URL "https://www.db.yugioh-card.com/yugiohdb/forbidden_limited.action?request_locale=ja"
 #define TCG_FORBIDDEN_URL "https://www.db.yugioh-card.com/yugiohdb/forbidden_limited.action?request_locale=en"
@@ -20,13 +21,15 @@
  * 返回值需要调用者使用 g_free() 释放
  */
 static gchar *get_config_data_dir(void) {
-    const gchar *config_dir = g_get_user_config_dir();
-    if (!config_dir) {
-        g_warning("Unable to get user config directory");
-        return NULL;
+    if (is_portable_mode()) {
+        // 便携模式
+        const char *prog_dir = get_program_directory();
+        return g_build_filename(prog_dir, "data", NULL);
+    } else {
+        // 系统安装模式：使用 XDG_DATA_HOME
+        const char *data_home = g_get_user_data_dir();
+        return g_build_filename(data_home, "ygo-deck-builder", NULL);
     }
-    
-    return g_build_filename(config_dir, "ygo-deck-builder", "data", NULL);
 }
 
 /**

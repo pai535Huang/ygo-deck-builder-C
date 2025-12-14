@@ -1,4 +1,5 @@
 #include "offline_data.h"
+#include "app_path.h"
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
 #include <archive.h>
@@ -15,29 +16,33 @@
 #define CARDS_DIR_NAME "cards"
 
 /**
- * 获取离线数据目录的绝对路径 (~/.config/ygo-deck-builder/data)
+ * 获取离线数据目录的绝对路径
  */
 static gchar *get_offline_data_dir(void) {
-    const gchar *config_dir = g_get_user_config_dir();
-    if (!config_dir) {
-        g_warning("Unable to get user config directory");
-        return NULL;
+    if (is_portable_mode()) {
+        // 便携模式
+        const char *prog_dir = get_program_directory();
+        return g_build_filename(prog_dir, "data", NULL);
+    } else {
+        // 系统安装模式：使用 XDG_DATA_HOME
+        const char *data_home = g_get_user_data_dir();
+        return g_build_filename(data_home, "ygo-deck-builder", NULL);
     }
-    
-    return g_build_filename(config_dir, "ygo-deck-builder", "data", NULL);
 }
 
 /**
- * 获取 cards 目录的绝对路径 (~/.config/ygo-deck-builder/data/cards)
+ * 获取 cards 目录的绝对路径
  */
 static gchar *get_cards_dir(void) {
-    const gchar *config_dir = g_get_user_config_dir();
-    if (!config_dir) {
-        g_warning("Unable to get user config directory");
-        return NULL;
+    if (is_portable_mode()) {
+        // 便携模式
+        const char *prog_dir = get_program_directory();
+        return g_build_filename(prog_dir, "data", CARDS_DIR_NAME, NULL);
+    } else {
+        // 系统安装模式：使用 XDG_DATA_HOME
+        const char *data_home = g_get_user_data_dir();
+        return g_build_filename(data_home, "ygo-deck-builder", CARDS_DIR_NAME, NULL);
     }
-    
-    return g_build_filename(config_dir, "ygo-deck-builder", "data", CARDS_DIR_NAME, NULL);
 }
 
 /**

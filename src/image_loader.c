@@ -1,4 +1,5 @@
 #include "image_loader.h"
+#include "app_path.h"
 #include <gdk-pixbuf/gdk-pixbuf.h>
 
 // 全局缓存变量
@@ -44,8 +45,15 @@ void init_image_cache(void) {
     download_queue = g_queue_new();
     
     // 创建缓存目录
-    const char *user_cache = g_get_user_cache_dir();
-    cache_dir = g_build_filename(user_cache, "ygo-deck-builder", "images", NULL);
+    if (is_portable_mode()) {
+        // 便携模式：程序所在目录下的 img 子目录
+        const char *prog_dir = get_program_directory();
+        cache_dir = g_build_filename(prog_dir, "img", NULL);
+    } else {
+        // 系统安装模式：使用 XDG_CACHE_HOME
+        const char *cache_home = g_get_user_cache_dir();
+        cache_dir = g_build_filename(cache_home, "ygo-deck-builder", "images", NULL);
+    }
     g_mkdir_with_parents(cache_dir, 0755);
 }
 

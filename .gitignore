@@ -22,3 +22,6 @@ Thumbs.db
 # Meson specific
 meson-private/
 meson-logs/
+
+# Development desktop file (local only)
+*.dev.desktop

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=YGODBR
+Comment=Yu-Gi-Oh! Deck Builder
+Icon=com.pai535.YGODeckBuilder
+Exec=@BINDIR@/ygo-deck-builder
+Terminal=false
+Categories=Game;CardGame;
+Keywords=yugioh;ygo;deck;cards;

@@ -8,7 +8,7 @@
  * 下载并处理离线卡片数据
  * 此函数会在后台线程中执行，不会阻塞主线程
  * 从 https://ygocdb.com/api/v0/cards.zip 下载数据
- * 保存到 ~/.config/ygo-deck-builder/data 目录
+ * 保存到程序根目录下的 data 目录
  * 解压到根目录的 cards 目录
  * @param callback 完成后的回调函数，在主线程中调用
  * @param user_data 传递给回调函数的用户数据

@@ -35,6 +35,8 @@
 	./build/src/ygo-deck-builder
 	```
 
+详细的安装说明（包括系统级安装和便携模式）请参见 [INSTALL.md](INSTALL.md)。
+
 ## 使用说明
 - 启动后可通过搜索栏检索卡片并自由编辑自己的卡组，支持类似 YGOPro 的点击和拖拽互动
 - 通过顶部菜单栏进行各种操作
@@ -48,3 +50,6 @@
 - ~~利用 YGO-DA 协议（https://www.zybuluo.com/feihuaduo/note/1824534）将编辑好的卡组导出为分享 URL 或从其他人分享的 URL 直接加载卡组~~
 - 修复一些已知 bug
 - 进一步优化性能
+
+## 许可证
+本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。

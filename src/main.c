@@ -1,3 +1,28 @@
+/*
+ * YGO Deck Builder
+ * Copyright (c) 2025 pai535Huang
+ * 
+ * SPDX-License-Identifier: MIT
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+
 #include <adwaita.h>
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
@@ -19,6 +44,11 @@
 #include "dnd_manager.h"
 #include "search_filter.h"
 #include "deck_url.h"
+
+// 全局变量：程序所在目录
+static char *program_directory = NULL;
+// 全局变量：是否为便携模式（数据文件在程序目录下）
+static gboolean portable_mode = FALSE;
 
 // 全局变量：缓存最后导出和导入的目录
 static char *last_export_directory = NULL;
@@ -93,21 +123,37 @@ gboolean has_active_filter(void) {
 }
 
 // 配置文件路径
-#define CONFIG_DIR ".config/ygo-deck-builder"
 #define CONFIG_FILE "settings.conf"
+
+/**
+ * 获取程序所在目录
+ * 返回值不需要释放，是全局变量
+ */
+const char* get_program_directory(void) {
+    return program_directory;
+}
+
+/**
+ * 检查是否为便携模式
+ * 如果程序目录下存在 .portable 文件，则使用便携模式
+ */
+gboolean is_portable_mode(void) {
+    return portable_mode;
+}
 
 /**
  * 获取禁限卡表文件的完整路径
  * 返回值需要调用者使用 g_free() 释放
  */
 static gchar *get_forbidden_list_path(const char *filename) {
-    const gchar *config_dir = g_get_user_config_dir();
-    if (!config_dir) {
-        g_warning("Unable to get user config directory");
-        return NULL;
+    if (portable_mode) {
+        // 便携模式：使用程序目录
+        return g_build_filename(program_directory, "data", filename, NULL);
+    } else {
+        // 系统安装模式：使用 XDG_DATA_HOME
+        const char *data_home = g_get_user_data_dir();
+        return g_build_filename(data_home, "ygo-deck-builder", filename, NULL);
     }
-    
-    return g_build_filename(config_dir, "ygo-deck-builder", "data", filename, NULL);
 }
 
 // 通过 DnD 传递简单字符串 payload，例如 "main:12"
@@ -2513,7 +2559,7 @@ on_activate(GApplication *app, gpointer user_data)
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
     g_object_unref(provider);
 
-    gtk_window_set_title(GTK_WINDOW(win), "Yu-Gi-Oh! Deck Builder");
+    gtk_window_set_title(GTK_WINDOW(win), "YGODBR");
     gtk_window_set_default_size(GTK_WINDOW(win), 1200, 800);
 
     AdwHeaderBar *header = ADW_HEADER_BAR(adw_header_bar_new());
@@ -3138,6 +3184,30 @@ on_activate(GApplication *app, gpointer user_data)
 int
 main(int argc, char *argv[])
 {
+    // 获取程序所在目录
+    if (argc > 0 && argv[0]) {
+        char *exe_path = g_find_program_in_path(argv[0]);
+        if (!exe_path) {
+            exe_path = g_strdup(argv[0]);
+        }
+        program_directory = g_path_get_dirname(exe_path);
+        g_free(exe_path);
+    }
+    if (!program_directory) {
+        program_directory = g_get_current_dir();
+    }
+    
+    // 检测便携模式：如果程序目录下存在 .portable 文件
+    gchar *portable_marker = g_build_filename(program_directory, ".portable", NULL);
+    portable_mode = g_file_test(portable_marker, G_FILE_TEST_EXISTS);
+    g_free(portable_marker);
+    
+    if (portable_mode) {
+        g_message("Running in portable mode (data in program directory)");
+    } else {
+        g_message("Running in system install mode (using XDG directories)");
+    }
+    
     g_autoptr(AdwApplication) app = adw_application_new(
         "com.pai535.YGODeckBuilder", G_APPLICATION_DEFAULT_FLAGS);
 

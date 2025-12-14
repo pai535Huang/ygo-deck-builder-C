@@ -4,11 +4,11 @@
 #include "image_loader.h"
 #include "prerelease.h"
 #include "offline_data.h"
+#include "app_path.h"
 #include <stdio.h>
 #include <string.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
 
-#define CONFIG_DIR ".config/ygo-deck-builder"
 #define CONFIG_FILE "settings.conf"
 
 // 导出卡组为YDK文件
@@ -239,10 +239,21 @@ gboolean import_deck_from_ydk(
 
 // 加载导入导出目录配置
 void load_io_config(char **last_export_dir, char **last_import_dir) {
-    const char *home = g_get_home_dir();
-    if (!home) return;
+    char *config_path;
     
-    char *config_path = g_build_filename(home, CONFIG_DIR, CONFIG_FILE, NULL);
+    if (is_portable_mode()) {
+        // 便携模式
+        const char *prog_dir = get_program_directory();
+        config_path = g_build_filename(prog_dir, CONFIG_FILE, NULL);
+    } else {
+        // 系统安装模式：使用 XDG_CONFIG_HOME
+        const char *config_home = g_get_user_config_dir();
+        config_path = g_build_filename(config_home, "ygo-deck-builder", CONFIG_FILE, NULL);
+        // 确保配置目录存在
+        char *config_dir = g_path_get_dirname(config_path);
+        g_mkdir_with_parents(config_dir, 0755);
+        g_free(config_dir);
+    }
     
     GKeyFile *keyfile = g_key_file_new();
     GError *error = NULL;
@@ -283,15 +294,21 @@ void load_io_config(char **last_export_dir, char **last_import_dir) {
 
 // 保存导入导出目录配置
 void save_io_config(const char *last_export_dir, const char *last_import_dir) {
-    const char *home = g_get_home_dir();
-    if (!home) return;
+    char *config_path;
     
-    char *config_dir_path = g_build_filename(home, CONFIG_DIR, NULL);
-    
-    // 确保配置目录存在
-    g_mkdir_with_parents(config_dir_path, 0755);
-    
-    char *config_path = g_build_filename(config_dir_path, CONFIG_FILE, NULL);
+    if (is_portable_mode()) {
+        // 便携模式
+        const char *prog_dir = get_program_directory();
+        config_path = g_build_filename(prog_dir, CONFIG_FILE, NULL);
+    } else {
+        // 系统安装模式：使用 XDG_CONFIG_HOME
+        const char *config_home = g_get_user_config_dir();
+        config_path = g_build_filename(config_home, "ygo-deck-builder", CONFIG_FILE, NULL);
+        // 确保配置目录存在
+        char *config_dir = g_path_get_dirname(config_path);
+        g_mkdir_with_parents(config_dir, 0755);
+        g_free(config_dir);
+    }
     
     GKeyFile *keyfile = g_key_file_new();
     
@@ -315,15 +332,21 @@ void save_io_config(const char *last_export_dir, const char *last_import_dir) {
     
     g_key_file_free(keyfile);
     g_free(config_path);
-    g_free(config_dir_path);
 }
 
 // 加载离线数据开关状态
 gboolean load_offline_data_switch_state(void) {
-    const char *home = g_get_home_dir();
-    if (!home) return FALSE;
+    char *config_path;
     
-    char *config_path = g_build_filename(home, CONFIG_DIR, CONFIG_FILE, NULL);
+    if (is_portable_mode()) {
+        // 便携模式
+        const char *prog_dir = get_program_directory();
+        config_path = g_build_filename(prog_dir, CONFIG_FILE, NULL);
+    } else {
+        // 系统安装模式
+        const char *config_home = g_get_user_config_dir();
+        config_path = g_build_filename(config_home, "ygo-deck-builder", CONFIG_FILE, NULL);
+    }
     
     GKeyFile *keyfile = g_key_file_new();
     GError *error = NULL;
@@ -343,15 +366,21 @@ gboolean load_offline_data_switch_state(void) {
 
 // 保存离线数据开关状态
 void save_offline_data_switch_state(gboolean enabled) {
-    const char *home = g_get_home_dir();
-    if (!home) return;
+    char *config_path;
     
-    char *config_dir_path = g_build_filename(home, CONFIG_DIR, NULL);
-    
-    // 确保配置目录存在
-    g_mkdir_with_parents(config_dir_path, 0755);
-    
-    char *config_path = g_build_filename(config_dir_path, CONFIG_FILE, NULL);
+    if (is_portable_mode()) {
+        // 便携模式
+        const char *prog_dir = get_program_directory();
+        config_path = g_build_filename(prog_dir, CONFIG_FILE, NULL);
+    } else {
+        // 系统安装模式
+        const char *config_home = g_get_user_config_dir();
+        config_path = g_build_filename(config_home, "ygo-deck-builder", CONFIG_FILE, NULL);
+        // 确保配置目录存在
+        char *config_dir = g_path_get_dirname(config_path);
+        g_mkdir_with_parents(config_dir, 0755);
+        g_free(config_dir);
+    }
     
     GKeyFile *keyfile = g_key_file_new();
     
@@ -370,5 +399,4 @@ void save_offline_data_switch_state(gboolean enabled) {
     
     g_key_file_free(keyfile);
     g_free(config_path);
-    g_free(config_dir_path);
 }
