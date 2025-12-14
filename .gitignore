@@ -1,0 +1,24 @@
+# Build directory and all compiled artifacts
+build/
+
+# Compiled binaries and object files
+*.o
+*.a
+*.so
+*.exe
+*.out
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# Meson specific
+meson-private/
+meson-logs/
