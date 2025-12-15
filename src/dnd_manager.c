@@ -15,9 +15,24 @@ extern void array_shift_right(GPtrArray *arr, int start, int end);
 GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, double y, gpointer user_data) {
     (void)x; (void)y; (void)user_data;
     GtkWidget *pic = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(source));
+    
+    // 安全性检查：确保控件仍然有效
+    if (!pic) return NULL;
+    
     // 判断是否为右栏行拖拽
     const char *drag_kind = (const char*)g_object_get_data(G_OBJECT(pic), "drag_kind");
     if (drag_kind && g_strcmp0(drag_kind, "search_row") == 0) {
+        // 对于搜索结果行，检查是否仍在列表中
+        if (!GTK_IS_LIST_BOX_ROW(pic)) return NULL;
+        
+        // 检查是否被标记为无效
+        if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "row_invalid"))) {
+            return NULL;
+        }
+        
+        GtkWidget *parent = gtk_widget_get_parent(pic);
+        if (!parent || !GTK_IS_LIST_BOX(parent)) return NULL;
+        
         CardPreview *pv = (CardPreview*)g_object_get_data(G_OBJECT(pic), "preview");
         if (!pv || pv->id <= 0) return NULL;
         gboolean is_monster = FALSE, is_extra_type = FALSE;
@@ -45,10 +60,24 @@ GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, double y, g
 void on_drag_begin(GtkDragSource *source, GdkDrag *drag, gpointer user_data) {
     (void)user_data; (void)drag;
     GtkWidget *pic = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(source));
+    
+    // 安全性检查：确保控件仍然有效
+    if (!pic) return;
+    
     // 若为右栏行，使用行内图片作为预览（若存在）
     const char *drag_kind = (const char*)g_object_get_data(G_OBJECT(pic), "drag_kind");
     GdkPixbuf *pb = NULL;
     if (drag_kind && g_strcmp0(drag_kind, "search_row") == 0) {
+        // 对于搜索结果行，检查是否仍在列表中
+        if (!GTK_IS_LIST_BOX_ROW(pic)) return;
+        
+        // 检查是否被标记为无效
+        if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "row_invalid"))) {
+            return;
+        }
+        
+        GtkWidget *parent = gtk_widget_get_parent(pic);
+        if (!parent || !GTK_IS_LIST_BOX(parent)) return;
         GtkWidget *row_child = gtk_list_box_row_get_child(GTK_LIST_BOX_ROW(pic));
         if (row_child) {
             GtkWidget *hbox = row_child;

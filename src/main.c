@@ -1977,6 +1977,17 @@ static void show_card_preview(SearchUI *ui, const CardPreview *pv) {
 void on_result_row_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
     (void)n_press; (void)user_data;
     GtkWidget *row = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture));
+    
+    // 安全性检查：确保 row 仍然有效
+    if (!row || !GTK_IS_LIST_BOX_ROW(row)) {
+        return;
+    }
+    
+    // 检查是否被标记为无效（在 list_clear 之前）
+    if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "row_invalid"))) {
+        return;
+    }
+    
     double *press_xy = g_new(double, 2);
     press_xy[0] = x;
     press_xy[1] = y;
@@ -1988,6 +1999,23 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
     (void)n_press;
     SearchUI *ui = (SearchUI*)user_data;
     GtkWidget *row = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture));
+    
+    // 安全性检查：确保 row 仍然有效且是 ListBoxRow
+    if (!row || !GTK_IS_LIST_BOX_ROW(row)) {
+        return;
+    }
+    
+    // 检查是否被标记为无效（在 list_clear 之前）
+    if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "row_invalid"))) {
+        return;
+    }
+    
+    // 检查 row 是否仍在列表中（防止在 list_clear 后访问）
+    GtkWidget *parent = gtk_widget_get_parent(row);
+    if (!parent || !GTK_IS_LIST_BOX(parent)) {
+        return;
+    }
+    
     double *press_xy = (double*)g_object_get_data(G_OBJECT(row), "press_xy");
     if (press_xy) {
         double dx = fabs(x - press_xy[0]);
@@ -2155,6 +2183,23 @@ void on_result_row_enter(GtkEventControllerMotion *controller, double x, double 
     (void)x; (void)y;
     SearchUI *ui = (SearchUI*)user_data;
     GtkWidget *row = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(controller));
+    
+    // 安全性检查：确保 row 仍然有效且是 ListBoxRow
+    if (!row || !GTK_IS_LIST_BOX_ROW(row)) {
+        return;
+    }
+    
+    // 检查是否被标记为无效（在 list_clear 之前）
+    if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(row), "row_invalid"))) {
+        return;
+    }
+    
+    // 检查 row 是否仍在列表中（防止在 list_clear 后访问）
+    GtkWidget *parent = gtk_widget_get_parent(row);
+    if (!parent || !GTK_IS_LIST_BOX(parent)) {
+        return;
+    }
+    
     CardPreview *pv = (CardPreview*)g_object_get_data(G_OBJECT(row), "preview");
     if (pv) show_card_preview(ui, pv);
 }

@@ -562,6 +562,16 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
     // 取消所有未完成的下载任务（通过递增代次）
     cancel_all_pending();
     
+    // 在清空UI列表之前，标记所有现有行为"无效"
+    // 这样即使有待处理的事件回调，它们也会检测到标记并跳过处理
+    GtkWidget *list_child = gtk_widget_get_first_child(ui->list);
+    while (list_child) {
+        if (GTK_IS_LIST_BOX_ROW(list_child)) {
+            g_object_set_data(G_OBJECT(list_child), "row_invalid", GINT_TO_POINTER(1));
+        }
+        list_child = gtk_widget_get_next_sibling(list_child);
+    }
+    
     // 最后清空UI列表（这会销毁widget并触发弱引用清理）
     list_clear(GTK_LIST_BOX(ui->list));
 
