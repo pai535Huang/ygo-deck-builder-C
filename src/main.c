@@ -71,7 +71,8 @@ static FilterState filter_state = {
     .def_text = NULL,
     .level_text = NULL,
     .left_scale_text = NULL,
-    .right_scale_text = NULL
+    .right_scale_text = NULL,
+    .field_text = NULL
 };
 
 // 获取当前筛选状态的指针（供search_filter.c使用）
@@ -115,7 +116,8 @@ gboolean has_active_filter(void) {
         (filter_state.def_text && filter_state.def_text[0] != '\0') ||
         (filter_state.level_text && filter_state.level_text[0] != '\0') ||
         (filter_state.left_scale_text && filter_state.left_scale_text[0] != '\0') ||
-        (filter_state.right_scale_text && filter_state.right_scale_text[0] != '\0')) {
+        (filter_state.right_scale_text && filter_state.right_scale_text[0] != '\0') ||
+        (filter_state.field_text && filter_state.field_text[0] != '\0')) {
         return TRUE;
     }
     
@@ -656,12 +658,14 @@ static void reset_filter_state(void) {
     g_free(filter_state.level_text);
     g_free(filter_state.left_scale_text);
     g_free(filter_state.right_scale_text);
+    g_free(filter_state.field_text);
     
     filter_state.atk_text = NULL;
     filter_state.def_text = NULL;
     filter_state.level_text = NULL;
     filter_state.left_scale_text = NULL;
     filter_state.right_scale_text = NULL;
+    filter_state.field_text = NULL;
 }
 
 // "恢复默认"按钮回调：重置筛选状态并更新UI控件
@@ -757,6 +761,12 @@ static void on_reset_filter_clicked(GtkButton *button, gpointer user_data) {
             }
             child = gtk_widget_get_next_sibling(child);
         }
+    }
+    
+    // 13. 卡片字段输入框
+    AdwEntryRow *field_row = g_object_get_data(G_OBJECT(dialog), "field_row");
+    if (field_row) {
+        gtk_editable_set_text(GTK_EDITABLE(field_row), "");
     }
 }
 
@@ -857,12 +867,17 @@ static void on_filter_dialog_closed(AdwDialog *dialog, gpointer user_data) {
     g_free(filter_state.level_text);
     g_free(filter_state.left_scale_text);
     g_free(filter_state.right_scale_text);
+    g_free(filter_state.field_text);
     
     filter_state.atk_text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(atk_row)));
     filter_state.def_text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(def_row)));
     filter_state.level_text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(level_row)));
     filter_state.left_scale_text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(left_scale_entry)));
     filter_state.right_scale_text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(right_scale_entry)));
+    
+    // 保存卡片字段文本
+    AdwEntryRow *field_row = g_object_get_data(G_OBJECT(dialog), "field_row");
+    filter_state.field_text = field_row ? g_strdup(gtk_editable_get_text(GTK_EDITABLE(field_row))) : NULL;
 }
 
 // 筛选按钮回调：打开筛选选项对话框
@@ -885,7 +900,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     adw_dialog_set_title(dialog, "筛选选项");
     
     // 设置对话框内容高度
-    adw_dialog_set_content_height(dialog, 600);
+    adw_dialog_set_content_height(dialog, 800);
     
     // 创建 PreferencesPage
     AdwPreferencesPage *page = ADW_PREFERENCES_PAGE(adw_preferences_page_new());
@@ -908,6 +923,21 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     adw_preferences_group_add(reset_group, reset_button);
     
     adw_preferences_page_add(page, reset_group);
+    
+    // === 卡片字段组 ===
+    AdwPreferencesGroup *field_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+    adw_preferences_group_set_title(field_group, "卡片字段");
+    
+    // 卡片字段输入行
+    AdwEntryRow *field_row = ADW_ENTRY_ROW(adw_entry_row_new());
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(field_row), "字段");
+    gtk_editable_set_text(GTK_EDITABLE(field_row), filter_state.field_text ? filter_state.field_text : "");  // 恢复状态
+    adw_preferences_group_add(field_group, GTK_WIDGET(field_row));
+    
+    // 保存引用
+    g_object_set_data(G_OBJECT(dialog), "field_row", field_row);
+    
+    adw_preferences_page_add(page, field_group);
     
     // === 卡片类型组（顶层）===
     AdwPreferencesGroup *type_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());

@@ -46,6 +46,7 @@ typedef struct {
     gchar *level_text;  // 等级文本
     gchar *left_scale_text;  // 左刻度文本
     gchar *right_scale_text;  // 右刻度文本
+    gchar *field_text;  // 卡片字段文本
 } FilterState;
 
 // 应用筛选条件到搜索结果

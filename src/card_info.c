@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <glib.h>
 
 // constant.lua TYPE 部分参考
 #define TYPE_MONSTER      0x1
@@ -375,4 +376,112 @@ uint32_t get_race_from_string(const char* race) {
     }
     
     return 0;
+}
+
+// 获取strings.conf文件路径
+static gchar* get_strings_conf_path(void) {
+    // 从offline_data模块获取cards目录路径
+    // 这里需要包含app_path.h和offline_data相关的逻辑
+    const char *data_home = g_get_user_data_dir();
+    return g_build_filename(data_home, "ygo-deck-builder", "cards", "strings.conf", NULL);
+}
+
+// 从字段名字符串获取对应的setcode值（十进制）
+uint64_t get_setcode_from_field_name(const char* field_name) {
+    if (!field_name || field_name[0] == '\0') {
+        return 0;
+    }
+    
+    gchar *strings_path = get_strings_conf_path();
+    if (!strings_path || !g_file_test(strings_path, G_FILE_TEST_EXISTS)) {
+        g_free(strings_path);
+        return 0;
+    }
+    
+    // 读取strings.conf文件
+    gchar *content = NULL;
+    GError *error = NULL;
+    if (!g_file_get_contents(strings_path, &content, NULL, &error)) {
+        if (error) {
+            g_warning("Failed to read strings.conf: %s", error->message);
+            g_error_free(error);
+        }
+        g_free(strings_path);
+        return 0;
+    }
+    g_free(strings_path);
+    
+    // 逐行解析文件
+    gchar **lines = g_strsplit(content, "\n", -1);
+    g_free(content);
+    
+    uint64_t result = 0;
+    for (int i = 0; lines[i] != NULL; i++) {
+        gchar *line = g_strstrip(lines[i]);
+        
+        // 跳过空行和注释
+        if (line[0] == '\0' || line[0] == '#') {
+            continue;
+        }
+        
+        // 查找以"!setname"开头的行
+        if (g_str_has_prefix(line, "!setname")) {
+            // 格式：!setname 0x十六进制 字段名
+            gchar **parts = g_strsplit(line, " ", 3);
+            if (g_strv_length(parts) >= 3) {
+                const gchar *hex_str = parts[1];
+                const gchar *name = parts[2];
+                
+                // 检查字段名是否匹配
+                if (name && strstr(name, field_name) != NULL) {
+                    // 解析十六进制数（去掉"0x"前缀）
+                    if (g_str_has_prefix(hex_str, "0x") || g_str_has_prefix(hex_str, "0X")) {
+                        result = g_ascii_strtoull(hex_str + 2, NULL, 16);
+                        g_strfreev(parts);
+                        break;
+                    }
+                }
+            }
+            g_strfreev(parts);
+        }
+    }
+    
+    g_strfreev(lines);
+    return result;
+}
+
+// 检查卡片的setcode是否匹配给定的字段名
+gboolean match_setcode_with_field(uint64_t card_setcode, const char* field_name) {
+    if (!field_name || field_name[0] == '\0') {
+        return TRUE;  // 空字段名视为不筛选
+    }
+    
+    if (card_setcode == 0) {
+        return FALSE;  // 卡片没有setcode
+    }
+    
+    // 获取字段名对应的setcode
+    uint64_t target_setcode = get_setcode_from_field_name(field_name);
+    if (target_setcode == 0) {
+        return FALSE;  // 未找到对应的字段
+    }
+    
+    // setcode是64位整数，可能包含多个字段代码（每16位一个）
+    // 需要逐个检查
+    for (int shift = 0; shift < 64; shift += 16) {
+        uint64_t code_part = (card_setcode >> shift) & 0xFFFF;
+        if (code_part == 0) {
+            break;  // 没有更多字段代码
+        }
+        
+        // 检查是否匹配（考虑掩码）
+        uint64_t target_masked = target_setcode & 0xFFF;  // 取低12位作为实际代码
+        uint64_t card_masked = code_part & 0xFFF;
+        
+        if (card_masked == target_masked) {
+            return TRUE;
+        }
+    }
+    
+    return FALSE;
 }

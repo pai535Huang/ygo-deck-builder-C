@@ -13,6 +13,7 @@
 
 #define OFFLINE_DATA_URL "https://ygocdb.com/api/v0/cards.zip"
 #define OFFLINE_DATA_MD5_URL "https://ygocdb.com/api/v0/cards.zip.md5"
+#define STRINGS_CONF_URL "https://raw.githubusercontent.com/Fluorohydride/ygopro/master/strings.conf"
 #define CARDS_DIR_NAME "cards"
 
 /**
@@ -360,6 +361,55 @@ static gpointer download_offline_data_thread(gpointer data) {
     // 删除 ZIP 文件
     g_message("Removing ZIP file: %s", zip_path);
     remove(zip_path);
+    
+    // 下载 strings.conf 文件
+    g_message("Downloading strings.conf from %s...", STRINGS_CONF_URL);
+    
+    SoupSession *strings_session = soup_session_new();
+    SoupMessage *strings_msg = soup_message_new("GET", STRINGS_CONF_URL);
+    GError *strings_error = NULL;
+    
+    GInputStream *strings_input = soup_session_send(strings_session, strings_msg, NULL, &strings_error);
+    
+    if (strings_error) {
+        g_warning("Failed to download strings.conf: %s", strings_error->message);
+        g_error_free(strings_error);
+        g_object_unref(strings_session);
+        // strings.conf 下载失败不影响主流程，继续执行
+    } else {
+        // 保存 strings.conf 文件到 cards 目录
+        gchar *strings_path = g_build_filename(cards_dir, "strings.conf", NULL);
+        GFile *strings_file = g_file_new_for_path(strings_path);
+        GOutputStream *strings_output = (GOutputStream *)g_file_replace(strings_file, NULL, FALSE, G_FILE_CREATE_NONE, NULL, &strings_error);
+        
+        if (strings_error) {
+            g_warning("Failed to create strings.conf output file: %s", strings_error->message);
+            g_error_free(strings_error);
+            g_object_unref(strings_input);
+            g_object_unref(strings_file);
+            g_object_unref(strings_session);
+            g_free(strings_path);
+            // strings.conf 保存失败不影响主流程
+        } else {
+            // 复制数据
+            g_output_stream_splice(strings_output, strings_input, G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE | G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET, NULL, &strings_error);
+            
+            if (strings_error) {
+                g_warning("Failed to save strings.conf: %s", strings_error->message);
+                g_error_free(strings_error);
+                // strings.conf 保存失败不影响主流程
+            } else {
+                g_message("strings.conf saved to %s", strings_path);
+            }
+            
+            g_object_unref(strings_input);
+            g_object_unref(strings_output);
+            g_object_unref(strings_file);
+        }
+        
+        g_object_unref(strings_session);
+        g_free(strings_path);
+    }
     
     g_free(zip_path);
     g_free(data_dir);

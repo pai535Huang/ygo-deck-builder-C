@@ -3,6 +3,7 @@
 #define CARD_INFO_H
 #include <stdint.h>
 #include <stddef.h>
+#include <glib.h>
 
 // 将十进制 type 分解为类别字符串，写入 out，多个类别用逗号分隔
 void get_card_types(uint32_t type, char* out, size_t out_size);
@@ -40,5 +41,17 @@ uint32_t get_attribute_from_string(const char* attribute);
 // race: "全部", "战士", "魔法师", ...
 // 返回值：RACE 常量
 uint32_t get_race_from_string(const char* race);
+
+// 从字段名字符串获取对应的setcode值（十进制）
+// 通过解析strings.conf文件，将字段名映射为十六进制数，再转换为十进制
+// field_name: 字段名（如"青眼", "真红眼", "英雄"等）
+// 返回值：对应的setcode十进制值，如果未找到返回0
+uint64_t get_setcode_from_field_name(const char* field_name);
+
+// 检查卡片的setcode是否匹配给定的字段名
+// card_setcode: 卡片的setcode字段值（十进制）
+// field_name: 要匹配的字段名
+// 返回值：TRUE表示匹配，FALSE表示不匹配
+gboolean match_setcode_with_field(uint64_t card_setcode, const char* field_name);
 
 #endif // CARD_INFO_H

@@ -665,11 +665,6 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
         return TRUE;
     }
     
-    // 如果卡片类型选择是"全部"，不进行类型筛选
-    if (filter_state->card_type_selected == 0) {
-        return TRUE;
-    }
-    
     // 判断卡片数据结构类型并缓存data对象（如果是离线数据）
     gboolean is_prerelease = json_object_has_member(card, "type");
     JsonObject *data = NULL;
@@ -678,6 +673,28 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
         if (json_object_has_member(card, "data")) {
             data = json_object_get_object_member(card, "data");
         }
+    }
+    
+    // 定义辅助宏来获取卡片字段（先行卡或离线数据）
+    #define GET_CARD_INT_FIELD(field_name, default_value) \
+        (is_prerelease \
+            ? (json_object_has_member(card, field_name) ? json_object_get_int_member(card, field_name) : (default_value)) \
+            : (data && json_object_has_member(data, field_name) ? json_object_get_int_member(data, field_name) : (default_value)))
+    
+    // 首先检查字段筛选（不依赖卡片类型选择）
+    if (filter_state->field_text && filter_state->field_text[0] != '\0') {
+        // 获取卡片的setcode字段
+        gint64 card_setcode = GET_CARD_INT_FIELD("setcode", 0);
+        
+        // 使用card_info中的函数检查字段匹配
+        if (!match_setcode_with_field(card_setcode, filter_state->field_text)) {
+            return FALSE;
+        }
+    }
+    
+    // 如果卡片类型选择是"全部"，不进行类型筛选
+    if (filter_state->card_type_selected == 0) {
+        return TRUE;
     }
     
     // 获取卡片的type字段
@@ -692,12 +709,6 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
     } else {
         return FALSE;
     }
-    
-    // 定义辅助宏来获取卡片字段（先行卡或离线数据）
-    #define GET_CARD_INT_FIELD(field_name, default_value) \
-        (is_prerelease \
-            ? (json_object_has_member(card, field_name) ? json_object_get_int_member(card, field_name) : (default_value)) \
-            : (data && json_object_has_member(data, field_name) ? json_object_get_int_member(data, field_name) : (default_value)))
     
     // 怪兽卡筛选
     if (filter_state->card_type_selected == 1) {
