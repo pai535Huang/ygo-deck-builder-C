@@ -14,7 +14,8 @@ typedef struct {
     gboolean scale_to_thumb;   // TRUE表示缩略图，FALSE表示全尺寸
     int cache_id;              // >0时启用缓存（使用卡片ID）
     gboolean add_to_thumb_cache; // TRUE时添加到缩略图缓存
-    char *url;                 // 正在加载的URL
+    char *url;                 // 正在加载的URL（网络）或file_path（本地）
+    gboolean is_local_file;    // TRUE表示从本地文件加载，FALSE表示从网络加载
     guint64 cancel_generation; // 创建时的取消代次，用于检测是否应该取消
 } ImageLoadCtx;
 
@@ -50,6 +51,13 @@ void save_to_disk_cache(int card_id, GdkPixbuf *pixbuf);
  * @return GdkPixbuf指针，不需要unref，失败返回NULL
  */
 GdkPixbuf* get_thumb_from_cache(int card_id);
+
+/**
+ * 添加缩略图到内存缓存
+ * @param card_id 卡片ID
+ * @param pixbuf 缩略图（会增加引用计数）
+ */
+void add_thumb_to_cache(int card_id, GdkPixbuf *pixbuf);
 
 /**
  * 从内存缓存获取全尺寸图片

@@ -22,60 +22,66 @@ typedef struct {
     int count;
 } CardInfo;
 
-// 比较函数，用于qsort
-static int compare_card_ids(const void *a, const void *b) {
-    return *(const int*)a - *(const int*)b;
-}
-
-// 统计排序后的卡片，返回不同种类的卡片信息
+// 统计卡片，返回不同种类的卡片信息（保持原始顺序）
+// 协议要求：相同的卡片排在一起，但整体保持YDK文件中的出现顺序
 static CardInfo* count_unique_cards(const int *cards, int count, int *unique_count) {
     if (count == 0) {
         *unique_count = 0;
         return NULL;
     }
     
-    // 复制并排序
-    int *sorted = g_new(int, count);
-    memcpy(sorted, cards, count * sizeof(int));
-    qsort(sorted, count, sizeof(int), compare_card_ids);
+    // 按照原始顺序扫描，统计每种卡片的数量
+    // 使用数组存储已经遇到的卡片，保持顺序
+    CardInfo *infos = g_new(CardInfo, count);  // 最多count种不同的卡
+    int uniq = 0;
     
-    // 统计不同种类数量
-    int uniq = 1;
-    for (int i = 1; i < count; i++) {
-        if (sorted[i] != sorted[i-1]) uniq++;
-    }
-    
-    // 创建CardInfo数组
-    CardInfo *infos = g_new(CardInfo, uniq);
-    infos[0].card_id = sorted[0];
-    infos[0].count = 1;
-    
-    int idx = 0;
-    for (int i = 1; i < count; i++) {
-        if (sorted[i] == sorted[i-1]) {
-            infos[idx].count++;
+    for (int i = 0; i < count; i++) {
+        int card_id = cards[i];
+        
+        // 查找这个卡片是否已经记录过
+        int found = -1;
+        for (int j = 0; j < uniq; j++) {
+            if (infos[j].card_id == card_id) {
+                found = j;
+                break;
+            }
+        }
+        
+        if (found >= 0) {
+            // 已经存在，增加计数
+            infos[found].count++;
         } else {
-            idx++;
-            infos[idx].card_id = sorted[i];
-            infos[idx].count = 1;
+            // 新卡片，添加到列表
+            infos[uniq].card_id = card_id;
+            infos[uniq].count = 1;
+            uniq++;
         }
     }
     
-    g_free(sorted);
+    // 调整数组大小到实际需要的大小
+    CardInfo *result = g_new(CardInfo, uniq);
+    memcpy(result, infos, uniq * sizeof(CardInfo));
+    g_free(infos);
+    
     *unique_count = uniq;
-    return infos;
+    return result;
 }
 
 // 将位数组转换为Base64Url字符串
 static char* bits_to_base64url(const bool *bits, int bit_count) {
+    // 为了与其他平台兼容，需要将数据填充到字节边界（8的倍数）
+    // 然后再转换为Base64URL
+    int padded_bit_count = ((bit_count + 7) / 8) * 8;  // 向上取整到8的倍数
+    
     // 计算需要多少个6位组（Base64每个字符代表6位）
-    int sextet_count = (bit_count + 5) / 6;
+    int sextet_count = (padded_bit_count + 5) / 6;
     char *result = g_new(char, sextet_count + 1);
     
     for (int i = 0; i < sextet_count; i++) {
         int value = 0;
         for (int j = 0; j < 6; j++) {
             int bit_idx = i * 6 + j;
+            // 超出原始数据的位自动为0（填充位）
             if (bit_idx < bit_count && bits[bit_idx]) {
                 value |= (1 << (5 - j));
             }

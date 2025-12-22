@@ -5,6 +5,7 @@
 #include <sqlite3.h>
 #include <archive.h>
 #include <archive_entry.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -690,6 +691,13 @@ gchar* get_prerelease_card_image_path(int card_id) {
     }
     
     return image_path;
+}
+
+/**
+ * 检查卡片ID是否为先行卡ID（9位数字，100000000-999999999）
+ */
+gboolean is_prerelease_id(int card_id) {
+    return (card_id >= 100000000 && card_id <= 999999999);
 }
 
 gboolean prerelease_data_exists(void) {

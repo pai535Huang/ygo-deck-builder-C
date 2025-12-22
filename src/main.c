@@ -1307,7 +1307,7 @@ static void on_action_import_from_file(GSimpleAction *action, GVariant *paramete
 
 // 用于导出URL对话框的数据结构
 typedef struct {
-    GtkWidget *url_label;
+    GtkTextView *url_text_view;
     AdwDialog *dialog;
     AdwToastOverlay *toast_overlay;
 } ExportUrlDialogData;
@@ -1319,61 +1319,129 @@ typedef struct {
     SearchUI *ui;
 } ImportUrlDialogData;
 
-// 辅助函数：为槽位加载卡片图片
+// 异步加载先行卡图片的任务数据
+typedef struct {
+    GtkWidget *slot;
+    int img_id;
+    gchar *local_path;
+} PreleaseLoadTask;
+
+// 异步加载先行卡图片的工作线程
+static void prerelease_load_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object;
+    (void)cancellable;
+    
+    PreleaseLoadTask *data = (PreleaseLoadTask*)task_data;
+    if (!data || !data->local_path) {
+        g_task_return_pointer(task, NULL, NULL);
+        return;
+    }
+    
+    GError *error = NULL;
+    GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(data->local_path, &error);
+    
+    if (error) {
+        g_warning("加载先行卡图片失败: %s", error->message);
+        g_error_free(error);
+        g_task_return_pointer(task, NULL, NULL);
+    } else {
+        g_task_return_pointer(task, pixbuf, (GDestroyNotify)g_object_unref);
+    }
+}
+
+// 先行卡图片加载完成回调
+static void prerelease_load_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
+    (void)source;
+    PreleaseLoadTask *data = (PreleaseLoadTask*)user_data;
+    
+    if (!data) return;
+    
+    GTask *task = G_TASK(res);
+    GError *err = NULL;
+    GdkPixbuf *pixbuf = (GdkPixbuf*)g_task_propagate_pointer(task, &err);
+    
+    if (err) {
+        g_error_free(err);
+    }
+    
+    // 检查slot是否仍然有效
+    if (pixbuf && data->slot && GTK_IS_WIDGET(data->slot)) {
+        slot_set_pixbuf(data->slot, pixbuf);
+    }
+    
+    // 清理
+    if (pixbuf) g_object_unref(pixbuf);
+    if (data->slot) g_object_remove_weak_pointer(G_OBJECT(data->slot), (gpointer*)&data->slot);
+    g_free(data->local_path);
+    g_free(data);
+}
+
+// 辅助函数：为槽位加载卡片图片（优化：完全异步加载）
 static void load_card_image(GtkWidget *slot, int img_id, SoupSession *session) {
     if (img_id <= 0 || !session || !slot) return;
     
-    // 检查是否是先行卡
-    JsonObject *prerelease_card = find_prerelease_card_by_id(img_id);
-    gboolean is_prerelease = (prerelease_card != NULL);
-    if (prerelease_card) {
-        json_object_unref(prerelease_card);
+    // 检查是否是先行卡（优先通过ID位数判断，9位数=先行卡）
+    gboolean is_prerelease = is_prerelease_id(img_id);
+    
+    // 如果不是9位数，再检查本地先行卡数据（向后兼容）
+    if (!is_prerelease) {
+        JsonObject *prerelease_card = find_prerelease_card_by_id(img_id);
+        is_prerelease = (prerelease_card != NULL);
+        if (prerelease_card) {
+            json_object_unref(prerelease_card);  // 重要：释放引用
+        }
     }
     
     if (is_prerelease) {
-        // 先行卡：从本地加载
+        // 先行卡：异步从本地加载（避免IO阻塞）
         gchar *local_path = get_prerelease_card_image_path(img_id);
         if (local_path && g_file_test(local_path, G_FILE_TEST_EXISTS)) {
-            GError *error = NULL;
-            GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(local_path, &error);
-            if (pixbuf) {
-                slot_set_pixbuf(slot, pixbuf);
-                g_object_unref(pixbuf);
-            } else {
-                if (error) {
-                    g_warning("加载先行卡图片失败: %s", error->message);
-                    g_error_free(error);
-                }
-            }
+            PreleaseLoadTask *task_data = g_new0(PreleaseLoadTask, 1);
+            task_data->slot = slot;
+            task_data->img_id = img_id;
+            task_data->local_path = local_path;  // 转移所有权
+            
+            // 添加弱引用防止slot被销毁后访问
+            g_object_add_weak_pointer(G_OBJECT(slot), (gpointer*)&task_data->slot);
+            
+            GTask *task = g_task_new(NULL, NULL, prerelease_load_finished, task_data);
+            g_task_set_task_data(task, task_data, NULL);
+            g_task_run_in_thread(task, prerelease_load_thread);
+            g_object_unref(task);
+        } else {
+            g_free(local_path);
         }
-        g_free(local_path);
     } else {
-        // 普通卡：从缓存或在线加载
+        // 普通卡：先检查内存缓存（快速路径）
         GdkPixbuf *cached = get_thumb_from_cache(img_id);
-        if (!cached) {
-            cached = load_from_disk_cache(img_id);
+        if (cached) {
+            // 内存缓存命中，直接设置（无需unref，缓存持有引用）
+            slot_set_pixbuf(slot, cached);
+            return;
         }
         
-        if (cached) {
-            // 缓存命中，直接设置
-            slot_set_pixbuf(slot, cached);
-            if (get_thumb_from_cache(img_id) == NULL) {
-                g_object_unref(cached);
-            }
-        } else {
-            // 缓存未命中，异步加载
-            char url[128];
-            g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", img_id);
-            ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
-            ctx->stack = NULL;
-            ctx->target = slot;
-            g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
-            ctx->scale_to_thumb = TRUE;
-            ctx->cache_id = img_id;
-            ctx->add_to_thumb_cache = TRUE;
-            ctx->url = g_strdup(url);
-            load_image_async(session, url, ctx);
+        // 内存缓存未命中，检查磁盘缓存
+        // 注意：load_from_disk_cache返回新引用，调用者需要unref
+        GdkPixbuf *disk_cached = load_from_disk_cache(img_id);
+        if (disk_cached) {
+            slot_set_pixbuf(slot, disk_cached);
+            g_object_unref(disk_cached);  // 重要：释放引用
+            return;
         }
+        
+        // 缓存都未命中，异步从网络加载
+        char url[128];
+        g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", img_id);
+        ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
+        ctx->stack = NULL;
+        ctx->target = slot;
+        g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
+        ctx->scale_to_thumb = TRUE;
+        ctx->cache_id = img_id;
+        ctx->add_to_thumb_cache = TRUE;
+        ctx->url = g_strdup(url);
+        ctx->cancel_generation = get_cancel_generation();
+        load_image_async(session, url, ctx);
     }
 }
 
@@ -1506,18 +1574,22 @@ static void on_action_export_to_file(GSimpleAction *action, GVariant *parameter,
     on_export_clicked(NULL, ui);
 }
 
-// 复制按钮回调：将URL标签中的文本复制到剪贴板
+// 复制按钮回调：将URL文本视图中的文本复制到剪贴板
 static void on_copy_url_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     ExportUrlDialogData *data = (ExportUrlDialogData*)user_data;
     
-    if (!data || !data->url_label) return;
+    if (!data || !data->url_text_view) return;
     
-    // 获取URL标签的文本
-    const char *url_text = gtk_label_get_text(GTK_LABEL(data->url_label));
+    // 从GtkTextView的buffer中获取完整文本
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(data->url_text_view);
+    GtkTextIter start, end;
+    gtk_text_buffer_get_bounds(buffer, &start, &end);
+    gchar *url_text = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
     
     // 如果文本为空或是占位符，则不复制
-    if (!url_text || *url_text == '\0' || g_strcmp0(url_text, "(URL 将在此显示)") == 0) {
+    if (!url_text || *url_text == '\0' || g_strcmp0(url_text, "(生成URL失败)") == 0) {
+        g_free(url_text);
         return;
     }
     
@@ -1533,6 +1605,8 @@ static void on_copy_url_clicked(GtkButton *btn, gpointer user_data) {
         adw_toast_set_timeout(toast, 2);
         adw_toast_overlay_add_toast(data->toast_overlay, toast);
     }
+    
+    g_free(url_text);
 }
 
 // 导入URL按钮回调：从LURL解码并导入卡组
@@ -1746,29 +1820,35 @@ static void on_action_export_to_url(GSimpleAction *action, GVariant *parameter, 
     gtk_widget_add_css_class(heading, "heading");
     gtk_box_append(GTK_BOX(content_box), heading);
 
-    // URL显示容器
-    GtkWidget *url_placeholder = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_set_hexpand(url_placeholder, TRUE);
-    gtk_widget_set_margin_top(url_placeholder, 18);
+    // URL显示容器 - 使用GtkTextView以支持长URL
+    GtkWidget *scrolled_window = gtk_scrolled_window_new();
+    gtk_widget_set_hexpand(scrolled_window, TRUE);
+    gtk_widget_set_vexpand(scrolled_window, TRUE);
+    gtk_widget_set_margin_top(scrolled_window, 18);
+    gtk_scrolled_window_set_min_content_height(GTK_SCROLLED_WINDOW(scrolled_window), 100);
+    gtk_scrolled_window_set_max_content_height(GTK_SCROLLED_WINDOW(scrolled_window), 200);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scrolled_window),
+                                   GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
     
-    // 显示生成的URL或错误信息
-    GtkWidget *url_label;
+    // 创建GtkTextView用于显示URL
+    GtkWidget *url_text_view = gtk_text_view_new();
+    gtk_text_view_set_editable(GTK_TEXT_VIEW(url_text_view), FALSE);
+    gtk_text_view_set_wrap_mode(GTK_TEXT_VIEW(url_text_view), GTK_WRAP_CHAR);
+    gtk_text_view_set_cursor_visible(GTK_TEXT_VIEW(url_text_view), TRUE);
+    gtk_widget_add_css_class(url_text_view, "view");
+    
+    // 设置文本内容
+    GtkTextBuffer *buffer = gtk_text_view_get_buffer(GTK_TEXT_VIEW(url_text_view));
     if (deck_url) {
-        url_label = gtk_label_new(deck_url);
-        gtk_label_set_wrap(GTK_LABEL(url_label), TRUE);
-        gtk_label_set_wrap_mode(GTK_LABEL(url_label), PANGO_WRAP_CHAR);
-        gtk_label_set_selectable(GTK_LABEL(url_label), TRUE);
+        gtk_text_buffer_set_text(buffer, deck_url, -1);
         // 当对话框关闭时释放URL字符串
         g_object_set_data_full(G_OBJECT(dialog), "deck-url", deck_url, g_free);
     } else {
-        url_label = gtk_label_new("(生成URL失败)");
-        gtk_widget_add_css_class(url_label, "dim-label");
+        gtk_text_buffer_set_text(buffer, "(生成URL失败)", -1);
     }
     
-    gtk_label_set_xalign(GTK_LABEL(url_label), 0.5);
-    gtk_widget_set_halign(url_label, GTK_ALIGN_CENTER);
-    gtk_box_append(GTK_BOX(url_placeholder), url_label);
-    gtk_box_append(GTK_BOX(content_box), url_placeholder);
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled_window), url_text_view);
+    gtk_box_append(GTK_BOX(content_box), scrolled_window);
 
     // 按钮（居中）
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 36);
@@ -1785,7 +1865,7 @@ static void on_action_export_to_url(GSimpleAction *action, GVariant *parameter, 
 
     // 创建对话框数据并连接复制按钮信号
     ExportUrlDialogData *dialog_data = g_new(ExportUrlDialogData, 1);
-    dialog_data->url_label = url_label;
+    dialog_data->url_text_view = GTK_TEXT_VIEW(url_text_view);
     dialog_data->dialog = dialog;
     dialog_data->toast_overlay = ui->toast_overlay;
     
@@ -1935,6 +2015,71 @@ char* format_card_text(const CardPreview *pv) {
     return g_string_free(s, FALSE);
 }
 
+// 先行卡预览图加载任务数据
+typedef struct {
+    GtkPicture *picture;
+    GtkStack *stack;
+    int card_id;
+    gchar *local_path;
+} PreviewLoadTask;
+
+// 异步加载预览图的工作线程
+static void preview_load_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object;
+    (void)cancellable;
+    
+    PreviewLoadTask *data = (PreviewLoadTask*)task_data;
+    if (!data || !data->local_path) {
+        g_task_return_pointer(task, NULL, NULL);
+        return;
+    }
+    
+    GError *error = NULL;
+    GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(data->local_path, &error);
+    
+    if (error) {
+        g_warning("Failed to load prerelease image: %s", error->message);
+        g_error_free(error);
+        g_task_return_pointer(task, NULL, NULL);
+    } else {
+        g_task_return_pointer(task, pixbuf, (GDestroyNotify)g_object_unref);
+    }
+}
+
+// 预览图加载完成回调
+static void preview_load_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
+    (void)source;
+    PreviewLoadTask *data = (PreviewLoadTask*)user_data;
+    
+    if (!data) return;
+    
+    GTask *task = G_TASK(res);
+    GError *err = NULL;
+    GdkPixbuf *pixbuf = (GdkPixbuf*)g_task_propagate_pointer(task, &err);
+    
+    if (err) {
+        g_error_free(err);
+    }
+    
+    // 检查picture和stack是否仍然有效
+    if (pixbuf && data->picture && GTK_IS_PICTURE(data->picture) && 
+        data->stack && GTK_IS_STACK(data->stack)) {
+        GdkTexture *tex = gdk_texture_new_for_pixbuf(pixbuf);
+        if (tex) {
+            gtk_picture_set_paintable(data->picture, GDK_PAINTABLE(tex));
+            g_object_unref(tex);
+        }
+        gtk_stack_set_visible_child_name(data->stack, "picture");
+    }
+    
+    // 清理
+    if (pixbuf) g_object_unref(pixbuf);
+    if (data->picture) g_object_remove_weak_pointer(G_OBJECT(data->picture), (gpointer*)&data->picture);
+    if (data->stack) g_object_remove_weak_pointer(G_OBJECT(data->stack), (gpointer*)&data->stack);
+    g_free(data->local_path);
+    g_free(data);
+}
+
 static void show_card_preview(SearchUI *ui, const CardPreview *pv) {
     if (!ui || !pv) return;
     // 文本
@@ -1945,25 +2090,24 @@ static void show_card_preview(SearchUI *ui, const CardPreview *pv) {
     // 图片
     if (pv->id > 0) {
         if (pv->is_prerelease) {
-            // 先行卡：从本地加载图片
+            // 先行卡：异步从本地加载图片（避免IO阻塞）
             gchar *local_path = get_prerelease_card_image_path(pv->id);
             if (local_path && g_file_test(local_path, G_FILE_TEST_EXISTS)) {
-                GError *error = NULL;
-                GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(local_path, &error);
-                if (pixbuf) {
-                    GdkTexture *tex = gdk_texture_new_for_pixbuf(pixbuf);
-                    if (tex) {
-                        gtk_picture_set_paintable(ui->left_picture, GDK_PAINTABLE(tex));
-                        g_object_unref(tex);
-                    }
-                    g_object_unref(pixbuf);
-                    gtk_stack_set_visible_child_name(ui->left_stack, "picture");
-                } else {
-                    if (error) {
-                        g_warning("Failed to load prerelease image: %s", error->message);
-                        g_error_free(error);
-                    }
-                }
+                PreviewLoadTask *task_data = g_new0(PreviewLoadTask, 1);
+                task_data->picture = ui->left_picture;
+                task_data->stack = ui->left_stack;
+                task_data->card_id = pv->id;
+                task_data->local_path = local_path;  // 转移所有权
+                
+                // 添加弱引用
+                g_object_add_weak_pointer(G_OBJECT(task_data->picture), (gpointer*)&task_data->picture);
+                g_object_add_weak_pointer(G_OBJECT(task_data->stack), (gpointer*)&task_data->stack);
+                
+                GTask *task = g_task_new(NULL, NULL, preview_load_finished, task_data);
+                g_task_set_task_data(task, task_data, NULL);
+                g_task_run_in_thread(task, preview_load_thread);
+                g_object_unref(task);
+            } else {
                 g_free(local_path);
             }
         } else {
@@ -1976,7 +2120,7 @@ static void show_card_preview(SearchUI *ui, const CardPreview *pv) {
                     gtk_picture_set_paintable(ui->left_picture, GDK_PAINTABLE(tex));
                     g_object_unref(tex);
                 }
-                g_object_unref(cached_pixbuf);
+                g_object_unref(cached_pixbuf);  // 重要：释放引用
                 gtk_stack_set_visible_child_name(ui->left_stack, "picture");
             } else {
                 // 缓存不存在，从在线URL加载
@@ -2162,33 +2306,20 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
             slot_set_pixbuf(target_pic, right_pixbuf);
             g_object_unref(right_pixbuf);  // 释放我们增加的引用
         } else if (pv->is_prerelease) {
-            // 先行卡：从本地加载
-            gchar *local_path = get_prerelease_card_image_path(pv->id);
-            if (local_path && g_file_test(local_path, G_FILE_TEST_EXISTS)) {
-                GError *error = NULL;
-                GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(local_path, &error);
-                if (pixbuf) {
-                    slot_set_pixbuf(target_pic, pixbuf);
-                    g_object_unref(pixbuf);
-                } else {
-                    if (error) {
-                        g_warning("加载先行卡图片失败: %s", error->message);
-                        g_error_free(error);
-                    }
-                }
-            }
-            g_free(local_path);
+            // 先行卡：异步从本地加载（优化：避免IO阻塞）
+            load_card_image(target_pic, pv->id, ui->session);
         } else {
             // 尝试从内存缓存加载
             GdkPixbuf *cached = get_thumb_from_cache(pv->id);
             if (cached) {
                 slot_set_pixbuf(target_pic, cached);
+                // 注意：get_thumb_from_cache返回缓存持有的引用，不需要unref
             } else {
                 // 尝试从磁盘缓存加载
                 GdkPixbuf *disk_cached = load_from_disk_cache(pv->id);
                 if (disk_cached) {
                     slot_set_pixbuf(target_pic, disk_cached);
-                    g_object_unref(disk_cached);
+                    g_object_unref(disk_cached);  // 重要：释放引用
                 } else {
                     // 缓存都未命中，从在线加载
                     char url[128];
@@ -2202,6 +2333,7 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
                     ctx->cache_id = pv->id;  // 启用缓存检查和保存
                     ctx->add_to_thumb_cache = TRUE;  // 下载后保存到缩略图缓存
                     ctx->url = g_strdup(url);
+                    ctx->cancel_generation = get_cancel_generation();
                     load_image_async(ui->session, url, ctx);
                 }
             }
@@ -2234,27 +2366,44 @@ void on_result_row_enter(GtkEventControllerMotion *controller, double x, double 
     if (pv) show_card_preview(ui, pv);
 }
 
-// 中栏卡图悬浮事件：异步回调
-static void on_slot_card_info_received(GObject *source, GAsyncResult *res, gpointer user_data) {
-    SoupSession *session = SOUP_SESSION(source);
-    SearchUI *ui = (SearchUI*)user_data;
-    GError *err = NULL;
-    GInputStream *in = soup_session_send_finish(session, res, &err);
-    if (!in) { 
-        if (err) g_error_free(err); 
-        return; 
-    }
+// 异步读取数据的任务结构
+typedef struct {
+    SearchUI *ui;
+    GByteArray *data;
+} CardInfoReadTask;
+
+// 异步读取响应数据的工作线程
+static void card_info_read_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object;
     
+    GInputStream *in = (GInputStream*)g_task_get_task_data(task);
     GByteArray *ba = g_byte_array_new();
     guint8 bufread[4096];
     gssize n;
-    while ((n = g_input_stream_read(in, bufread, sizeof bufread, NULL, NULL)) > 0) {
+    
+    while ((n = g_input_stream_read(in, bufread, sizeof bufread, cancellable, NULL)) > 0) {
         g_byte_array_append(ba, bufread, (guint)n);
     }
-    g_object_unref(in);
     
-    if (ba->len == 0) {
-        g_byte_array_unref(ba);
+    g_task_return_pointer(task, ba, (GDestroyNotify)g_byte_array_unref);
+}
+
+// 数据读取完成后的处理回调
+static void card_info_read_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
+    (void)source;
+    SearchUI *ui = (SearchUI*)user_data;
+    
+    GTask *task = G_TASK(res);
+    GError *err = NULL;
+    GByteArray *ba = (GByteArray*)g_task_propagate_pointer(task, &err);
+    
+    if (err) {
+        g_error_free(err);
+        return;
+    }
+    
+    if (!ba || ba->len == 0) {
+        if (ba) g_byte_array_unref(ba);
         return;
     }
     
@@ -2313,8 +2462,26 @@ static void on_slot_card_info_received(GObject *source, GAsyncResult *res, gpoin
         }
     }
     if (jerr) g_error_free(jerr);
-    g_object_unref(parser);
-    g_byte_array_unref(ba);
+    g_object_unref(parser);  // 重要：释放JSON解析器
+    g_byte_array_unref(ba);  // 重要：释放字节数组
+}
+
+// 中栏卡图悬浮事件：异步回调（优化版：使用异步读取）
+static void on_slot_card_info_received(GObject *source, GAsyncResult *res, gpointer user_data) {
+    SoupSession *session = SOUP_SESSION(source);
+    SearchUI *ui = (SearchUI*)user_data;
+    GError *err = NULL;
+    GInputStream *in = soup_session_send_finish(session, res, &err);
+    if (!in) { 
+        if (err) g_error_free(err); 
+        return; 
+    }
+    
+    // 使用GTask异步读取数据，避免阻塞主线程
+    GTask *task = g_task_new(NULL, NULL, card_info_read_finished, ui);
+    g_task_set_task_data(task, in, g_object_unref);  // in的所有权转移给task
+    g_task_run_in_thread(task, card_info_read_thread);
+    g_object_unref(task);
 }
 
 // 中栏卡图悬浮事件：获取 img_id 并请求卡片信息

@@ -45,4 +45,11 @@ gchar* get_prerelease_card_image_path(int card_id);
  */
 gboolean prerelease_data_exists(void);
 
+/**
+ * 通过ID判断是否是先行卡（先行卡ID为9位数）
+ * @param card_id 卡片ID
+ * @return TRUE如果是先行卡ID，否则FALSE
+ */
+gboolean is_prerelease_id(int card_id);
+
 #endif // PRERELEASE_H

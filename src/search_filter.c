@@ -20,6 +20,59 @@ extern void on_result_row_pressed(GtkGestureClick *gesture, int n_press, double 
 extern void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data);
 extern void on_result_row_enter(GtkEventControllerMotion *controller, double x, double y, gpointer user_data);
 
+// 先行卡异步加载的数据结构
+typedef struct {
+    GtkWidget *target;
+    GtkStack *stack;
+    gchar *path;
+} PreloadData;
+
+// 先行卡加载完成回调
+static void preload_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
+    (void)source;
+    PreloadData *pd = (PreloadData*)user_data;
+    GError *err = NULL;
+    GdkPixbuf *pb = (GdkPixbuf*)g_task_propagate_pointer(G_TASK(res), &err);
+    
+    if (err) g_error_free(err);
+    
+    if (pb && pd->target && GTK_IS_DRAWING_AREA(pd->target)) {
+        g_object_set_data_full(G_OBJECT(pd->target), "pixbuf", pb, 
+                              (GDestroyNotify)g_object_unref);
+        g_object_set_data(G_OBJECT(pd->target), "cached_surface", NULL);
+        gtk_widget_queue_draw(pd->target);
+        if (pd->stack && GTK_IS_STACK(pd->stack)) {
+            gtk_stack_set_visible_child_name(pd->stack, "picture");
+        }
+    } else if (pb) {
+        g_object_unref(pb);
+    }
+    
+    if (pd->target && G_IS_OBJECT(pd->target)) {
+        g_object_remove_weak_pointer(G_OBJECT(pd->target), (gpointer*)&pd->target);
+    }
+    if (pd->stack && G_IS_OBJECT(pd->stack)) {
+        g_object_remove_weak_pointer(G_OBJECT(pd->stack), (gpointer*)&pd->stack);
+    }
+    g_free(pd->path);
+    g_free(pd);
+}
+
+// 先行卡加载线程函数
+static void preload_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object;
+    (void)cancellable;
+    PreloadData *pd = (PreloadData*)task_data;
+    GError *err = NULL;
+    GdkPixbuf *pb = gdk_pixbuf_new_from_file(pd->path, &err);
+    if (err) {
+        g_error_free(err);
+        g_task_return_pointer(task, NULL, NULL);
+    } else {
+        g_task_return_pointer(task, pb, NULL);
+    }
+}
+
 // 逐个加载搜索结果图片，避免同时加载太多导致UI卡顿
 gboolean search_load_next_image(gpointer user_data) {
     SearchUI *ui = (SearchUI*)user_data;
@@ -89,19 +142,24 @@ gboolean search_load_next_image(gpointer user_data) {
             g_object_set_data(G_OBJECT(target), "pending_img_id", GINT_TO_POINTER(0));
             
             if (is_prerelease) {
-                // 从本地加载先行卡图片
+                // 先行卡：直接在后台线程加载本地文件（不使用libsoup）
                 gchar *local_path = get_prerelease_card_image_path(img_id);
                 if (local_path && g_file_test(local_path, G_FILE_TEST_EXISTS)) {
-                    GError *error = NULL;
-                    GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(local_path, &error);
-                    if (pixbuf) {
-                        g_object_set_data_full(G_OBJECT(target), "pixbuf", pixbuf, (GDestroyNotify)g_object_unref);
-                        g_object_set_data(G_OBJECT(target), "cached_surface", NULL);
-                        gtk_widget_queue_draw(target);
-                        gtk_stack_set_visible_child_name(stack, "picture");
-                    } else {
-                        if (error) g_error_free(error);
-                    }
+                    // 使用GTask在后台线程加载，避免阻塞UI
+                    // 注意：不能使用libsoup的file:// URL，libsoup不支持本地文件
+                    PreloadData *pdata = g_new0(PreloadData, 1);
+                    pdata->target = target;
+                    pdata->stack = stack;
+                    pdata->path = local_path;  // 转移所有权
+                    
+                    g_object_add_weak_pointer(G_OBJECT(target), (gpointer*)&pdata->target);
+                    g_object_add_weak_pointer(G_OBJECT(stack), (gpointer*)&pdata->stack);
+                    
+                    GTask *task = g_task_new(NULL, NULL, preload_finished, pdata);
+                    g_task_set_task_data(task, pdata, NULL);
+                    g_task_run_in_thread(task, preload_thread);
+                    g_object_unref(task);
+                } else {
                     g_free(local_path);
                 }
             } else {
@@ -111,11 +169,13 @@ gboolean search_load_next_image(gpointer user_data) {
                 ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
                 ctx->stack = stack;
                 ctx->target = target;
-                // 注意：不需要在这里设置弱引用，load_image_async 内部会处理
+                g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
+                g_object_add_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
                 ctx->scale_to_thumb = TRUE;
                 ctx->cache_id = img_id;
                 ctx->add_to_thumb_cache = TRUE;
                 ctx->url = g_strdup(url);
+                ctx->cancel_generation = get_cancel_generation();
                 load_image_async(ui->session, url, ctx);
             }
             loaded++;
@@ -252,9 +312,13 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
     gtk_stack_add_named(GTK_STACK(thumb_stack), picture, "picture");
     gtk_stack_set_visible_child_name(GTK_STACK(thumb_stack), "placeholder");
     
-    // 检查是否是先行卡
-    gboolean is_prerelease = json_object_has_member(obj, "is_prerelease") && 
-                             json_object_get_boolean_member(obj, "is_prerelease");
+    // 检查是否是先行卡（优先通过ID位数判断，9位数=先行卡）
+    gboolean is_prerelease = (id > 0 && is_prerelease_id(id));
+    
+    // 如果不是9位数，检查JSON中的标记（向后兼容）
+    if (!is_prerelease && json_object_has_member(obj, "is_prerelease")) {
+        is_prerelease = json_object_get_boolean_member(obj, "is_prerelease");
+    }
     
     if (id > 0) {
         // 不立即加载图片，而是添加到队列中
@@ -281,6 +345,7 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
                 gtk_widget_queue_draw(picture);
                 gtk_stack_set_visible_child_name(GTK_STACK(thumb_stack), "picture");
                 loaded_from_cache = TRUE;
+                // disk_cached的引用已经转移到picture的data中，不需要额外unref
             }
         }
         

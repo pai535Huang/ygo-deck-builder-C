@@ -384,11 +384,12 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
         session = (SoupSession*)g_object_get_data(G_OBJECT(ctx->target), "_loader_session");
     }
     
-    // 移除弱引用（只在指针非NULL时调用，NULL表示对象已被销毁）
-    if (ctx->target) {
+    // 移除弱引用（只在指针非NULL且对象仍然有效时调用）
+    // 注意：需要在使用session之前清理，因为session可能来自target
+    if (ctx->target && G_IS_OBJECT(ctx->target)) {
         g_object_remove_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
     }
-    if (ctx->stack) {
+    if (ctx->stack && G_IS_OBJECT(ctx->stack)) {
         g_object_remove_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
     }
     
@@ -463,11 +464,11 @@ static void image_response_cb(GObject *source, GAsyncResult *res, gpointer user_
             g_mutex_unlock(&cache_mutex);
         }
         
-        // 清理弱引用
-        if (ctx->target) {
+        // 清理弱引用（检查对象是否仍然有效）
+        if (ctx->target && G_IS_OBJECT(ctx->target)) {
             g_object_remove_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
         }
-        if (ctx->stack) {
+        if (ctx->stack && G_IS_OBJECT(ctx->stack)) {
             g_object_remove_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
         }
         g_free(ctx->url);
@@ -522,10 +523,10 @@ static void image_response_cb(GObject *source, GAsyncResult *res, gpointer user_
             }
             g_mutex_unlock(&cache_mutex);
         }
-        if (ctx->target) {
+        if (ctx->target && G_IS_OBJECT(ctx->target)) {
             g_object_remove_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
         }
-        if (ctx->stack) {
+        if (ctx->stack && G_IS_OBJECT(ctx->stack)) {
             g_object_remove_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
         }
         g_free(ctx->url);
@@ -564,8 +565,31 @@ static void start_download(SoupSession *session, ImageLoadCtx *ctx) {
         g_object_set_data(G_OBJECT(ctx->target), "_loader_session", session);
     }
     
-    // 发起HTTP请求（不使用GCancellable，让请求自然完成，回调中检查代次来决定是否处理结果）
+    // 创建HTTP消息（检查返回值，URL可能无效）
     SoupMessage *msg = soup_message_new("GET", ctx->url);
+    if (!msg) {
+        g_warning("无效的URL，无法创建soup消息: %s", ctx->url);
+        // 清理上下文
+        if (ctx->target && G_IS_OBJECT(ctx->target)) {
+            g_object_remove_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
+        }
+        if (ctx->stack && G_IS_OBJECT(ctx->stack)) {
+            g_object_remove_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
+        }
+        g_free(ctx->url);
+        g_free(ctx);
+        
+        // 减少活跃下载计数
+        g_mutex_lock(&download_queue_mutex);
+        active_downloads--;
+        g_mutex_unlock(&download_queue_mutex);
+        
+        // 继续处理队列
+        process_download_queue(session);
+        return;
+    }
+    
+    // 发起HTTP请求（不使用GCancellable，让请求自然完成，回调中检查代次来决定是否处理结果）
     soup_session_send_async(session, msg, G_PRIORITY_DEFAULT, NULL, image_response_cb, ctx);
     g_object_unref(msg);  // soup_session_send_async 会内部增加引用
 }

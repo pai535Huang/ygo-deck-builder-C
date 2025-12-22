@@ -63,6 +63,8 @@ typedef struct {
     // 批量渲染队列
     GPtrArray *pending_results;  // 存储待渲染的JsonObject
     guint batch_render_id;       // idle callback的ID
+    // 搜索代次计数器（每次搜索递增，用于检测过期回调）
+    guint64 search_generation;
     // 窗口引用（用于显示对话框）
     AdwApplicationWindow *window;
     // Toast overlay（用于显示通知）
