@@ -199,16 +199,19 @@ gboolean import_deck_from_ydk(
             } else {
                 // 普通卡：从缓存或在线加载（离线模式不影响此逻辑）
                 // 先尝试从缓存加载
+                gboolean from_mem_cache = FALSE;
                 GdkPixbuf *cached = get_thumb_from_cache(img_id);
-                if (!cached) {
-                    cached = load_from_disk_cache(img_id);
+                if (cached) {
+                    from_mem_cache = TRUE; // 借用引用，不需要 unref
+                } else {
+                    cached = load_from_disk_cache(img_id); // 新引用，需要 unref
                 }
                 
                 if (cached) {
                     // 缓存命中，直接设置
                     slot_set_pixbuf(target_pic, cached);
-                    if (get_thumb_from_cache(img_id) == NULL) {
-                        // 如果不在内存缓存中，需要unref
+                    if (!from_mem_cache) {
+                        // 从磁盘缓存加载返回新引用，需要 unref
                         g_object_unref(cached);
                     }
                 } else {
@@ -218,7 +221,6 @@ gboolean import_deck_from_ydk(
                     ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
                     ctx->stack = NULL;
                     ctx->target = GTK_WIDGET(target_pic);
-                    g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
                     ctx->scale_to_thumb = TRUE;
                     ctx->cache_id = img_id;
                     ctx->add_to_thumb_cache = TRUE;

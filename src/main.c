@@ -50,6 +50,11 @@ static char *program_directory = NULL;
 // 全局变量：是否为便携模式（数据文件在程序目录下）
 static gboolean portable_mode = FALSE;
 
+static void free_user_data_closure_notify(gpointer data, GClosure *closure) {
+    (void)closure;
+    g_free(data);
+}
+
 // 全局变量：缓存最后导出和导入的目录
 static char *last_export_directory = NULL;
 static char *last_import_directory = NULL;
@@ -176,84 +181,149 @@ void draw_pixbuf_scaled(GtkDrawingArea *area, cairo_t *cr, int width, int height
     (void)user_data;
     GdkPixbuf *pb = (GdkPixbuf*)g_object_get_data(G_OBJECT(area), "pixbuf");
     if (!pb) return;
+    g_object_ref(pb);
     int pw = gdk_pixbuf_get_width(pb);
     int ph = gdk_pixbuf_get_height(pb);
-    if (pw <= 0 || ph <= 0) return;
-    
-    // 获取设备像素比例以支持高DPI显示
-    double scale = gtk_widget_get_scale_factor(GTK_WIDGET(area));
-    
-    // 检查缓存的surface是否存在且尺寸匹配
-    cairo_surface_t *cached = (cairo_surface_t*)g_object_get_data(G_OBJECT(area), "cached_surface");
-    int cached_w = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(area), "cached_width"));
-    int cached_h = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(area), "cached_height"));
-    double cached_scale = g_object_get_data(G_OBJECT(area), "cached_scale") ? 
-                          *(double*)g_object_get_data(G_OBJECT(area), "cached_scale") : 1.0;
-    
-    if (cached && cached_w == width && cached_h == height && cached_scale == scale) {
-        // 使用缓存的surface,避免重新缩放和绘制
-        cairo_set_source_surface(cr, cached, 0, 0);
-        // 设置高质量过滤器以保持清晰度
+    if (pw <= 0 || ph <= 0) {
+        g_object_unref(pb);
+        return;
+    }
+
+    // 使用“渲染后缓存的缩放 pixbuf”替代 cairo_surface 缓存：
+    // 1) 避免 cairo_surface_destroy 在销毁链里触发堆损坏（coredump7）
+    // 2) 按显示 scale 生成 device-pixel 尺寸，保持 HiDPI 清晰度
+    int scale_factor = gtk_widget_get_scale_factor(GTK_WIDGET(area));
+    if (scale_factor < 1) scale_factor = 1;
+
+    int target_w = width * scale_factor;
+    int target_h = height * scale_factor;
+    if (target_w <= 0 || target_h <= 0) {
+        g_object_unref(pb);
+        return;
+    }
+
+    GdkPixbuf *cached = (GdkPixbuf*)g_object_get_data(G_OBJECT(area), "cached_render");
+    int cached_w = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(area), "cached_render_w"));
+    int cached_h = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(area), "cached_render_h"));
+    int cached_scale = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(area), "cached_render_scale"));
+
+    if (cached && cached_w == target_w && cached_h == target_h && cached_scale == scale_factor) {
+        g_object_ref(cached);
+        // 直接绘制缓存（缓存是 device-pixel 尺寸，因此绘制前需要把坐标系缩回 logical）
+        cairo_save(cr);
+        cairo_scale(cr, 1.0 / (double)scale_factor, 1.0 / (double)scale_factor);
+        gdk_cairo_set_source_pixbuf(cr, cached, 0, 0);
         cairo_pattern_t *pattern = cairo_get_source(cr);
         if (pattern) cairo_pattern_set_filter(pattern, CAIRO_FILTER_BEST);
         cairo_paint(cr);
+        cairo_restore(cr);
+        g_object_unref(cached);
+        g_object_unref(pb);
         return;
     }
-    
-    double sx = (double)width / (double)pw;
-    double sy = (double)height / (double)ph;
-    double s = sx < sy ? sx : sy; // contain
-    double rw = pw * s;
-    double rh = ph * s;
-    double tx = (width - rw) / 2.0;
-    double ty = (height - rh) / 2.0;
 
-    // 创建高分辨率的缓存surface以支持高DPI
-    int surface_w = (int)(width * scale);
-    int surface_h = (int)(height * scale);
-    cairo_surface_t *new_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, surface_w, surface_h);
-    cairo_surface_set_device_scale(new_surface, scale, scale);
-    cairo_t *cache_cr = cairo_create(new_surface);
-    
-    // 清除背景为透明
-    cairo_set_operator(cache_cr, CAIRO_OPERATOR_CLEAR);
-    cairo_paint(cache_cr);
-    cairo_set_operator(cache_cr, CAIRO_OPERATOR_OVER);
-    
-    cairo_save(cache_cr);
-    cairo_translate(cache_cr, tx, ty);
-    cairo_scale(cache_cr, s, s);
-    gdk_cairo_set_source_pixbuf(cache_cr, pb, 0, 0);
-    cairo_pattern_t *pat = cairo_get_source(cache_cr);
-    if (pat) cairo_pattern_set_filter(pat, CAIRO_FILTER_BEST);
-    cairo_rectangle(cache_cr, 0, 0, pw, ph);
-    cairo_fill(cache_cr);
-    cairo_restore(cache_cr);
-    cairo_destroy(cache_cr);
-    
-    // 缓存surface和scale
-    double *scale_ptr = g_new(double, 1);
-    *scale_ptr = scale;
-    g_object_set_data_full(G_OBJECT(area), "cached_surface", new_surface, (GDestroyNotify)cairo_surface_destroy);
-    g_object_set_data(G_OBJECT(area), "cached_width", GINT_TO_POINTER(width));
-    g_object_set_data(G_OBJECT(area), "cached_height", GINT_TO_POINTER(height));
-    g_object_set_data_full(G_OBJECT(area), "cached_scale", scale_ptr, g_free);
-    
-    // 绘制缓存的surface,使用高质量过滤器
-    cairo_set_source_surface(cr, new_surface, 0, 0);
+    // 重新生成缓存：按比例 contain 填充到 target_w x target_h
+    // 若当前 pixbuf 分辨率低于目标 device-pixel 尺寸（常见于 widget 未 realize 时取到 scale=1 的预缩放），
+    // 尝试从磁盘缓存读取原图用于本次渲染，以恢复清晰度。
+    GdkPixbuf *src_pb = pb;
+    GdkPixbuf *disk_pb = NULL;
+    if (gdk_pixbuf_get_width(pb) < target_w || gdk_pixbuf_get_height(pb) < target_h) {
+        int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(area), "img_id"));
+        if (img_id > 0) {
+            disk_pb = load_from_disk_cache(img_id);
+            if (disk_pb) {
+                src_pb = disk_pb;
+            }
+        }
+    }
+
+    int spw = gdk_pixbuf_get_width(src_pb);
+    int sph = gdk_pixbuf_get_height(src_pb);
+
+    // 注意：这里必须保证 (tx,ty,rw,rh) 完全落在 render 的范围内；
+    // 否则 gdk_pixbuf_scale 可能越界写，导致后续 free/unref 时堆损坏（coredump8）。
+    double sx = (double)target_w / (double)spw;
+    double sy = (double)target_h / (double)sph;
+    double s = sx < sy ? sx : sy;
+    int rw = (int)(spw * s);
+    int rh = (int)(sph * s);
+    if (rw < 1) rw = 1;
+    if (rh < 1) rh = 1;
+    if (rw > target_w) rw = target_w;
+    if (rh > target_h) rh = target_h;
+    int tx = (target_w - rw) / 2;
+    int ty = (target_h - rh) / 2;
+    if (tx < 0) tx = 0;
+    if (ty < 0) ty = 0;
+    // 二次收敛，确保不越界
+    if (tx + rw > target_w) rw = target_w - tx;
+    if (ty + rh > target_h) rh = target_h - ty;
+    if (rw <= 0 || rh <= 0) {
+        g_object_unref(pb);
+        return;
+    }
+
+    // 用 scale_simple 先生成 rw x rh 的缩放图，再 copy_area 到目标画布。
+    // 这样避免 gdk_pixbuf_scale() 的 offset/region 组合导致的越界写/堆损坏。
+    GdkPixbuf *scaled = gdk_pixbuf_scale_simple(src_pb, rw, rh, GDK_INTERP_HYPER);
+    if (!scaled) {
+        g_object_unref(pb);
+        if (disk_pb) g_object_unref(disk_pb);
+        return;
+    }
+
+    GdkPixbuf *render = NULL;
+    if (tx == 0 && ty == 0 && rw == target_w && rh == target_h) {
+        // 无留边：直接用 scaled 作为缓存
+        render = scaled;
+        scaled = NULL;
+    } else {
+        render = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, target_w, target_h);
+        if (!render) {
+            g_object_unref(pb);
+            if (disk_pb) g_object_unref(disk_pb);
+            g_object_unref(scaled);
+            return;
+        }
+        gdk_pixbuf_fill(render, 0x00000000);
+        // 最终保险 clamp：copy_area 也要求完全在范围内
+        if (tx < 0) tx = 0;
+        if (ty < 0) ty = 0;
+        if (tx + rw > target_w) rw = target_w - tx;
+        if (ty + rh > target_h) rh = target_h - ty;
+        if (rw > 0 && rh > 0) {
+            gdk_pixbuf_copy_area(scaled, 0, 0, rw, rh, render, tx, ty);
+        }
+    }
+
+    if (scaled) g_object_unref(scaled);
+
+    // 写入缓存
+    g_object_set_data_full(G_OBJECT(area), "cached_render", render, (GDestroyNotify)g_object_unref);
+    g_object_set_data(G_OBJECT(area), "cached_render_w", GINT_TO_POINTER(target_w));
+    g_object_set_data(G_OBJECT(area), "cached_render_h", GINT_TO_POINTER(target_h));
+    g_object_set_data(G_OBJECT(area), "cached_render_scale", GINT_TO_POINTER(scale_factor));
+
+    // 绘制缓存
+    cairo_save(cr);
+    cairo_scale(cr, 1.0 / (double)scale_factor, 1.0 / (double)scale_factor);
+    gdk_cairo_set_source_pixbuf(cr, render, 0, 0);
     cairo_pattern_t *pattern = cairo_get_source(cr);
     if (pattern) cairo_pattern_set_filter(pattern, CAIRO_FILTER_BEST);
     cairo_paint(cr);
+    cairo_restore(cr);
+    g_object_unref(pb);
+    if (disk_pb) g_object_unref(disk_pb);
 }
 
-// 当 DrawingArea 销毁时清理 pixbuf 数据和缓存的surface，防止 Cairo 上下文问题
+// 当 DrawingArea 销毁时
 void on_drawing_area_destroy(GtkWidget *widget, gpointer user_data) {
     (void)user_data;
-    g_object_set_data(G_OBJECT(widget), "pixbuf", NULL);
-    g_object_set_data(G_OBJECT(widget), "cached_surface", NULL);
-    g_object_set_data(G_OBJECT(widget), "cached_width", NULL);
-    g_object_set_data(G_OBJECT(widget), "cached_height", NULL);
-    g_object_set_data(G_OBJECT(widget), "cached_scale", NULL);
+    (void)widget;
+
+    // 这里必须什么都不做。
+    // cached_surface/pixbuf/cached_scale 都应通过 g_object_set_data_full 的 destroy notify 自动释放。
+    // 在 destroy 信号回调里手动 cairo_surface_destroy 会与 GTK/Cairo 的销毁链交叉，导致堆损坏/崩溃。
 }
 
 // 槽位点击：删除并前移
@@ -1245,7 +1315,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     g_signal_connect_data(type_row, "notify::selected", 
                          G_CALLBACK(on_card_type_changed), 
                          groups, 
-                         (GClosureNotify)g_free, 
+                         free_user_data_closure_notify, 
                          0);
     
     // 触发一次类型变化以设置正确的可见性
@@ -2133,11 +2203,7 @@ static void show_card_preview(SearchUI *ui, const CardPreview *pv) {
                 }
                 ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
                 ctx->stack = ui->left_stack;
-                // 为 stack 增加弱引用，避免销毁后调用
-                if (ctx->stack) g_object_add_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
                 ctx->target = GTK_WIDGET(ui->left_picture);
-                // 防止目标控件销毁后悬空访问
-                g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
                 ctx->scale_to_thumb = FALSE;
                 ctx->cache_id = pv->id;  // 设置cache_id以便下载后保存到缓存
                 ctx->url = g_strdup(url);
@@ -2327,8 +2393,6 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
                     ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
                     ctx->stack = NULL;
                     ctx->target = GTK_WIDGET(target_pic);
-                    // 防止目标控件销毁后悬空访问
-                    g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
                     ctx->scale_to_thumb = TRUE;
                     ctx->cache_id = pv->id;  // 启用缓存检查和保存
                     ctx->add_to_thumb_cache = TRUE;  // 下载后保存到缩略图缓存
@@ -3017,6 +3081,8 @@ on_activate(GApplication *app, gpointer user_data)
     if (actual_state) {
         g_message("Offline data switch is ON, checking for updates...");
         check_offline_data_update(NULL, NULL);
+        // 预热离线数据解析缓存（后台线程），减少第一次搜索卡顿
+        offline_data_warm_cache_async();
     }
     gtk_box_append(GTK_BOX(offline_data_box), offline_data_switch);
     gtk_box_append(GTK_BOX(toolbar_section), offline_data_box);

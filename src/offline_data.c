@@ -6,10 +6,226 @@
 #include <archive_entry.h>
 #include <stdio.h>
 #include <string.h>
+#include <glib/gstdio.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <dirent.h>
 #include <unistd.h>
+
+// 离线 cards.json 解析缓存：避免每次搜索都重新 parse，尤其是第一次搜索会明显卡顿。
+static GMutex offline_cache_mutex;
+static JsonParser *offline_cards_parser = NULL;
+static JsonObject *offline_cards_root = NULL; // owned by parser->root
+static gchar *offline_cards_json_path = NULL;
+static gint64 offline_cards_json_mtime = 0;
+
+static gchar *get_cards_dir(void);
+
+static gchar *get_cards_json_path(void) {
+    gchar *cards_dir = get_cards_dir();
+    if (!cards_dir) return NULL;
+    gchar *json_path = g_build_filename(cards_dir, "cards.json", NULL);
+    g_free(cards_dir);
+    return json_path;
+}
+
+static gint64 stat_mtime_us(const char *path) {
+    if (!path) return 0;
+    GStatBuf st;
+    if (g_stat(path, &st) != 0) return 0;
+#if defined(G_OS_UNIX)
+    // st_mtime is seconds; convert to microseconds for a stable integer
+    return (gint64)st.st_mtime * 1000000;
+#else
+    return (gint64)st.st_mtime * 1000000;
+#endif
+}
+
+void offline_data_clear_cache(void) {
+    g_mutex_lock(&offline_cache_mutex);
+    if (offline_cards_parser) {
+        g_object_unref(offline_cards_parser);
+        offline_cards_parser = NULL;
+    }
+    offline_cards_root = NULL;
+    g_clear_pointer(&offline_cards_json_path, g_free);
+    offline_cards_json_mtime = 0;
+    g_mutex_unlock(&offline_cache_mutex);
+}
+
+static gboolean offline_cache_ensure_loaded_locked(void) {
+    gchar *json_path = get_cards_json_path();
+    if (!json_path) return FALSE;
+    if (!g_file_test(json_path, G_FILE_TEST_EXISTS)) {
+        g_free(json_path);
+        return FALSE;
+    }
+
+    gint64 mtime = stat_mtime_us(json_path);
+    gboolean need_reload = (offline_cards_parser == NULL) ||
+                           (offline_cards_root == NULL) ||
+                           (offline_cards_json_path == NULL) ||
+                           (g_strcmp0(offline_cards_json_path, json_path) != 0) ||
+                           (offline_cards_json_mtime != mtime);
+
+    if (!need_reload) {
+        g_free(json_path);
+        return TRUE;
+    }
+
+    // reload
+    if (offline_cards_parser) {
+        g_object_unref(offline_cards_parser);
+        offline_cards_parser = NULL;
+    }
+    offline_cards_root = NULL;
+    g_clear_pointer(&offline_cards_json_path, g_free);
+    offline_cards_json_mtime = 0;
+
+    JsonParser *parser = json_parser_new();
+    GError *error = NULL;
+    if (!json_parser_load_from_file(parser, json_path, &error)) {
+        g_warning("Failed to parse cards.json: %s", error ? error->message : "unknown error");
+        if (error) g_error_free(error);
+        g_object_unref(parser);
+        g_free(json_path);
+        return FALSE;
+    }
+
+    JsonNode *root = json_parser_get_root(parser);
+    if (!root || !JSON_NODE_HOLDS_OBJECT(root)) {
+        g_warning("Invalid JSON structure in cards.json");
+        g_object_unref(parser);
+        g_free(json_path);
+        return FALSE;
+    }
+
+    offline_cards_parser = parser;
+    offline_cards_root = json_node_get_object(root);
+    offline_cards_json_path = json_path; // take ownership
+    offline_cards_json_mtime = mtime;
+    return TRUE;
+}
+
+static gboolean card_matches_query(JsonObject *card, const gchar *query_lower) {
+    if (!card || !query_lower || query_lower[0] == '\0') return TRUE;
+
+    gboolean match = FALSE;
+    const gchar *name_fields[] = {"cn_name", "sc_name", "md_name", "jp_name", "en_name", "nwbbs_n", "cnocg_n", NULL};
+    for (int i = 0; name_fields[i] != NULL && !match; i++) {
+        if (json_object_has_member(card, name_fields[i])) {
+            const gchar *name = json_object_get_string_member(card, name_fields[i]);
+            if (name) {
+                gchar *name_lower = g_utf8_strdown(name, -1);
+                if (name_lower && strstr(name_lower, query_lower) != NULL) {
+                    match = TRUE;
+                }
+                g_free(name_lower);
+            }
+        }
+    }
+
+    if (!match && json_object_has_member(card, "text")) {
+        JsonObject *text = json_object_get_object_member(card, "text");
+        if (text && json_object_has_member(text, "desc")) {
+            const gchar *desc = json_object_get_string_member(text, "desc");
+            if (desc) {
+                gchar *desc_lower = g_utf8_strdown(desc, -1);
+                if (desc_lower && strstr(desc_lower, query_lower) != NULL) {
+                    match = TRUE;
+                }
+                g_free(desc_lower);
+            }
+        }
+    }
+
+    return match;
+}
+
+guint offline_foreach_card(const char *query,
+                           gboolean search_all,
+                           OfflineCardMatchFunc match_cb,
+                           gpointer user_data,
+                           guint max_results) {
+    // max_results==0 表示不限制，但这里为了 UI 不卡死，通常会传入 500。
+    if (!offline_data_exists()) return 0;
+
+    gchar *query_lower = NULL;
+    if (!search_all && query && query[0] != '\0') {
+        query_lower = g_utf8_strdown(query, -1);
+    }
+
+    guint accepted = 0;
+
+    JsonParser *parser_ref = NULL;
+    JsonObject *root_obj = NULL;
+    g_mutex_lock(&offline_cache_mutex);
+    gboolean ok = offline_cache_ensure_loaded_locked();
+    if (ok && offline_cards_parser && offline_cards_root) {
+        parser_ref = g_object_ref(offline_cards_parser);
+        root_obj = offline_cards_root;
+    }
+    g_mutex_unlock(&offline_cache_mutex);
+
+    if (!ok || !parser_ref || !root_obj) {
+        if (parser_ref) g_object_unref(parser_ref);
+        g_free(query_lower);
+        return 0;
+    }
+
+    JsonObjectIter iter;
+    json_object_iter_init(&iter, root_obj);
+    const gchar *member_name = NULL;
+    JsonNode *card_node = NULL;
+
+    while (json_object_iter_next(&iter, &member_name, &card_node)) {
+        (void)member_name;
+        if (!card_node || !JSON_NODE_HOLDS_OBJECT(card_node)) continue;
+        JsonObject *card = json_node_get_object(card_node);
+        if (!card) continue;
+
+        if (!search_all && query_lower && !card_matches_query(card, query_lower)) {
+            continue;
+        }
+
+        gboolean accept = TRUE;
+        if (match_cb) {
+            accept = match_cb(card, user_data);
+        }
+        if (accept) {
+            accepted++;
+            if (max_results > 0 && accepted >= max_results) break;
+        }
+    }
+
+    g_free(query_lower);
+    g_object_unref(parser_ref);
+    return accepted;
+}
+
+typedef struct {
+    gboolean done;
+} OfflineWarmCtx;
+
+static gpointer offline_warm_thread(gpointer data) {
+    OfflineWarmCtx *ctx = (OfflineWarmCtx*)data;
+    g_mutex_lock(&offline_cache_mutex);
+    (void)offline_cache_ensure_loaded_locked();
+    g_mutex_unlock(&offline_cache_mutex);
+    if (ctx) {
+        ctx->done = TRUE;
+        g_free(ctx);
+    }
+    return NULL;
+}
+
+void offline_data_warm_cache_async(void) {
+    // 仅在离线数据存在时预热；失败也不影响主流程。
+    if (!offline_data_exists()) return;
+    OfflineWarmCtx *ctx = g_new0(OfflineWarmCtx, 1);
+    GThread *t = g_thread_new("offline-warm-cache", offline_warm_thread, ctx);
+    g_thread_unref(t);
+}
 
 #define OFFLINE_DATA_URL "https://ygocdb.com/api/v0/cards.zip"
 #define OFFLINE_DATA_MD5_URL "https://ygocdb.com/api/v0/cards.zip.md5"
@@ -414,6 +630,9 @@ static gpointer download_offline_data_thread(gpointer data) {
     g_free(zip_path);
     g_free(data_dir);
     g_free(cards_dir);
+
+    // 离线数据更新后，清理解析缓存，避免读取旧文件。
+    offline_data_clear_cache();
     
     ctx->success = TRUE;
     if (ctx->callback) {
@@ -487,6 +706,9 @@ gboolean clear_offline_data(void) {
     }
     
     g_free(cards_dir);
+
+    // 清理离线数据后，清空解析缓存
+    offline_data_clear_cache();
     return success;
 }
 

@@ -277,7 +277,6 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
                 GdkPixbuf *cached = get_thumb_from_cache(img_id);
                 if (cached) {
                     slot_set_pixbuf(place_w, cached);
-                    g_object_unref(cached);
                 }
             }
             // 异步加载图片到目标槽位
@@ -286,8 +285,6 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
             ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
             ctx->stack = NULL;
             ctx->target = GTK_WIDGET(place_w);
-            // 防止目标槽位被销毁后异步回调访问
-            g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
             ctx->scale_to_thumb = TRUE;
             ctx->cache_id = 0;
             ctx->add_to_thumb_cache = FALSE;

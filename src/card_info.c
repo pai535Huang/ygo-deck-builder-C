@@ -240,7 +240,7 @@ void get_link_markers(uint32_t def_value, char* out, size_t out_size) {
 // 从魔法类别字符串获取对应的type值
 // 返回值：TYPE_SPELL 与具体类别的组合
 // category: "全部"返回 TYPE_SPELL
-//          "通常"返回 TYPE_SPELL | TYPE_NORMAL
+//          "通常"返回 TYPE_SPELL
 //          "仪式"返回 TYPE_SPELL | TYPE_RITUAL
 //          "速攻"返回 TYPE_SPELL | TYPE_QUICKPLAY
 //          "永续"返回 TYPE_SPELL | TYPE_CONTINUOUS
@@ -252,7 +252,7 @@ uint32_t get_spell_type_from_category(const char* category) {
     if (strcmp(category, "全部") == 0) {
         return TYPE_SPELL;
     } else if (strcmp(category, "通常") == 0) {
-        return TYPE_SPELL | TYPE_NORMAL;
+        return TYPE_SPELL;
     } else if (strcmp(category, "仪式") == 0) {
         return TYPE_SPELL | TYPE_RITUAL;
     } else if (strcmp(category, "速攻") == 0) {
@@ -271,7 +271,7 @@ uint32_t get_spell_type_from_category(const char* category) {
 // 从陷阱类别字符串获取对应的type值
 // 返回值：TYPE_TRAP 与具体类别的组合
 // category: "全部"返回 TYPE_TRAP
-//          "通常"返回 TYPE_TRAP | TYPE_NORMAL
+//          "通常"返回 TYPE_TRAP
 //          "永续"返回 TYPE_TRAP | TYPE_CONTINUOUS
 //          "反击"返回 TYPE_TRAP | TYPE_COUNTER
 uint32_t get_trap_type_from_category(const char* category) {
@@ -280,7 +280,7 @@ uint32_t get_trap_type_from_category(const char* category) {
     if (strcmp(category, "全部") == 0) {
         return TYPE_TRAP;
     } else if (strcmp(category, "通常") == 0) {
-        return TYPE_TRAP | TYPE_NORMAL;
+        return TYPE_TRAP;
     } else if (strcmp(category, "永续") == 0) {
         return TYPE_TRAP | TYPE_CONTINUOUS;
     } else if (strcmp(category, "反击") == 0) {

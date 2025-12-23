@@ -1,5 +1,8 @@
 #include "deck_slot.h"
 
+#define SLOT_THUMB_W 68
+#define SLOT_THUMB_H 99
+
 // 从槽位获取图片
 GdkPixbuf* slot_get_pixbuf(GtkWidget *pic) {
     return (GdkPixbuf*)g_object_get_data(G_OBJECT(pic), "pixbuf");
@@ -7,13 +10,26 @@ GdkPixbuf* slot_get_pixbuf(GtkWidget *pic) {
 
 // 设置槽位图片
 void slot_set_pixbuf(GtkWidget *pic, GdkPixbuf *pb) {
+    // 清除缓存的surface：由 destroy notify 统一回收
+    g_object_set_data_full(G_OBJECT(pic), "cached_surface", NULL, NULL);
+    // 清除渲染缓存（缩放后的 pixbuf）
+    g_object_set_data_full(G_OBJECT(pic), "cached_render", NULL, NULL);
+    
     if (pb) {
-        g_object_set_data_full(G_OBJECT(pic), "pixbuf", g_object_ref(pb), (GDestroyNotify)g_object_unref);
+        // 槽位展示为固定缩略图：按 HiDPI scale_factor 生成 device-pixel 尺寸，避免模糊
+        int sf = gtk_widget_get_scale_factor(pic);
+        if (sf < 1) sf = 1;
+        int tw = SLOT_THUMB_W * sf;
+        int th = SLOT_THUMB_H * sf;
+        GdkPixbuf *thumb = NULL;
+        if (gdk_pixbuf_get_width(pb) != tw || gdk_pixbuf_get_height(pb) != th) {
+            thumb = gdk_pixbuf_scale_simple(pb, tw, th, GDK_INTERP_HYPER);
+        }
+        if (!thumb) thumb = g_object_ref(pb);
+        g_object_set_data_full(G_OBJECT(pic), "pixbuf", thumb, (GDestroyNotify)g_object_unref);
     } else {
-        g_object_set_data(G_OBJECT(pic), "pixbuf", NULL);
+        g_object_set_data_full(G_OBJECT(pic), "pixbuf", NULL, NULL);
     }
-    // 清除缓存的surface,因为pixbuf已更改
-    g_object_set_data(G_OBJECT(pic), "cached_surface", NULL);
     gtk_widget_queue_draw(pic);
 }
 

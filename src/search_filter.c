@@ -37,9 +37,11 @@ static void preload_finished(GObject *source, GAsyncResult *res, gpointer user_d
     if (err) g_error_free(err);
     
     if (pb && pd->target && GTK_IS_DRAWING_AREA(pd->target)) {
-        g_object_set_data_full(G_OBJECT(pd->target), "pixbuf", pb, 
+        // 清空缓存的 surface（触发 destroy notify 如果有的话）
+        g_object_set_data_full(G_OBJECT(pd->target), "cached_surface", NULL, NULL);
+
+        g_object_set_data_full(G_OBJECT(pd->target), "pixbuf", pb,
                               (GDestroyNotify)g_object_unref);
-        g_object_set_data(G_OBJECT(pd->target), "cached_surface", NULL);
         gtk_widget_queue_draw(pd->target);
         if (pd->stack && GTK_IS_STACK(pd->stack)) {
             gtk_stack_set_visible_child_name(pd->stack, "picture");
@@ -61,8 +63,14 @@ static void preload_finished(GObject *source, GAsyncResult *res, gpointer user_d
 // 先行卡加载线程函数
 static void preload_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
     (void)source_object;
-    (void)cancellable;
     PreloadData *pd = (PreloadData*)task_data;
+    
+    // 检查是否被取消
+    if (cancellable && g_cancellable_is_cancelled(cancellable)) {
+        g_task_return_pointer(task, NULL, NULL);
+        return;
+    }
+    
     GError *err = NULL;
     GdkPixbuf *pb = gdk_pixbuf_new_from_file(pd->path, &err);
     if (err) {
@@ -86,8 +94,8 @@ gboolean search_load_next_image(gpointer user_data) {
         return G_SOURCE_REMOVE;
     }
     
-    // 每次加载 4 张图片以加快显示速度
-    int batch_size = 4;
+    // 每次加载 8 张图片以加快显示速度（适度增加批次避免过度占用带宽）
+    int batch_size = 8;
     int loaded = 0;
     
     while (loaded < batch_size && ui->search_image_queue && ui->search_image_queue->len > 0) {
@@ -169,13 +177,10 @@ gboolean search_load_next_image(gpointer user_data) {
                 ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
                 ctx->stack = stack;
                 ctx->target = target;
-                g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
-                g_object_add_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
                 ctx->scale_to_thumb = TRUE;
                 ctx->cache_id = img_id;
                 ctx->add_to_thumb_cache = TRUE;
                 ctx->url = g_strdup(url);
-                ctx->cancel_generation = get_cancel_generation();
                 load_image_async(ui->session, url, ctx);
             }
             loaded++;
@@ -196,8 +201,8 @@ gboolean batch_render_results(gpointer user_data) {
         return G_SOURCE_REMOVE;
     }
     
-    // 每次处理20个结果，平衡性能和响应性
-    const int BATCH_SIZE = 20;
+    // 每次处理50个结果，加快大量结果的渲染速度
+    const int BATCH_SIZE = 50;
     int processed = 0;
     
     while (processed < BATCH_SIZE && ui->pending_results && ui->pending_results->len > 0) {
@@ -328,8 +333,10 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
         if (!is_prerelease) {
             GdkPixbuf *cached = get_thumb_from_cache(id);
             if (cached) {
-                g_object_set_data_full(G_OBJECT(picture), "pixbuf", cached, (GDestroyNotify)g_object_unref);
-                g_object_set_data(G_OBJECT(picture), "cached_surface", NULL);
+                g_object_set_data(G_OBJECT(picture), "img_id", GINT_TO_POINTER(id));
+                g_object_set_data_full(G_OBJECT(picture), "pixbuf", g_object_ref(cached), (GDestroyNotify)g_object_unref);
+                g_object_set_data_full(G_OBJECT(picture), "cached_surface", NULL, NULL);
+                g_object_set_data_full(G_OBJECT(picture), "cached_render", NULL, NULL);
                 gtk_widget_queue_draw(picture);
                 gtk_stack_set_visible_child_name(GTK_STACK(thumb_stack), "picture");
                 loaded_from_cache = TRUE;
@@ -340,12 +347,28 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
         if (!loaded_from_cache && !is_prerelease) {
             GdkPixbuf *disk_cached = load_from_disk_cache(id);
             if (disk_cached) {
-                g_object_set_data_full(G_OBJECT(picture), "pixbuf", disk_cached, (GDestroyNotify)g_object_unref);
-                g_object_set_data(G_OBJECT(picture), "cached_surface", NULL);
+                g_object_set_data(G_OBJECT(picture), "img_id", GINT_TO_POINTER(id));
+                // 磁盘缓存通常是原图；这里缩放成固定缩略图，避免每行持有大图导致内存暴涨
+                int sf = gtk_widget_get_scale_factor(picture);
+                if (sf < 1) sf = 1;
+                int tw = 68 * sf;
+                int th = 99 * sf;
+
+                GdkPixbuf *thumb = disk_cached;
+                if (gdk_pixbuf_get_width(disk_cached) != tw || gdk_pixbuf_get_height(disk_cached) != th) {
+                    GdkPixbuf *scaled = gdk_pixbuf_scale_simple(disk_cached, tw, th, GDK_INTERP_HYPER);
+                    if (scaled) {
+                        g_object_unref(disk_cached);
+                        thumb = scaled;
+                    }
+                }
+                g_object_set_data_full(G_OBJECT(picture), "pixbuf", thumb, (GDestroyNotify)g_object_unref);
+                g_object_set_data_full(G_OBJECT(picture), "cached_surface", NULL, NULL);
+                g_object_set_data_full(G_OBJECT(picture), "cached_render", NULL, NULL);
                 gtk_widget_queue_draw(picture);
                 gtk_stack_set_visible_child_name(GTK_STACK(thumb_stack), "picture");
                 loaded_from_cache = TRUE;
-                // disk_cached的引用已经转移到picture的data中，不需要额外unref
+                // thumb 的引用已转移到 picture 的 data 中，不需要额外 unref
             }
         }
         
@@ -587,6 +610,22 @@ void on_trap_filter_toggled(GtkCheckButton *btn, gpointer user_data) {
     ui->filter_by_trap = gtk_check_button_get_active(btn);
 }
 
+typedef struct {
+    SearchUI *ui;
+    const FilterState *filter;
+    guint *result_count;
+} OfflineCollectCtx;
+
+// offline_foreach_card 的 match_cb：返回 TRUE 表示“接受并计数”
+static gboolean offline_collect_match_cb(JsonObject *item, gpointer user_data) {
+    OfflineCollectCtx *c = (OfflineCollectCtx*)user_data;
+    if (!item || !c || !c->ui || !c->filter || !c->result_count) return FALSE;
+    if (!apply_filter(item, c->filter)) return FALSE;
+    queue_result_for_render(c->ui, item);
+    (*c->result_count)++;
+    return TRUE;
+}
+
 void on_search_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     SearchUI *ui = (SearchUI*)user_data;
@@ -608,6 +647,9 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
         g_source_remove(ui->batch_render_id);
         ui->batch_render_id = 0;
     }
+    
+    // 注意：移除 g_main_context_iteration 调用，因为它可能导致重入问题
+    // 我们依赖于弱引用和 row_invalid 标记来防止访问已销毁的对象
     
     // 清理待渲染队列
     GPtrArray *old_pending = ui->pending_results;
@@ -670,6 +712,16 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
                 }
             }
             json_array_unref(prerelease_results);
+            
+            // 如果先行卡就达到最大结果数，显示警告
+            if (result_count >= MAX_RESULTS) {
+                g_message("Reached maximum result limit (%u) with prerelease cards", MAX_RESULTS);
+                if (ui->toast_overlay) {
+                    AdwToast *toast = adw_toast_new("搜索结果过多，已限制为 500 条。请缩小搜索范围。");
+                    adw_toast_set_timeout(toast, 3);
+                    adw_toast_overlay_add_toast(ui->toast_overlay, toast);
+                }
+            }
         }
     }
 
@@ -677,31 +729,25 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
     gboolean offline_enabled = load_offline_data_switch_state();
     
     if (offline_enabled && offline_data_exists() && result_count < MAX_RESULTS) {
-        // 使用离线数据搜索
+        // 使用离线数据搜索：改为流式遍历 + 过滤 + 达到上限即停止
         g_message("Searching in offline data...");
-        JsonArray *offline_results = search_all ? get_all_offline_cards() : search_offline_cards(q);
-        if (offline_results) {
-            guint len = json_array_get_length(offline_results);
-            g_message("Found %u cards in offline data", len);
-            
-            for (guint i = 0; i < len && result_count < MAX_RESULTS; i++) {
-                JsonObject *item = json_array_get_object_element(offline_results, i);
-                if (item) {
-                    // 应用筛选条件
-                    if (apply_filter(item, filter)) {
-                        queue_result_for_render(ui, item);
-                        result_count++;
-                    }
-                }
+
+        OfflineCollectCtx ctx = {
+            .ui = ui,
+            .filter = filter,
+            .result_count = &result_count,
+        };
+
+        guint remaining = (MAX_RESULTS > result_count) ? (MAX_RESULTS - result_count) : 0;
+        (void)offline_foreach_card(q, search_all, offline_collect_match_cb, &ctx, remaining);
+
+        if (result_count >= MAX_RESULTS) {
+            g_message("Reached maximum result limit (%u), stopping search", MAX_RESULTS);
+            if (ui->toast_overlay) {
+                AdwToast *toast = adw_toast_new("搜索结果过多，已限制为 500 条。请缩小搜索范围。");
+                adw_toast_set_timeout(toast, 3);
+                adw_toast_overlay_add_toast(ui->toast_overlay, toast);
             }
-            json_array_unref(offline_results);
-            
-            // 如果达到最大结果数，显示警告
-            if (result_count >= MAX_RESULTS) {
-                g_message("Reached maximum result limit (%u), stopping search", MAX_RESULTS);
-            }
-        } else {
-            g_message("No results found in offline data");
         }
     } else if (!search_all && result_count < MAX_RESULTS) {
         // 仅在有搜索关键词时进行在线API搜索

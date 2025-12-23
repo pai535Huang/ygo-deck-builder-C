@@ -9,6 +9,57 @@ static char *cache_dir = NULL;               // 缓存目录路径
 static GHashTable *pending_downloads = NULL; // 待处理下载
 static GMutex cache_mutex;                   // 缓存互斥锁
 
+// 缓存容量控制：避免内存无限增长
+#define THUMB_CACHE_MAX_ENTRIES 700
+#define FULLSIZE_CACHE_MAX_ENTRIES 80
+static GQueue *thumb_cache_order = NULL;     // key(dup) FIFO，用于淘汰
+static GQueue *fullsize_cache_order = NULL;  // key(dup) FIFO，用于淘汰
+
+// 是否启用内存缓存：默认关闭（只用磁盘缓存），避免内存持续上涨。
+// 如需启用，设置环境变量：YGO_ENABLE_MEM_CACHE=1
+static gboolean mem_cache_enabled = FALSE;
+static gsize mem_cache_enabled_inited = 0;
+
+static gboolean is_mem_cache_enabled(void) {
+    if (g_once_init_enter(&mem_cache_enabled_inited)) {
+        const char *v = g_getenv("YGO_ENABLE_MEM_CACHE");
+        mem_cache_enabled = (v && v[0] == '1');
+        g_once_init_leave(&mem_cache_enabled_inited, 1);
+    }
+    return mem_cache_enabled;
+}
+
+// 缩略图逻辑尺寸（与 UI 中 thumb-fixed 保持一致）
+#define THUMB_W 68
+#define THUMB_H 99
+
+static GdkPixbuf* create_thumb_pixbuf(GdkPixbuf *src, int scale_factor) {
+    if (!src) return NULL;
+    if (scale_factor < 1) scale_factor = 1;
+    const int tw = THUMB_W * scale_factor;
+    const int th = THUMB_H * scale_factor;
+
+    const int w = gdk_pixbuf_get_width(src);
+    const int h = gdk_pixbuf_get_height(src);
+    if (w == tw && h == th) {
+        return g_object_ref(src);
+    }
+    GdkPixbuf *scaled = gdk_pixbuf_scale_simple(src, tw, th, GDK_INTERP_HYPER);
+    if (scaled) return scaled;
+    return g_object_ref(src);
+}
+
+static void evict_cache_if_needed(GHashTable *cache, GQueue *order, guint max_entries) {
+    if (!cache || !order) return;
+    while (g_hash_table_size(cache) > max_entries) {
+        char *old_key = (char*)g_queue_pop_head(order);
+        if (!old_key) break;
+        // 可能存在重复 key（replace 时再次入队），remove 失败则忽略
+        g_hash_table_remove(cache, old_key);
+        g_free(old_key);
+    }
+}
+
 // 全局取消标志（使用计数器而不是GCancellable列表）
 // 每次开始新搜索时递增，回调检查这个值来判断是否应该继续
 static guint64 global_cancel_generation = 0;
@@ -39,8 +90,12 @@ void init_image_cache(void) {
     g_mutex_init(&cancel_generation_mutex);
     g_mutex_init(&download_queue_mutex);
     
-    thumb_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_object_unref);
-    fullsize_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_object_unref);
+    if (is_mem_cache_enabled()) {
+        thumb_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_object_unref);
+        fullsize_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_object_unref);
+        thumb_cache_order = g_queue_new();
+        fullsize_cache_order = g_queue_new();
+    }
     pending_downloads = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_ptr_array_unref);
     download_queue = g_queue_new();
     
@@ -71,6 +126,16 @@ void cleanup_image_cache(void) {
         g_hash_table_destroy(pending_downloads);
         pending_downloads = NULL;
     }
+
+    if (thumb_cache_order) {
+        g_queue_free_full(thumb_cache_order, g_free);
+        thumb_cache_order = NULL;
+    }
+    if (fullsize_cache_order) {
+        g_queue_free_full(fullsize_cache_order, g_free);
+        fullsize_cache_order = NULL;
+    }
+
     g_free(cache_dir);
     cache_dir = NULL;
     g_mutex_unlock(&cache_mutex);
@@ -125,6 +190,7 @@ void save_to_disk_cache(int card_id, GdkPixbuf *pixbuf) {
 }
 
 GdkPixbuf* get_thumb_from_cache(int card_id) {
+    if (!is_mem_cache_enabled()) return NULL;
     GdkPixbuf *result = NULL;
     g_mutex_lock(&cache_mutex);
     if (thumb_cache) {
@@ -137,6 +203,7 @@ GdkPixbuf* get_thumb_from_cache(int card_id) {
 }
 
 GdkPixbuf* get_fullsize_from_cache(int card_id) {
+    if (!is_mem_cache_enabled()) return NULL;
     GdkPixbuf *result = NULL;
     g_mutex_lock(&cache_mutex);
     if (fullsize_cache) {
@@ -174,11 +241,19 @@ void cancel_all_pending(void) {
     g_mutex_unlock(&cancel_generation_mutex);
     
     // 清空下载队列（这些还没开始下载）
+    // 同时移除 pending_downloads 里对应 URL 的条目：否则会一直残留，重复搜索会不断累积。
+    // 锁顺序必须与 load_image_async 一致：cache_mutex -> download_queue_mutex，避免死锁。
+    g_mutex_lock(&cache_mutex);
     g_mutex_lock(&download_queue_mutex);
     if (download_queue) {
         gpointer item;
         while ((item = g_queue_pop_head(download_queue)) != NULL) {
             ImageLoadCtx *ctx = (ImageLoadCtx*)item;
+
+            if (pending_downloads && ctx->url) {
+                g_hash_table_remove(pending_downloads, ctx->url);
+            }
+
             if (ctx->target) {
                 g_object_remove_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
             }
@@ -190,6 +265,7 @@ void cancel_all_pending(void) {
         }
     }
     g_mutex_unlock(&download_queue_mutex);
+    g_mutex_unlock(&cache_mutex);
     
     // 不要清空 pending_downloads！
     // 活跃的下载回调仍然会访问这个哈希表
@@ -268,45 +344,70 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
     if (err) {
         g_error_free(err);
     }
+
+    // 仅在需要缩略图时懒生成，避免每行持有大图导致内存飙升
+    GdkPixbuf *thumb_pixbuf = NULL;
     
     // 使用代次检查代替 g_cancellable_is_cancelled
     if (pixbuf && !is_cancelled(data->cancel_generation) && ctx->target) {
         // 额外的类型检查以确保对象仍然有效
         if (GTK_IS_WIDGET(ctx->target) && GTK_IS_DRAWING_AREA(ctx->target)) {
+            GdkPixbuf *ui_pixbuf = pixbuf;
+            if (ctx->scale_to_thumb) {
+                int sf = gtk_widget_get_scale_factor(GTK_WIDGET(ctx->target));
+                if (!thumb_pixbuf) thumb_pixbuf = create_thumb_pixbuf(pixbuf, sf);
+                ui_pixbuf = thumb_pixbuf ? thumb_pixbuf : pixbuf;
+            }
+            // 清空缓存的 surface（触发 destroy notify 如果有的话）
+            g_object_set_data_full(G_OBJECT(ctx->target), "cached_surface", NULL, NULL);
+            g_object_set_data_full(G_OBJECT(ctx->target), "cached_render", NULL, NULL);
+            
             // 目标是DrawingArea（卡组槽位）
-            g_object_set_data_full(G_OBJECT(ctx->target), "pixbuf", g_object_ref(pixbuf), 
+            g_object_set_data_full(G_OBJECT(ctx->target), "pixbuf", g_object_ref(ui_pixbuf), 
                                    (GDestroyNotify)g_object_unref);
-            g_object_set_data(G_OBJECT(ctx->target), "cached_surface", NULL);
             gtk_widget_queue_draw(ctx->target);
             
             if (ctx->stack && GTK_IS_STACK(ctx->stack)) {
                 gtk_stack_set_visible_child_name(ctx->stack, "picture");
             }
             
-            // 添加到缩略图缓存
-            if (ctx->add_to_thumb_cache && ctx->cache_id > 0) {
+            // 添加到缩略图缓存（只缓存缩略图；如禁用内存缓存则跳过）
+            if (is_mem_cache_enabled() && ctx->add_to_thumb_cache && ctx->cache_id > 0) {
+                int sf = 1;
+                if (ctx->target && GTK_IS_WIDGET(ctx->target)) sf = gtk_widget_get_scale_factor(GTK_WIDGET(ctx->target));
+                if (!thumb_pixbuf) thumb_pixbuf = create_thumb_pixbuf(pixbuf, sf);
                 g_mutex_lock(&cache_mutex);
                 if (!thumb_cache) {
                     thumb_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 
                                                        (GDestroyNotify)g_object_unref);
                 }
                 char *key = g_strdup_printf("%d", ctx->cache_id);
-                g_hash_table_replace(thumb_cache, key, g_object_ref(pixbuf));
+                g_hash_table_replace(thumb_cache, key, g_object_ref(thumb_pixbuf ? thumb_pixbuf : pixbuf));
+                if (thumb_cache_order) {
+                    g_queue_push_tail(thumb_cache_order, g_strdup(key));
+                    evict_cache_if_needed(thumb_cache, thumb_cache_order, THUMB_CACHE_MAX_ENTRIES);
+                }
                 g_mutex_unlock(&cache_mutex);
             }
             
-            // 保存到磁盘缓存和全尺寸缓存
+            // 保存到磁盘缓存；全尺寸内存缓存仅在启用内存缓存时写入
             if (ctx->cache_id > 0) {
-                g_mutex_lock(&cache_mutex);
-                char *key = g_strdup_printf("%d", ctx->cache_id);
-                if (!fullsize_cache) {
-                    fullsize_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 
-                                                          (GDestroyNotify)g_object_unref);
+                if (is_mem_cache_enabled()) {
+                    g_mutex_lock(&cache_mutex);
+                    char *key = g_strdup_printf("%d", ctx->cache_id);
+                    if (!fullsize_cache) {
+                        fullsize_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 
+                                                              (GDestroyNotify)g_object_unref);
+                    }
+                    g_hash_table_replace(fullsize_cache, g_strdup(key), g_object_ref(pixbuf));
+                    if (fullsize_cache_order) {
+                        g_queue_push_tail(fullsize_cache_order, g_strdup(key));
+                        evict_cache_if_needed(fullsize_cache, fullsize_cache_order, FULLSIZE_CACHE_MAX_ENTRIES);
+                    }
+                    g_mutex_unlock(&cache_mutex);
+                    g_free(key);
                 }
-                g_hash_table_replace(fullsize_cache, g_strdup(key), g_object_ref(pixbuf));
-                g_mutex_unlock(&cache_mutex);
                 save_to_disk_cache(ctx->cache_id, pixbuf);
-                g_free(key);
             }
         } else if (GTK_IS_PICTURE(ctx->target)) {
             // 目标是GtkPicture（左侧预览）
@@ -331,14 +432,24 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
             for (guint i = 0; i < waiting->len; i++) {
                 ImageLoadCtx *waiting_ctx = (ImageLoadCtx*)g_ptr_array_index(waiting, i);
                 if (!waiting_ctx) continue;
-                
+
                 // 只有在未取消且有有效pixbuf时才更新UI
                 if (!cancelled && pixbuf && waiting_ctx->target) {
                     // 额外的类型检查以确保对象仍然有效
                     if (GTK_IS_WIDGET(waiting_ctx->target) && GTK_IS_DRAWING_AREA(waiting_ctx->target)) {
-                        g_object_set_data_full(G_OBJECT(waiting_ctx->target), "pixbuf", 
-                                              g_object_ref(pixbuf), (GDestroyNotify)g_object_unref);
-                        g_object_set_data(G_OBJECT(waiting_ctx->target), "cached_surface", NULL);
+                        GdkPixbuf *ui_pixbuf = pixbuf;
+                        if (waiting_ctx->scale_to_thumb) {
+                            int sf = gtk_widget_get_scale_factor(GTK_WIDGET(waiting_ctx->target));
+                            if (!thumb_pixbuf) thumb_pixbuf = create_thumb_pixbuf(pixbuf, sf);
+                            ui_pixbuf = thumb_pixbuf ? thumb_pixbuf : pixbuf;
+                        }
+
+                        // 清空缓存的 surface（触发 destroy notify 如果有的话）
+                        g_object_set_data_full(G_OBJECT(waiting_ctx->target), "cached_surface", NULL, NULL);
+                        g_object_set_data_full(G_OBJECT(waiting_ctx->target), "cached_render", NULL, NULL);
+
+                        g_object_set_data_full(G_OBJECT(waiting_ctx->target), "pixbuf",
+                                               g_object_ref(ui_pixbuf), (GDestroyNotify)g_object_unref);
                         gtk_widget_queue_draw(waiting_ctx->target);
                         if (waiting_ctx->stack && GTK_IS_WIDGET(waiting_ctx->stack) && GTK_IS_STACK(waiting_ctx->stack)) {
                             gtk_stack_set_visible_child_name(waiting_ctx->stack, "picture");
@@ -346,7 +457,7 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
                     } else if (GTK_IS_WIDGET(waiting_ctx->target) && GTK_IS_PICTURE(waiting_ctx->target)) {
                         GdkTexture *tex = gdk_texture_new_for_pixbuf(pixbuf);
                         if (tex) {
-                            gtk_picture_set_paintable(GTK_PICTURE(waiting_ctx->target), 
+                            gtk_picture_set_paintable(GTK_PICTURE(waiting_ctx->target),
                                                      GDK_PAINTABLE(tex));
                             g_object_unref(tex);
                         }
@@ -355,14 +466,14 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
                         }
                     }
                 }
-                
+
                 // 无论是否取消都要清理等待上下文
                 if (waiting_ctx->target) {
-                    g_object_remove_weak_pointer(G_OBJECT(waiting_ctx->target), 
+                    g_object_remove_weak_pointer(G_OBJECT(waiting_ctx->target),
                                                 (gpointer*)&waiting_ctx->target);
                 }
                 if (waiting_ctx->stack) {
-                    g_object_remove_weak_pointer(G_OBJECT(waiting_ctx->stack), 
+                    g_object_remove_weak_pointer(G_OBJECT(waiting_ctx->stack),
                                                 (gpointer*)&waiting_ctx->stack);
                 }
                 g_free(waiting_ctx->url);
@@ -374,6 +485,7 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
     }
     
     if (pixbuf) g_object_unref(pixbuf);
+    if (thumb_pixbuf) g_object_unref(thumb_pixbuf);
     if (data->image_data) g_bytes_unref(data->image_data);
     
     // 保存session用于处理队列

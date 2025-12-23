@@ -50,6 +50,22 @@ JsonArray* search_offline_cards(const char *query);
  */
 JsonArray* get_all_offline_cards(void);
 
+// 以流式方式遍历离线卡片：避免一次性构建 1w+ 结果数组导致首搜卡顿。
+// match_cb 返回 TRUE 表示“接受并计数”；当接受数量达到 max_results 时停止遍历。
+typedef gboolean (*OfflineCardMatchFunc)(JsonObject *card, gpointer user_data);
+
+guint offline_foreach_card(const char *query,
+						   gboolean search_all,
+						   OfflineCardMatchFunc match_cb,
+						   gpointer user_data,
+						   guint max_results);
+
+// 预热离线 JSON 解析缓存（后台线程）：减少第一次搜索的卡顿。
+void offline_data_warm_cache_async(void);
+
+// 清空离线 JSON 解析缓存（例如清理/更新离线数据后）。
+void offline_data_clear_cache(void);
+
 /**
  * 从离线数据中根据卡片ID获取单张卡片信息
  * @param card_id 卡片ID
