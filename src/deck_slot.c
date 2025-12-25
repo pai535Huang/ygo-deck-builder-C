@@ -1,8 +1,5 @@
 #include "deck_slot.h"
 
-#define SLOT_THUMB_W 68
-#define SLOT_THUMB_H 99
-
 // 从槽位获取图片
 GdkPixbuf* slot_get_pixbuf(GtkWidget *pic) {
     return (GdkPixbuf*)g_object_get_data(G_OBJECT(pic), "pixbuf");

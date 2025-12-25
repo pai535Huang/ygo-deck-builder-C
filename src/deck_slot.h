@@ -4,6 +4,10 @@
 #include <gtk/gtk.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
 
+// 槽位缩略图的逻辑尺寸（与 UI 中 thumb-fixed / image_loader 缩略图保持一致）
+#define SLOT_THUMB_W 68
+#define SLOT_THUMB_H 99
+
 /**
  * 从槽位获取图片
  * @param pic 槽位widget

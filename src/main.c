@@ -2368,6 +2368,18 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
         }
         
         if (right_pixbuf) {
+            // 仅当右栏缩略图分辨率足够时才复用；否则会被放大导致明显变糊（尤其是 HiDPI）。
+            int sf = gtk_widget_get_scale_factor(target_pic);
+            if (sf < 1) sf = 1;
+            const int tw = SLOT_THUMB_W * sf;
+            const int th = SLOT_THUMB_H * sf;
+            if (gdk_pixbuf_get_width(right_pixbuf) < tw || gdk_pixbuf_get_height(right_pixbuf) < th) {
+                g_object_unref(right_pixbuf);
+                right_pixbuf = NULL;
+            }
+        }
+
+        if (right_pixbuf) {
             // 直接复用右栏的缩略图，立即显示（最快）
             slot_set_pixbuf(target_pic, right_pixbuf);
             g_object_unref(right_pixbuf);  // 释放我们增加的引用
