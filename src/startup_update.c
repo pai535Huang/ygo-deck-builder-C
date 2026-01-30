@@ -9,11 +9,13 @@
 
 #define OCG_FORBIDDEN_URL "https://www.db.yugioh-card.com/yugiohdb/forbidden_limited.action?request_locale=ja"
 #define TCG_FORBIDDEN_URL "https://www.db.yugioh-card.com/yugiohdb/forbidden_limited.action?request_locale=en"
+#define AE_FORBIDDEN_URL "https://www.db.yugioh-card.com/yugiohdb/forbidden_limited.action?request_locale=ae"
 #define SC_FORBIDDEN_URL "https://yxwdbapi.windoent.com/forbiddenCard/forbiddencard/cachelist?groupId=1"
 
 // 文件名常量
 #define OCG_FORBIDDEN_FILENAME "ocg_forbidden.json"
 #define TCG_FORBIDDEN_FILENAME "tcg_forbidden.json"
+#define AE_FORBIDDEN_FILENAME "ae_forbidden.json"
 #define SC_FORBIDDEN_FILENAME "sc_forbidden.json"
 
 /**
@@ -239,6 +241,97 @@ static JsonNode *parse_html_to_json_tcg(const char *html_content) {
     g_hash_table_unref(mapping);
     
     g_message("TCG: Parsed %d card entries", entry_count);
+    
+    return root;
+}
+
+/**
+ * 解析HTML并提取禁限卡信息转换为JSON (AE版本)
+ * 根据JS代码逻辑，通过检测div id和提取cid来构建cid -> 限制等级的映射
+ */
+static JsonNode *parse_html_to_json_ae(const char *html_content) {
+    // 状态机：-1=none, 0=forbidden, 1=limited, 2=semi-limited
+    int current_status = -1;
+    const char *status_labels[] = {"禁止", "限制", "准限制"};
+    
+    GHashTable *mapping = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+    
+    // 按行分割HTML
+    gchar **lines = g_strsplit(html_content, "\n", -1);
+    
+    for (int i = 0; lines[i] != NULL; i++) {
+        const char *line = lines[i];
+        
+        // 检测区域结束
+        if (strstr(line, "</div><!-- #list_semi_limited .list_set -->")) {
+            current_status = -1;
+        }
+        
+        // 检测区域开始
+        if (strstr(line, "<div id=\"list_semi_limited\" class=\"list_set\">")) {
+            current_status = 2; // 准限制
+        }
+        if (strstr(line, "<div id=\"list_forbidden\" class=\"list_set\">")) {
+            current_status = 0; // 禁止
+        }
+        if (strstr(line, "<div id=\"list_limited\" class=\"list_set\">")) {
+            current_status = 1; // 限制
+        }
+        
+        // 提取cid
+        if (current_status >= 0) {
+            const char *input_pos = strstr(line, "<input");
+            if (input_pos) {
+                const char *class_pos = strstr(input_pos, "class=\"link_value\"");
+                const char *value_pos = strstr(input_pos, "value=\"");
+                
+                if (class_pos && value_pos) {
+                    const char *cid_pos = strstr(value_pos, "cid=");
+                    if (cid_pos) {
+                        cid_pos += 4;
+                        char cid_buf[32] = {0};
+                        int j = 0;
+                        while (cid_pos[j] >= '0' && cid_pos[j] <= '9' && j < 31) {
+                            cid_buf[j] = cid_pos[j];
+                            j++;
+                        }
+                        if (j > 0) {
+                            g_hash_table_insert(
+                                mapping,
+                                g_strdup(cid_buf),
+                                g_strdup(status_labels[current_status])
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    g_strfreev(lines);
+    
+    // 构建JSON
+    JsonBuilder *builder = json_builder_new();
+    json_builder_begin_object(builder);
+    
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, mapping);
+    
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        json_builder_set_member_name(builder, (const char *)key);
+        json_builder_add_string_value(builder, (const char *)value);
+    }
+    
+    json_builder_end_object(builder);
+    
+    JsonNode *root = json_builder_get_root(builder);
+    g_object_unref(builder);
+    
+    guint entry_count = g_hash_table_size(mapping);
+    g_hash_table_unref(mapping);
+    
+    g_message("AE: Parsed %d card entries", entry_count);
     
     return root;
 }
@@ -499,6 +592,53 @@ static gpointer download_thread_func(G_GNUC_UNUSED gpointer data) {
 }
 
 /**
+ * 下载完成后的回调函数 (AE)
+ */
+static void on_download_complete_ae(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
+    GError *error = NULL;
+    GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
+    
+    if (error) {
+        g_warning("Failed to download AE forbidden list: %s", error->message);
+        g_error_free(error);
+        g_object_unref(session);
+        return;
+    }
+    
+    gsize size;
+    const char *html_content = g_bytes_get_data(response_body, &size);
+    
+    if (html_content && size > 0) {
+        // 确保配置数据目录存在
+        gchar *data_dir = get_config_data_dir();
+        if (!data_dir || !ensure_directory_exists(data_dir)) {
+            g_free(data_dir);
+            g_bytes_unref(response_body);
+            g_object_unref(session);
+            return;
+        }
+        g_free(data_dir);
+        
+        // 解析HTML并转换为JSON
+        JsonNode *json_root = parse_html_to_json_ae(html_content);
+        
+        // 获取输出文件路径并保存
+        gchar *output_file = get_output_file_path(AE_FORBIDDEN_FILENAME);
+        if (output_file) {
+            save_json_to_file(json_root, output_file);
+            g_free(output_file);
+        }
+        
+        json_node_free(json_root);
+    } else {
+        g_warning("Received empty response from AE forbidden list URL");
+    }
+    
+    g_bytes_unref(response_body);
+    g_object_unref(session);
+}
+
+/**
  * 下载完成后的回调函数 (TCG)
  */
 static void on_download_complete_tcg(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
@@ -591,6 +731,44 @@ static void on_download_complete_sc(SoupSession *session, GAsyncResult *result, 
     
     g_bytes_unref(response_body);
     g_object_unref(session);
+}
+
+/**
+ * 后台线程执行的下载任务 (AE)
+ */
+static gpointer download_thread_func_ae(G_GNUC_UNUSED gpointer data) {
+    // 创建独立的SoupSession用于后台下载
+    SoupSession *session = soup_session_new();
+    
+    // 创建请求消息
+    SoupMessage *msg = soup_message_new("GET", AE_FORBIDDEN_URL);
+    
+    if (!msg) {
+        g_warning("Failed to create HTTP request for AE forbidden list");
+        g_object_unref(session);
+        return NULL;
+    }
+    
+    // 设置User-Agent避免被服务器拒绝
+    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
+    soup_message_headers_append(headers, "User-Agent", 
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
+    
+    g_message("Starting background download of AE forbidden list...");
+    
+    // 异步发送请求
+    soup_session_send_and_read_async(
+        session,
+        msg,
+        G_PRIORITY_LOW,
+        NULL,
+        (GAsyncReadyCallback)on_download_complete_ae,
+        NULL
+    );
+    
+    g_object_unref(msg);
+    
+    return NULL;
 }
 
 /**
@@ -698,6 +876,22 @@ void startup_update_tcg_forbidden(void) {
         g_message("TCG forbidden list update started in background");
     } else {
         g_warning("Failed to start TCG forbidden list update thread");
+    }
+}
+
+/**
+ * 启动后台更新AE禁限卡表
+ * 此函数立即返回，实际下载在后台线程中进行
+ */
+void startup_update_ae_forbidden(void) {
+    GThread *thread = g_thread_new("ae-forbidden-update", download_thread_func_ae, NULL);
+    
+    if (thread) {
+        // 分离线程，让它在后台自行运行
+        g_thread_unref(thread);
+        g_message("AE forbidden list update started in background");
+    } else {
+        g_warning("Failed to start AE forbidden list update thread");
     }
 }
 

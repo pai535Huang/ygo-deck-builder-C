@@ -51,6 +51,7 @@ typedef struct {
     GtkDropDown *forbidden_dropdown;
     GHashTable *ocg_forbidden;
     GHashTable *tcg_forbidden;
+    GHashTable *ae_forbidden;
     GHashTable *sc_forbidden;
     // 过滤选项
     GtkWidget *filter_popover;

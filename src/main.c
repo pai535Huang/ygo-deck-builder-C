@@ -3100,7 +3100,7 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_box_append(GTK_BOX(toolbar_section), offline_data_box);
     
     // 创建禁限卡表下拉菜单
-    GtkWidget *forbidden_dropdown = gtk_drop_down_new_from_strings((const char *[]){"OCG", "TCG", "简体中文", NULL});
+    GtkWidget *forbidden_dropdown = gtk_drop_down_new_from_strings((const char *[]){"OCG", "TCG", "亚洲英文", "简体中文", NULL});
     gtk_drop_down_set_selected(GTK_DROP_DOWN(forbidden_dropdown), 0); // 默认选择OCG
     gtk_widget_set_tooltip_text(forbidden_dropdown, "选择禁限卡表");
     gtk_box_append(GTK_BOX(toolbar_section), forbidden_dropdown);
@@ -3305,19 +3305,23 @@ on_activate(GApplication *app, gpointer user_data)
     // 启动后台更新禁限卡表（先下载）
     startup_update_ocg_forbidden();
     startup_update_tcg_forbidden();
+    startup_update_ae_forbidden();
     startup_update_sc_forbidden();
     
     // 加载禁限卡表（从配置目录）
     gchar *ocg_path = get_forbidden_list_path("ocg_forbidden.json");
     gchar *tcg_path = get_forbidden_list_path("tcg_forbidden.json");
+    gchar *ae_path = get_forbidden_list_path("ae_forbidden.json");
     gchar *sc_path = get_forbidden_list_path("sc_forbidden.json");
     
     sui->ocg_forbidden = load_forbidden_list(ocg_path ? ocg_path : "");
     sui->tcg_forbidden = load_forbidden_list(tcg_path ? tcg_path : "");
+    sui->ae_forbidden = load_forbidden_list(ae_path ? ae_path : "");
     sui->sc_forbidden = load_forbidden_list(sc_path ? sc_path : "");
     
     g_free(ocg_path);
     g_free(tcg_path);
+    g_free(ae_path);
     g_free(sc_path);
     
     // 连接下拉菜单变化信号

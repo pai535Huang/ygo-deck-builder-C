@@ -116,7 +116,9 @@ int get_card_limit(SearchUI *ui, int card_id) {
             forbidden_table = ui->ocg_forbidden;
         } else if (selected == 1 && ui->tcg_forbidden) {
             forbidden_table = ui->tcg_forbidden;
-        } else if (selected == 2 && ui->sc_forbidden) {
+        } else if (selected == 2 && ui->ae_forbidden) {
+            forbidden_table = ui->ae_forbidden;
+        } else if (selected == 3 && ui->sc_forbidden) {
             forbidden_table = ui->sc_forbidden;
         }
     }
