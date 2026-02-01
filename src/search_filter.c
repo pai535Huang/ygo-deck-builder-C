@@ -479,6 +479,7 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
     gtk_widget_add_controller(list_row, motion);
     // 绑定点击事件（与中栏一致：pressed 记录、released 判定点击）
     GtkGesture *click = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 0);  // 0 表示接受所有按钮（左键、右键等）
     g_signal_connect(click, "pressed", G_CALLBACK(on_result_row_pressed), ui);
     g_signal_connect(click, "released", G_CALLBACK(on_result_row_released), ui);
     gtk_widget_add_controller(list_row, GTK_EVENT_CONTROLLER(click));

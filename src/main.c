@@ -2269,6 +2269,9 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
     }
     g_object_set_data_full(G_OBJECT(row), "press_xy", NULL, NULL);
 
+    // 获取当前按下的鼠标按钮
+    guint button = gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture));
+
     CardPreview *pv = (CardPreview*)g_object_get_data(G_OBJECT(row), "preview");
     if (!pv) return;
     
@@ -2286,8 +2289,6 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
             is_extra_type = TRUE;
         }
     }
-    enum { REGION_MAIN, REGION_EXTRA, REGION_SIDE } region = REGION_MAIN;
-    if (is_monster && is_extra_type) region = REGION_EXTRA;
     
     // 检查当前数量是否已达到限制
     if (pv->cid > 0) {
@@ -2297,17 +2298,13 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
         if (current_count >= limit) return;  // 已达到上限
     }
     
+    // 根据鼠标按钮决定目标区域
+    // 左键（按钮1）：按卡片类型自动选择主卡组/额外卡组，满了则溢出到副卡组
+    // 右键（按钮3）：直接加入副卡组
     GtkWidget *target_pic = NULL;
-    if (region == REGION_MAIN) {
-        if (ui->main_idx < (int)ui->main_pics->len) {
-            target_pic = GTK_WIDGET(g_ptr_array_index(ui->main_pics, ui->main_idx));
-            ui->main_idx++;
-            if (ui->main_count) {
-                char buf[16];
-                g_snprintf(buf, sizeof buf, "(%d)", ui->main_idx);
-                gtk_label_set_text(ui->main_count, buf);
-            }
-        } else if (ui->side_idx < (int)ui->side_pics->len) {
+    if (button == 3) {
+        // 右键点击：直接加入副卡组
+        if (ui->side_idx < (int)ui->side_pics->len) {
             target_pic = GTK_WIDGET(g_ptr_array_index(ui->side_pics, ui->side_idx));
             ui->side_idx++;
             if (ui->side_count) {
@@ -2316,22 +2313,46 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
                 gtk_label_set_text(ui->side_count, buf);
             }
         }
-    } else if (region == REGION_EXTRA) {
-        if (ui->extra_idx < (int)ui->extra_pics->len) {
-            target_pic = GTK_WIDGET(g_ptr_array_index(ui->extra_pics, ui->extra_idx));
-            ui->extra_idx++;
-            if (ui->extra_count) {
-                char buf[16];
-                g_snprintf(buf, sizeof buf, "(%d)", ui->extra_idx);
-                gtk_label_set_text(ui->extra_count, buf);
+    } else {
+        // 左键点击（默认）：原有逻辑
+        enum { REGION_MAIN, REGION_EXTRA, REGION_SIDE } region = REGION_MAIN;
+        if (is_monster && is_extra_type) region = REGION_EXTRA;
+        
+        if (region == REGION_MAIN) {
+            if (ui->main_idx < (int)ui->main_pics->len) {
+                target_pic = GTK_WIDGET(g_ptr_array_index(ui->main_pics, ui->main_idx));
+                ui->main_idx++;
+                if (ui->main_count) {
+                    char buf[16];
+                    g_snprintf(buf, sizeof buf, "(%d)", ui->main_idx);
+                    gtk_label_set_text(ui->main_count, buf);
+                }
+            } else if (ui->side_idx < (int)ui->side_pics->len) {
+                target_pic = GTK_WIDGET(g_ptr_array_index(ui->side_pics, ui->side_idx));
+                ui->side_idx++;
+                if (ui->side_count) {
+                    char buf[16];
+                    g_snprintf(buf, sizeof buf, "(%d)", ui->side_idx);
+                    gtk_label_set_text(ui->side_count, buf);
+                }
             }
-        } else if (ui->side_idx < (int)ui->side_pics->len) {
-            target_pic = GTK_WIDGET(g_ptr_array_index(ui->side_pics, ui->side_idx));
-            ui->side_idx++;
-            if (ui->side_count) {
-                char buf[16];
-                g_snprintf(buf, sizeof buf, "(%d)", ui->side_idx);
-                gtk_label_set_text(ui->side_count, buf);
+        } else if (region == REGION_EXTRA) {
+            if (ui->extra_idx < (int)ui->extra_pics->len) {
+                target_pic = GTK_WIDGET(g_ptr_array_index(ui->extra_pics, ui->extra_idx));
+                ui->extra_idx++;
+                if (ui->extra_count) {
+                    char buf[16];
+                    g_snprintf(buf, sizeof buf, "(%d)", ui->extra_idx);
+                    gtk_label_set_text(ui->extra_count, buf);
+                }
+            } else if (ui->side_idx < (int)ui->side_pics->len) {
+                target_pic = GTK_WIDGET(g_ptr_array_index(ui->side_pics, ui->side_idx));
+                ui->side_idx++;
+                if (ui->side_count) {
+                    char buf[16];
+                    g_snprintf(buf, sizeof buf, "(%d)", ui->side_idx);
+                    gtk_label_set_text(ui->side_count, buf);
+                }
             }
         }
     }
