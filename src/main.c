@@ -62,6 +62,9 @@ static char *last_import_directory = NULL;
 // 全局变量：是否在搜索结果中显示先行卡（默认显示）
 gboolean show_prerelease_cards = TRUE;
 
+// 前向声明：GENESYS 总分更新
+void update_genesys_score(SearchUI *ui);
+
 // 全局筛选状态（保持默认值）
 // FilterState 定义在 search_filter.h 中
 static FilterState filter_state = {
@@ -353,16 +356,19 @@ static void on_slot_clicked(GtkGestureClick *gesture, int n_press, double x, dou
         if (index < ui->main_idx) {
             shift_delete_slots(ui->main_pics, &ui->main_idx, index);
             update_count_label(ui->main_count, ui->main_idx);
+            update_genesys_score(ui);
         }
     } else if (g_strcmp0(region, "extra") == 0) {
         if (index < ui->extra_idx) {
             shift_delete_slots(ui->extra_pics, &ui->extra_idx, index);
             update_count_label(ui->extra_count, ui->extra_idx);
+            update_genesys_score(ui);
         }
     } else if (g_strcmp0(region, "side") == 0) {
         if (index < ui->side_idx) {
             shift_delete_slots(ui->side_pics, &ui->side_idx, index);
             update_count_label(ui->side_count, ui->side_idx);
+            update_genesys_score(ui);
         }
     }
     // 清理按下坐标
@@ -411,6 +417,7 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
     gboolean moving_is_extra = slot_get_is_extra(from_widget);
     int moving_card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(from_widget), "card_id"));
     int moving_img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(from_widget), "img_id"));
+    const char *moving_en_name = slot_get_en_name(from_widget);  // GENESYS 英文名
 
     // 规则限制：跨区域移动时
     // - 额外怪兽不可进入 main
@@ -444,19 +451,24 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
             int to_card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(to_widget), "card_id"));
             int from_img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(from_widget), "img_id"));
             int to_img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(to_widget), "img_id"));
+            const char *from_en = slot_get_en_name(from_widget);
+            const char *to_en   = slot_get_en_name(to_widget);
             g_object_set_data(G_OBJECT(to_widget), "card_id", GINT_TO_POINTER(from_card_id));
             g_object_set_data(G_OBJECT(to_widget), "img_id", GINT_TO_POINTER(from_img_id));
+            slot_set_en_name(to_widget, from_en);
             if (dest_pb_ref) {
                 slot_set_is_extra(from_widget, dest_is_extra);
                 slot_set_pixbuf(from_widget, dest_pb_ref);
                 g_object_set_data(G_OBJECT(from_widget), "card_id", GINT_TO_POINTER(to_card_id));
                 g_object_set_data(G_OBJECT(from_widget), "img_id", GINT_TO_POINTER(to_img_id));
+                slot_set_en_name(from_widget, to_en);
                 g_object_unref(dest_pb_ref);
             } else {
                 slot_set_is_extra(from_widget, FALSE);
                 slot_set_pixbuf(from_widget, NULL);
                 g_object_set_data(G_OBJECT(from_widget), "card_id", GINT_TO_POINTER(0));
                 g_object_set_data(G_OBJECT(from_widget), "img_id", GINT_TO_POINTER(0));
+                slot_set_en_name(from_widget, NULL);
             }
         } else {
             // moving to empty slot within region
@@ -465,6 +477,7 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
             slot_set_is_extra(from_widget, FALSE);
             g_object_set_data(G_OBJECT(from_widget), "card_id", GINT_TO_POINTER(0));
             g_object_set_data(G_OBJECT(from_widget), "img_id", GINT_TO_POINTER(0));
+            slot_set_en_name(from_widget, NULL);
             int place_index = to_index;
             // Feature: if target and its previous are empty, place to first truly empty index (scan)
             if (to_index >= *from_count) {
@@ -484,6 +497,7 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
             slot_set_is_extra(to_w, moving_is_extra);
             g_object_set_data(G_OBJECT(to_w), "card_id", GINT_TO_POINTER(moving_card_id));
             g_object_set_data(G_OBJECT(to_w), "img_id", GINT_TO_POINTER(moving_img_id));
+            slot_set_en_name(to_w, moving_en_name);
             // update count if we extended or filled a lower empty slot
             if (*from_count < place_index + 1) *from_count = place_index + 1;
         }
@@ -499,22 +513,26 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
             // swap type flags
             gboolean dest_is_extra = slot_get_is_extra(to_widget);
             slot_set_is_extra(to_widget, moving_is_extra);
-            // swap card_id and img_id
+            // swap card_id and img_id and en_name
             int to_card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(to_widget), "card_id"));
             int to_img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(to_widget), "img_id"));
+            const char *to_en_name = slot_get_en_name(to_widget);
             g_object_set_data(G_OBJECT(to_widget), "card_id", GINT_TO_POINTER(moving_card_id));
             g_object_set_data(G_OBJECT(to_widget), "img_id", GINT_TO_POINTER(moving_img_id));
+            slot_set_en_name(to_widget, moving_en_name);
             if (dest_pb_ref) {
                 slot_set_is_extra(from_widget, dest_is_extra);
                 slot_set_pixbuf(from_widget, dest_pb_ref);
                 g_object_set_data(G_OBJECT(from_widget), "card_id", GINT_TO_POINTER(to_card_id));
                 g_object_set_data(G_OBJECT(from_widget), "img_id", GINT_TO_POINTER(to_img_id));
+                slot_set_en_name(from_widget, to_en_name);
                 g_object_unref(dest_pb_ref);
             } else {
                 slot_set_is_extra(from_widget, FALSE);
                 slot_set_pixbuf(from_widget, NULL);
                 g_object_set_data(G_OBJECT(from_widget), "card_id", GINT_TO_POINTER(0));
                 g_object_set_data(G_OBJECT(from_widget), "img_id", GINT_TO_POINTER(0));
+                slot_set_en_name(from_widget, NULL);
             }
         } else {
             // Destination empty: remove from source, insert into destination, update counts
@@ -528,6 +546,7 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
             slot_set_is_extra(from_last, FALSE);
             g_object_set_data(G_OBJECT(from_last), "card_id", GINT_TO_POINTER(0));
             g_object_set_data(G_OBJECT(from_last), "img_id", GINT_TO_POINTER(0));
+            slot_set_en_name(from_last, NULL);
             *from_count = *from_count - 1;
 
             // Insert into destination
@@ -555,6 +574,7 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
                 slot_set_is_extra(place_w, moving_is_extra);
                 g_object_set_data(G_OBJECT(place_w), "card_id", GINT_TO_POINTER(moving_card_id));
                 g_object_set_data(G_OBJECT(place_w), "img_id", GINT_TO_POINTER(moving_img_id));
+                slot_set_en_name(place_w, moving_en_name);
             } else {
                 // place at first empty slot and increase count
                 GtkWidget *place_w = GTK_WIDGET(g_ptr_array_index(to_arr, place_index));
@@ -562,12 +582,14 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
                 slot_set_is_extra(place_w, moving_is_extra);
                 g_object_set_data(G_OBJECT(place_w), "card_id", GINT_TO_POINTER(moving_card_id));
                 g_object_set_data(G_OBJECT(place_w), "img_id", GINT_TO_POINTER(moving_img_id));
+                slot_set_en_name(place_w, moving_en_name);
             }
             if (*to_count < place_index + 1) *to_count = place_index + 1;
         }
     }
     update_count_label(from_label, *from_count);
     update_count_label(to_label, *to_count);
+    update_genesys_score(ui);
     g_object_unref(moving_pb_ref);
 }
 
@@ -575,10 +597,52 @@ void free_card_preview(gpointer data) {
     CardPreview *pv = (CardPreview*)data;
     if (!pv) return;
     g_free(pv->cn_name);
+    g_free(pv->en_name);
     g_free(pv->types);
     g_free(pv->pdesc);
     g_free(pv->desc);
     g_free(pv);
+}
+
+void update_genesys_score(SearchUI *ui) {
+    if (!ui || !ui->genesys_score_label) return;
+    guint selected = gtk_drop_down_get_selected(ui->forbidden_dropdown);
+    if (selected != 4) {
+        gtk_widget_set_visible(GTK_WIDGET(ui->genesys_score_label), FALSE);
+        return;
+    }
+    int total = 0;
+    // 遍历 main
+    for (int i = 0; i < ui->main_idx; i++) {
+        GtkWidget *w = GTK_WIDGET(g_ptr_array_index(ui->main_pics, i));
+        const char *en = slot_get_en_name(w);
+        if (en && ui->genesys_forbidden) {
+            const char *pts = g_hash_table_lookup(ui->genesys_forbidden, en);
+            if (pts) total += atoi(pts);
+        }
+    }
+    // 遍历 extra
+    for (int i = 0; i < ui->extra_idx; i++) {
+        GtkWidget *w = GTK_WIDGET(g_ptr_array_index(ui->extra_pics, i));
+        const char *en = slot_get_en_name(w);
+        if (en && ui->genesys_forbidden) {
+            const char *pts = g_hash_table_lookup(ui->genesys_forbidden, en);
+            if (pts) total += atoi(pts);
+        }
+    }
+    // 遍历 side
+    for (int i = 0; i < ui->side_idx; i++) {
+        GtkWidget *w = GTK_WIDGET(g_ptr_array_index(ui->side_pics, i));
+        const char *en = slot_get_en_name(w);
+        if (en && ui->genesys_forbidden) {
+            const char *pts = g_hash_table_lookup(ui->genesys_forbidden, en);
+            if (pts) total += atoi(pts);
+        }
+    }
+    char buf[64];
+    g_snprintf(buf, sizeof(buf), "总分: %d/100", total);
+    gtk_label_set_text(ui->genesys_score_label, buf);
+    gtk_widget_set_visible(GTK_WIDGET(ui->genesys_score_label), TRUE);
 }
 
 typedef struct {
@@ -644,6 +708,7 @@ static void on_import_file_open_finish(GObject *source, GAsyncResult *result, gp
             import_data->ui->session,
             path
         );
+        update_genesys_score(import_data->ui);
         
         // 保存导入目录到缓存
         char *dir = g_path_get_dirname(path);
@@ -1788,6 +1853,7 @@ static void on_import_url_clicked(GtkButton *btn, gpointer user_data) {
     update_count_label(ui->main_count, ui->main_idx);
     update_count_label(ui->extra_count, ui->extra_idx);
     update_count_label(ui->side_count, ui->side_idx);
+    update_genesys_score(ui);
     
     // 清理
     g_free(main_cards);
@@ -1997,6 +2063,7 @@ static void on_clear_dialog_response(AdwAlertDialog *dialog, const char *respons
             ui->extra_pics, &ui->extra_idx, ui->extra_count,
             ui->side_pics, &ui->side_idx, ui->side_count
         );
+        update_genesys_score(ui);
     }
     // 如果是 "cancel"，则不做任何操作
 }
@@ -2367,8 +2434,8 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
     if (pv->id > 0) {
         g_object_set_data(G_OBJECT(target_pic), "img_id", GINT_TO_POINTER(pv->id));
     }
-    
-    // 加载图片
+    // 存储英文卡名（GENESYS 分值查找用）
+    slot_set_en_name(target_pic, pv->en_name);
     if (pv->id > 0) {
         // 优先尝试从右栏行中获取已加载的缩略图（零延迟）
         GdkPixbuf *right_pixbuf = NULL;
@@ -2436,6 +2503,7 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
             }
         }
     }
+    update_genesys_score(ui);
 }
 
 void on_result_row_enter(GtkEventControllerMotion *controller, double x, double y, gpointer user_data) {
@@ -3121,7 +3189,7 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_box_append(GTK_BOX(toolbar_section), offline_data_box);
     
     // 创建禁限卡表下拉菜单
-    GtkWidget *forbidden_dropdown = gtk_drop_down_new_from_strings((const char *[]){"OCG", "TCG", "亚洲英文", "简体中文", NULL});
+    GtkWidget *forbidden_dropdown = gtk_drop_down_new_from_strings((const char *[]){"OCG", "TCG", "亚洲英文", "简体中文", "GENESYS", NULL});
     gtk_drop_down_set_selected(GTK_DROP_DOWN(forbidden_dropdown), 0); // 默认选择OCG
     gtk_widget_set_tooltip_text(forbidden_dropdown, "选择禁限卡表");
     gtk_box_append(GTK_BOX(toolbar_section), forbidden_dropdown);
@@ -3147,6 +3215,10 @@ on_activate(GApplication *app, gpointer user_data)
     GtkWidget *main_count = gtk_label_new("(0)");
     gtk_widget_add_css_class(main_count, "dim-label");
     gtk_box_append(GTK_BOX(main_title_row), main_count);
+    GtkWidget *genesys_score_label = gtk_label_new("总分: 0/100");
+    gtk_widget_add_css_class(genesys_score_label, "dim-label");
+    gtk_widget_set_visible(genesys_score_label, FALSE);
+    gtk_box_append(GTK_BOX(main_title_row), genesys_score_label);
     gtk_box_append(GTK_BOX(main_section), main_title_row);
     // 使用 ScrolledWindow 包装，让内容有自然宽度
     GtkWidget *main_placeholder = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
@@ -3328,22 +3400,26 @@ on_activate(GApplication *app, gpointer user_data)
     startup_update_tcg_forbidden();
     startup_update_ae_forbidden();
     startup_update_sc_forbidden();
+    startup_update_genesys_forbidden();
     
     // 加载禁限卡表（从配置目录）
     gchar *ocg_path = get_forbidden_list_path("ocg_forbidden.json");
     gchar *tcg_path = get_forbidden_list_path("tcg_forbidden.json");
     gchar *ae_path = get_forbidden_list_path("ae_forbidden.json");
     gchar *sc_path = get_forbidden_list_path("sc_forbidden.json");
+    gchar *genesys_path = get_forbidden_list_path("genesys_forbidden.json");
     
     sui->ocg_forbidden = load_forbidden_list(ocg_path ? ocg_path : "");
     sui->tcg_forbidden = load_forbidden_list(tcg_path ? tcg_path : "");
     sui->ae_forbidden = load_forbidden_list(ae_path ? ae_path : "");
     sui->sc_forbidden = load_forbidden_list(sc_path ? sc_path : "");
+    sui->genesys_forbidden = load_forbidden_list(genesys_path ? genesys_path : "");
     
     g_free(ocg_path);
     g_free(tcg_path);
     g_free(ae_path);
     g_free(sc_path);
+    g_free(genesys_path);
     
     // 连接下拉菜单变化信号
     g_signal_connect(forbidden_dropdown, "notify::selected", G_CALLBACK(on_forbidden_dropdown_changed), sui);
@@ -3428,6 +3504,7 @@ on_activate(GApplication *app, gpointer user_data)
     sui->side_idx = 0;
     // 计数标签绑定
     sui->main_count = GTK_LABEL(main_count);
+    sui->genesys_score_label = GTK_LABEL(genesys_score_label);
     sui->extra_count = GTK_LABEL(g_object_get_data(G_OBJECT(extra_header), "count_label"));
     sui->side_count  = GTK_LABEL(g_object_get_data(G_OBJECT(side_header), "count_label"));
 

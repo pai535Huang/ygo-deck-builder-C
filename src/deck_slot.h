@@ -35,7 +35,19 @@ gboolean slot_get_is_extra(GtkWidget *pic);
  * @param is_extra TRUE表示额外卡，FALSE表示主卡组卡
  */
 void slot_set_is_extra(GtkWidget *pic, gboolean is_extra);
+/**
+ * 获取槽位存储的英文卡名（用于 GENESYS 分值查找）
+ * @param pic 槽位 widget
+ * @return 英文名字符串（不需要释放），不存在时返回 NULL
+ */
+const char* slot_get_en_name(GtkWidget *pic);
 
+/**
+ * 设置槽位的英文卡名（用于 GENESYS 分值查找）
+ * @param pic 槽位 widget
+ * @param en_name 英文名字符串，NULL 表示清空（函数内部会拷贝一份）
+ */
+void slot_set_en_name(GtkWidget *pic, const char *en_name);
 /**
  * 查找第一个空槽位
  * @param pics 槽位数组

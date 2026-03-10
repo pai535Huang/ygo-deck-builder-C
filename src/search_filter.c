@@ -19,6 +19,7 @@ extern void free_card_preview(gpointer data);
 extern void on_result_row_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data);
 extern void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data);
 extern void on_result_row_enter(GtkEventControllerMotion *controller, double x, double y, gpointer user_data);
+extern void update_genesys_score(SearchUI *ui);  // GENESYS 总分更新
 
 // 先行卡异步加载的数据结构
 typedef struct {
@@ -418,48 +419,112 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
     gtk_box_append(GTK_BOX(vbox), subtitle);
     
     // 显示禁限状态（使用cid而非id）
-    if (cid > 0 && ui->forbidden_dropdown) {
+    if (ui->forbidden_dropdown) {
         guint selected = gtk_drop_down_get_selected(ui->forbidden_dropdown);
-        GHashTable *forbidden_table = NULL;
-        
-        if (selected == 0 && ui->ocg_forbidden) {
-            forbidden_table = ui->ocg_forbidden;
-        } else if (selected == 1 && ui->tcg_forbidden) {
-            forbidden_table = ui->tcg_forbidden;
-        } else if (selected == 2 && ui->ae_forbidden) {
-            forbidden_table = ui->ae_forbidden;
-        } else if (selected == 3 && ui->sc_forbidden) {
-            forbidden_table = ui->sc_forbidden;
-        }
-        
-        if (forbidden_table) {
-            char cid_str[32];
-            g_snprintf(cid_str, sizeof(cid_str), "%d", cid);
-            const char *status = g_hash_table_lookup(forbidden_table, cid_str);
-            
-            if (status) {
-                // 创建带背景色的禁限状态标签
+
+        if (selected == 4) {
+            // ---- GENESYS 模式 ----
+            // 规则1：灵摆怪兽（TYPE_PENDULUM=0x1000000）和连接怪兽（TYPE_LINK=0x4000000）全部禁止
+            // 规则2：其余卡片按分值表显示分值（0分的卡无需显示）
+
+            // 从JSON中获取卡片type字段
+            uint32_t card_type = 0;
+            if (json_object_has_member(obj, "type")) {
+                // 先行卡：type直接在顶层
+                card_type = (uint32_t)json_object_get_int_member(obj, "type");
+            } else if (json_object_has_member(obj, "data")) {
+                JsonObject *data_obj = json_object_get_object_member(obj, "data");
+                if (data_obj && json_object_has_member(data_obj, "type")) {
+                    card_type = (uint32_t)json_object_get_int_member(data_obj, "type");
+                }
+            }
+
+            gboolean is_pendulum = (card_type & 0x1000000) != 0;
+            gboolean is_link     = (card_type & 0x4000000) != 0;
+
+            const char *display_status = NULL;
+            const char *css_class = NULL;
+            gchar *points_buf = NULL;
+
+            if (is_pendulum || is_link) {
+                display_status = "禁止";
+                css_class = "error";
+            } else if (cid > 0 && ui->genesys_forbidden) {
+                // 通过英文卡名查找分值（GENESYS表键为英文卡名）
+                const char *en_name = NULL;
+                if (json_object_has_member(obj, "en_name")) {
+                    en_name = json_object_get_string_member(obj, "en_name");
+                }
+                if (en_name && *en_name != '\0') {
+                    const char *pts = (const char *)g_hash_table_lookup(ui->genesys_forbidden, en_name);
+                    if (pts && *pts != '\0') {
+                        points_buf = g_strdup_printf("%s分", pts);
+                        display_status = points_buf;
+                        css_class = "accent";
+                    }
+                }
+            }
+
+            if (display_status) {
                 GtkWidget *forbidden_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
                 gtk_widget_set_halign(forbidden_box, GTK_ALIGN_START);
-                
+
                 GtkWidget *forbidden_label = gtk_label_new(NULL);
-                char *markup = g_strdup_printf("<b>[%s]</b>", status);
+                char *markup = g_strdup_printf("<b>[%s]</b>", display_status);
                 gtk_label_set_markup(GTK_LABEL(forbidden_label), markup);
                 g_free(markup);
-                
                 gtk_label_set_xalign(GTK_LABEL(forbidden_label), 0.0);
-                
-                // 根据不同状态设置不同样式
-                if (g_strcmp0(status, "禁止") == 0) {
-                    gtk_widget_add_css_class(forbidden_label, "error");
-                } else if (g_strcmp0(status, "限制") == 0) {
-                    gtk_widget_add_css_class(forbidden_label, "warning");
-                } else if (g_strcmp0(status, "准限制") == 0) {
-                    gtk_widget_add_css_class(forbidden_label, "accent");
+
+                if (css_class) {
+                    gtk_widget_add_css_class(forbidden_label, css_class);
                 }
-                
+
                 gtk_box_append(GTK_BOX(forbidden_box), forbidden_label);
                 gtk_box_append(GTK_BOX(vbox), forbidden_box);
+            }
+
+            g_free(points_buf);
+
+        } else {
+            // ---- OCG / TCG / AE / SC 模式（原逻辑）----
+            GHashTable *forbidden_table = NULL;
+
+            if (selected == 0 && ui->ocg_forbidden) {
+                forbidden_table = ui->ocg_forbidden;
+            } else if (selected == 1 && ui->tcg_forbidden) {
+                forbidden_table = ui->tcg_forbidden;
+            } else if (selected == 2 && ui->ae_forbidden) {
+                forbidden_table = ui->ae_forbidden;
+            } else if (selected == 3 && ui->sc_forbidden) {
+                forbidden_table = ui->sc_forbidden;
+            }
+
+            if (cid > 0 && forbidden_table) {
+                char cid_str[32];
+                g_snprintf(cid_str, sizeof(cid_str), "%d", cid);
+                const char *status = g_hash_table_lookup(forbidden_table, cid_str);
+
+                if (status) {
+                    GtkWidget *forbidden_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+                    gtk_widget_set_halign(forbidden_box, GTK_ALIGN_START);
+
+                    GtkWidget *forbidden_label = gtk_label_new(NULL);
+                    char *markup = g_strdup_printf("<b>[%s]</b>", status);
+                    gtk_label_set_markup(GTK_LABEL(forbidden_label), markup);
+                    g_free(markup);
+                    gtk_label_set_xalign(GTK_LABEL(forbidden_label), 0.0);
+
+                    if (g_strcmp0(status, "禁止") == 0) {
+                        gtk_widget_add_css_class(forbidden_label, "error");
+                    } else if (g_strcmp0(status, "限制") == 0) {
+                        gtk_widget_add_css_class(forbidden_label, "warning");
+                    } else if (g_strcmp0(status, "准限制") == 0) {
+                        gtk_widget_add_css_class(forbidden_label, "accent");
+                    }
+
+                    gtk_box_append(GTK_BOX(forbidden_box), forbidden_label);
+                    gtk_box_append(GTK_BOX(vbox), forbidden_box);
+                }
             }
         }
     }
@@ -488,6 +553,9 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
     pv->id = id;
     pv->cid = cid;
     pv->cn_name = name ? g_strdup(name) : NULL;
+    // 英文卡名（GENESYS 分值查找用）
+    const char *en_name_raw = json_object_has_member(obj, "en_name") ? json_object_get_string_member(obj, "en_name") : NULL;
+    pv->en_name = en_name_raw ? g_strdup(en_name_raw) : NULL;
     pv->is_prerelease = is_prerelease;  // 设置是否是先行卡
     
     // 获取类型和其他 data 字段：先行卡的字段在顶层，普通卡的在 data 对象中
@@ -590,6 +658,9 @@ void on_forbidden_dropdown_changed(GtkDropDown *dropdown, GParamSpec *pspec, gpo
     (void)pspec;
     SearchUI *ui = (SearchUI*)user_data;
     
+    // 更新 GENESYS 总分显示
+    update_genesys_score(ui);
+
     // 重新触发搜索以更新禁限状态显示
     const char *q = gtk_editable_get_text(GTK_EDITABLE(ui->entry));
     if (q && *q != '\0') {

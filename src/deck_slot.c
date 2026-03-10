@@ -40,6 +40,18 @@ void slot_set_is_extra(GtkWidget *pic, gboolean is_extra) {
     g_object_set_data(G_OBJECT(pic), "slot_is_extra_type", GINT_TO_POINTER(is_extra ? 1 : 0));
 }
 
+// 获取槽位存储的英文卡名
+const char* slot_get_en_name(GtkWidget *pic) {
+    return (const char*)g_object_get_data(G_OBJECT(pic), "en_name");
+}
+
+// 设置槽位的英文卡名
+void slot_set_en_name(GtkWidget *pic, const char *en_name) {
+    g_object_set_data_full(G_OBJECT(pic), "en_name",
+                           en_name ? g_strdup(en_name) : NULL,
+                           en_name ? (GDestroyNotify)g_free : NULL);
+}
+
 // 查找第一个空槽位
 int array_find_first_empty(GPtrArray *pics) {
     if (!pics) return -1;
@@ -73,6 +85,7 @@ void shift_delete_slots(GPtrArray *pics, int *count_ptr, int del_index) {
         g_object_set_data(G_OBJECT(dst), "card_id", GINT_TO_POINTER(card_id));
         int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(src), "img_id"));
         g_object_set_data(G_OBJECT(dst), "img_id", GINT_TO_POINTER(img_id));
+        slot_set_en_name(dst, slot_get_en_name(src));
     }
     // 清空最后一个原已填槽
     if (count > 0) {
@@ -81,6 +94,7 @@ void shift_delete_slots(GPtrArray *pics, int *count_ptr, int del_index) {
         slot_set_is_extra(last, FALSE);
         g_object_set_data(G_OBJECT(last), "card_id", GINT_TO_POINTER(0));
         g_object_set_data(G_OBJECT(last), "img_id", GINT_TO_POINTER(0));
+        slot_set_en_name(last, NULL);
     }
     *count_ptr = count - 1;
 }
@@ -102,6 +116,7 @@ void array_shift_right(GPtrArray *pics, int start, int end) {
         g_object_set_data(G_OBJECT(dst), "card_id", GINT_TO_POINTER(card_id));
         int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(src), "img_id"));
         g_object_set_data(G_OBJECT(dst), "img_id", GINT_TO_POINTER(img_id));
+        slot_set_en_name(dst, slot_get_en_name(src));
     }
 }
 
@@ -122,5 +137,6 @@ void array_shift_left(GPtrArray *pics, int start, int end) {
         g_object_set_data(G_OBJECT(dst), "card_id", GINT_TO_POINTER(card_id));
         int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(src), "img_id"));
         g_object_set_data(G_OBJECT(dst), "img_id", GINT_TO_POINTER(img_id));
+        slot_set_en_name(dst, slot_get_en_name(src));
     }
 }

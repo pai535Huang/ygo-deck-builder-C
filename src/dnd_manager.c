@@ -10,6 +10,7 @@ extern void perform_move(SearchUI *ui, const char *from_region, int from_index, 
 extern void update_count_label(GtkLabel *label, int count);
 extern int array_find_first_empty(GPtrArray *arr);
 extern void array_shift_right(GPtrArray *arr, int start, int end);
+extern void update_genesys_score(SearchUI *ui);  // GENESYS 总分更新
 
 // DnD: drag setup
 GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, double y, gpointer user_data) {
@@ -44,8 +45,10 @@ GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, double y, g
             }
         }
         gboolean is_extra_card = is_monster && is_extra_type;
-        // payload 格式: search:<cid>:<id>:<isExtra>:<isPrerelease>
-        char *payload = g_strdup_printf("search:%d:%d:%d:%d", pv->cid, pv->id, is_extra_card ? 1 : 0, pv->is_prerelease ? 1 : 0);
+        // payload 格式: search:<cid>:<id>:<isExtra>:<isPrerelease>:<en_name>
+        char *payload = g_strdup_printf("search:%d:%d:%d:%d:%s",
+            pv->cid, pv->id, is_extra_card ? 1 : 0, pv->is_prerelease ? 1 : 0,
+            pv->en_name ? pv->en_name : "");
         return gdk_content_provider_new_typed(G_TYPE_STRING, payload);
     }
     // 中栏槽位拖拽：仅当槽位已有图像时才允许拖拽
@@ -198,7 +201,8 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
         int img_id = 0;   // id，用于图片URL
         int is_extra = 0;
         int is_prerelease = 0;
-        // 解析 search:cid:id:isExtra:isPrerelease
+        const char *en_name_str = NULL;  // GENESYS 分值查找用
+        // 解析 search:cid:id:isExtra:isPrerelease:en_name
         const char *p = payload + 7;
         const char *colon1 = strchr(p, ':');
         if (colon1) {
@@ -209,7 +213,15 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
                 const char *colon3 = strchr(colon2 + 1, ':');
                 if (colon3) {
                     is_extra = atoi(colon2 + 1);
-                    is_prerelease = atoi(colon3 + 1);
+                    const char *colon4 = strchr(colon3 + 1, ':');
+                    if (colon4) {
+                        is_prerelease = atoi(colon3 + 1);
+                        // en_name 是第5个冒号之后直到行尾
+                        en_name_str = colon4 + 1;
+                    } else {
+                        is_extra = atoi(colon2 + 1);
+                        is_prerelease = atoi(colon3 + 1);
+                    }
                 } else {
                     is_extra = atoi(colon2 + 1);
                 }
@@ -254,6 +266,8 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
         slot_set_is_extra(place_w, is_extra ? TRUE : FALSE);
         g_object_set_data(G_OBJECT(place_w), "card_id", GINT_TO_POINTER(card_id));
         g_object_set_data(G_OBJECT(place_w), "img_id", GINT_TO_POINTER(img_id));
+        // 存储英文和名（GENESYS 分值查找用）
+        slot_set_en_name(place_w, (en_name_str && *en_name_str) ? en_name_str : NULL);
         
         // 如果是先行卡，从本地加载图片
         if (is_prerelease) {
@@ -295,6 +309,7 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
         }
         if (*to_count < place_index + 1) *to_count = place_index + 1;
         update_count_label(to_label, *to_count);
+        update_genesys_score(ui);
         return;
     }
     // 原有 region:index 处理

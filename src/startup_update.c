@@ -11,12 +11,14 @@
 #define TCG_FORBIDDEN_URL "https://www.db.yugioh-card.com/yugiohdb/forbidden_limited.action?request_locale=en"
 #define AE_FORBIDDEN_URL "https://www.db.yugioh-card.com/yugiohdb/forbidden_limited.action?request_locale=ae"
 #define SC_FORBIDDEN_URL "https://yxwdbapi.windoent.com/forbiddenCard/forbiddencard/cachelist?groupId=1"
+#define GENESYS_FORBIDDEN_URL "https://www.yugioh-card.com/en/genesys/"
 
 // 文件名常量
 #define OCG_FORBIDDEN_FILENAME "ocg_forbidden.json"
 #define TCG_FORBIDDEN_FILENAME "tcg_forbidden.json"
 #define AE_FORBIDDEN_FILENAME "ae_forbidden.json"
 #define SC_FORBIDDEN_FILENAME "sc_forbidden.json"
+#define GENESYS_FORBIDDEN_FILENAME "genesys_forbidden.json"
 
 /**
  * 获取配置数据目录的绝对路径
@@ -908,5 +910,233 @@ void startup_update_sc_forbidden(void) {
         g_message("SC forbidden list update started in background");
     } else {
         g_warning("Failed to start SC forbidden list update thread");
+    }
+}
+
+// ============================================================
+// GENESYS 分值表解析与下载
+// ============================================================
+
+/**
+ * 去除字符串中的HTML标签，返回纯文字
+ * 返回值需要调用者 g_free() 释放
+ */
+static gchar *strip_html_tags(const char *input) {
+    GString *result = g_string_new(NULL);
+    gboolean in_tag = FALSE;
+    for (const char *p = input; *p; p++) {
+        if (*p == '<') {
+            in_tag = TRUE;
+        } else if (*p == '>') {
+            in_tag = FALSE;
+        } else if (!in_tag) {
+            g_string_append_c(result, *p);
+        }
+    }
+    return g_string_free(result, FALSE);
+}
+
+/**
+ * 解析GENESYS页面HTML，提取 英文卡名 -> 分值 映射
+ * GENESYS规则：灵摆怪兽、连接怪兽全部禁止；其余卡片使用分值制
+ * 分值表格式：<table>...<tr><td>Card Name</td><td>Points</td></tr>...</table>
+ */
+static JsonNode *parse_html_to_json_genesys(const char *html_content) {
+    GHashTable *mapping = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+
+    const char *pos = html_content;
+
+    while ((pos = strstr(pos, "<tr")) != NULL) {
+        // 找到 <tr ...> 的结束 '>'
+        const char *row_tag_end = strchr(pos, '>');
+        if (!row_tag_end) break;
+        const char *row_start = row_tag_end + 1;
+
+        // 找到 </tr>
+        const char *row_end = strstr(row_start, "</tr>");
+        if (!row_end) break;
+
+        // 提取第一个 <td>...</td>（卡名列）
+        const char *td1 = strstr(row_start, "<td");
+        if (!td1 || td1 >= row_end) { pos = row_end + 5; continue; }
+        const char *td1_content_start = strchr(td1, '>');
+        if (!td1_content_start || td1_content_start >= row_end) { pos = row_end + 5; continue; }
+        td1_content_start++;
+        const char *td1_end = strstr(td1_content_start, "</td>");
+        if (!td1_end || td1_end >= row_end) { pos = row_end + 5; continue; }
+
+        // 提取第二个 <td>...</td>（分值列）
+        const char *td2 = strstr(td1_end + 5, "<td");
+        if (!td2 || td2 >= row_end) { pos = row_end + 5; continue; }
+        const char *td2_content_start = strchr(td2, '>');
+        if (!td2_content_start || td2_content_start >= row_end) { pos = row_end + 5; continue; }
+        td2_content_start++;
+        const char *td2_end = strstr(td2_content_start, "</td>");
+        if (!td2_end || td2_end >= row_end) { pos = row_end + 5; continue; }
+
+        // 取出原始文字并去除HTML标签
+        gchar *raw_name  = g_strndup(td1_content_start, td1_end - td1_content_start);
+        gchar *raw_pts   = g_strndup(td2_content_start, td2_end - td2_content_start);
+
+        gchar *stripped_name = strip_html_tags(raw_name);
+        gchar *stripped_pts  = strip_html_tags(raw_pts);
+        g_free(raw_name);
+        g_free(raw_pts);
+
+        gchar *card_name  = g_strstrip(stripped_name);
+        gchar *points_str = g_strstrip(stripped_pts);
+
+        // 跳过表头行（不全是数字的分值列）和空行
+        if (card_name && *card_name != '\0' && points_str && *points_str != '\0') {
+            // 检验 points_str 全部为数字
+            gboolean is_number = TRUE;
+            for (int k = 0; points_str[k] != '\0'; k++) {
+                if (!g_ascii_isdigit(points_str[k])) { is_number = FALSE; break; }
+            }
+            if (is_number) {
+                // 确保卡名是合法的 UTF-8 字符串。
+                // 官网个别卡名含有 Latin-1 单字节字符（如 Ø = 0xD8），
+                // 直接写入 JSON 会导致整个文件解析失败。
+                // 若验证失败，则尝试从 ISO-8859-1 转换；仍失败则忽略该条目。
+                gchar *safe_name = NULL;
+                if (g_utf8_validate(card_name, -1, NULL)) {
+                    safe_name = g_strdup(card_name);
+                } else {
+                    GError *conv_err = NULL;
+                    gsize bytes_written = 0;
+                    safe_name = g_convert(card_name, -1,
+                                          "UTF-8", "ISO-8859-1",
+                                          NULL, &bytes_written, &conv_err);
+                    if (conv_err) {
+                        g_warning("GENESYS: failed to convert card name to UTF-8, skipping: %s", conv_err->message);
+                        g_error_free(conv_err);
+                    }
+                }
+
+                if (safe_name) {
+                    g_hash_table_insert(mapping, safe_name, g_strdup(points_str));
+                }
+            }
+        }
+
+        g_free(stripped_name);
+        g_free(stripped_pts);
+
+        pos = row_end + 5;
+    }
+
+    // 构建JSON对象：英文卡名 -> 分值字符串
+    JsonBuilder *builder = json_builder_new();
+    json_builder_begin_object(builder);
+
+    GHashTableIter iter;
+    gpointer key, value;
+    g_hash_table_iter_init(&iter, mapping);
+    while (g_hash_table_iter_next(&iter, &key, &value)) {
+        json_builder_set_member_name(builder, (const char *)key);
+        json_builder_add_string_value(builder, (const char *)value);
+    }
+
+    json_builder_end_object(builder);
+    JsonNode *root = json_builder_get_root(builder);
+    g_object_unref(builder);
+
+    guint entry_count = g_hash_table_size(mapping);
+    g_hash_table_unref(mapping);
+
+    g_message("GENESYS: Parsed %d card point entries", entry_count);
+    return root;
+}
+
+/**
+ * GENESYS下载完成后的回调
+ */
+static void on_download_complete_genesys(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
+    GError *error = NULL;
+    GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
+
+    if (error) {
+        g_warning("Failed to download GENESYS points list: %s", error->message);
+        g_error_free(error);
+        g_object_unref(session);
+        return;
+    }
+
+    gsize size;
+    const char *html_content = g_bytes_get_data(response_body, &size);
+
+    if (html_content && size > 0) {
+        gchar *data_dir = get_config_data_dir();
+        if (!data_dir || !ensure_directory_exists(data_dir)) {
+            g_free(data_dir);
+            g_bytes_unref(response_body);
+            g_object_unref(session);
+            return;
+        }
+        g_free(data_dir);
+
+        JsonNode *json_root = parse_html_to_json_genesys(html_content);
+
+        gchar *output_file = get_output_file_path(GENESYS_FORBIDDEN_FILENAME);
+        if (output_file) {
+            save_json_to_file(json_root, output_file);
+            g_free(output_file);
+        }
+        json_node_free(json_root);
+    } else {
+        g_warning("Received empty response from GENESYS points URL");
+    }
+
+    g_bytes_unref(response_body);
+    g_object_unref(session);
+}
+
+/**
+ * 后台线程：下载GENESYS分值表
+ */
+static gpointer download_thread_func_genesys(G_GNUC_UNUSED gpointer data) {
+    SoupSession *session = soup_session_new();
+    SoupMessage *msg = soup_message_new("GET", GENESYS_FORBIDDEN_URL);
+
+    if (!msg) {
+        g_warning("Failed to create HTTP request for GENESYS points list");
+        g_object_unref(session);
+        return NULL;
+    }
+
+    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
+    soup_message_headers_append(headers, "User-Agent",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
+    // Accept cookies/HTML
+    soup_message_headers_append(headers, "Accept",
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+
+    g_message("Starting background download of GENESYS points list...");
+
+    soup_session_send_and_read_async(
+        session,
+        msg,
+        G_PRIORITY_LOW,
+        NULL,
+        (GAsyncReadyCallback)on_download_complete_genesys,
+        NULL
+    );
+
+    g_object_unref(msg);
+    return NULL;
+}
+
+/**
+ * 启动后台更新GENESYS分值表
+ * 此函数立即返回，实际下载在后台线程中进行
+ */
+void startup_update_genesys_forbidden(void) {
+    GThread *thread = g_thread_new("genesys-forbidden-update", download_thread_func_genesys, NULL);
+
+    if (thread) {
+        g_thread_unref(thread);
+        g_message("GENESYS points list update started in background");
+    } else {
+        g_warning("Failed to start GENESYS points list update thread");
     }
 }
