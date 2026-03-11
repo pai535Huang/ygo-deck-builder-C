@@ -18,6 +18,8 @@ static JsonParser *offline_cards_parser = NULL;
 static JsonObject *offline_cards_root = NULL; // owned by parser->root
 static gchar *offline_cards_json_path = NULL;
 static gint64 offline_cards_json_mtime = 0;
+// img_id（Konami 八位码）→ cid（ygocdb 短 ID）反向索引缓存
+static GHashTable *offline_img_to_cid = NULL;  // key: g_strdup(img_id), value: GINT_TO_POINTER(cid)
 
 static gchar *get_cards_dir(void);
 
@@ -50,6 +52,10 @@ void offline_data_clear_cache(void) {
     offline_cards_root = NULL;
     g_clear_pointer(&offline_cards_json_path, g_free);
     offline_cards_json_mtime = 0;
+    if (offline_img_to_cid) {
+        g_hash_table_unref(offline_img_to_cid);
+        offline_img_to_cid = NULL;
+    }
     g_mutex_unlock(&offline_cache_mutex);
 }
 
@@ -104,6 +110,31 @@ static gboolean offline_cache_ensure_loaded_locked(void) {
     offline_cards_root = json_node_get_object(root);
     offline_cards_json_path = json_path; // take ownership
     offline_cards_json_mtime = mtime;
+    // 重建 img_id → cid 反向索引
+    if (offline_img_to_cid) {
+        g_hash_table_unref(offline_img_to_cid);
+    }
+    offline_img_to_cid = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    GList *members_for_idx = json_object_get_members(offline_cards_root);
+    for (GList *l = members_for_idx; l != NULL; l = l->next) {
+        const char *cid_key = (const char *)l->data;
+        JsonNode *cn = json_object_get_member(offline_cards_root, cid_key);
+        if (!cn || !JSON_NODE_HOLDS_OBJECT(cn)) continue;
+        JsonObject *co = json_node_get_object(cn);
+        if (!json_object_has_member(co, "id")) continue;
+        gint64 raw_id = json_object_get_int_member(co, "id");
+        if (raw_id <= 0) continue;
+        char img_id_str[32];
+        g_snprintf(img_id_str, sizeof(img_id_str), "%" G_GINT64_FORMAT, raw_id);
+        /* cid_key 是 root 的 JSON key，生命周期与 parser 绑定，直接 GINT 存 cid */
+        int cid_val = atoi(cid_key);
+        if (cid_val > 0) {
+            g_hash_table_insert(offline_img_to_cid,
+                                g_strdup(img_id_str),
+                                GINT_TO_POINTER(cid_val));
+        }
+    }
+    g_list_free(members_for_idx);
     return TRUE;
 }
 
@@ -1015,63 +1046,84 @@ JsonArray* search_offline_cards(const char *query) {
 }
 
 /**
- * 从离线数据中根据卡片ID获取单张卡片信息
+ * 从离线数据中根据卡片ID获取单张卡片信息（复用共享缓存，不重复解析）
  */
 JsonObject* get_card_by_id_offline(int card_id) {
-    if (card_id <= 0) {
+    if (card_id <= 0) return NULL;
+
+    g_mutex_lock(&offline_cache_mutex);
+    if (!offline_cache_ensure_loaded_locked()) {
+        g_mutex_unlock(&offline_cache_mutex);
         return NULL;
     }
-    
-    // 获取 cards.json 文件路径
-    gchar *cards_dir = get_cards_dir();
-    if (!cards_dir) {
-        return NULL;
-    }
-    
-    gchar *json_path = g_build_filename(cards_dir, "cards.json", NULL);
-    g_free(cards_dir);
-    
-    if (!g_file_test(json_path, G_FILE_TEST_EXISTS)) {
-        g_free(json_path);
-        return NULL;
-    }
-    
-    // 加载 JSON 文件
-    JsonParser *parser = json_parser_new();
-    GError *error = NULL;
-    
-    if (!json_parser_load_from_file(parser, json_path, &error)) {
-        if (error) g_error_free(error);
-        g_object_unref(parser);
-        g_free(json_path);
-        return NULL;
-    }
-    
-    g_free(json_path);
-    
-    JsonNode *root = json_parser_get_root(parser);
-    if (!root || !JSON_NODE_HOLDS_OBJECT(root)) {
-        g_object_unref(parser);
-        return NULL;
-    }
-    
-    JsonObject *root_obj = json_node_get_object(root);
-    
-    // 根据ID查找卡片
+
     char card_id_str[32];
     g_snprintf(card_id_str, sizeof(card_id_str), "%d", card_id);
-    
+
     JsonObject *result = NULL;
-    if (json_object_has_member(root_obj, card_id_str)) {
-        JsonNode *card_node = json_object_get_member(root_obj, card_id_str);
+    if (json_object_has_member(offline_cards_root, card_id_str)) {
+        JsonNode *card_node = json_object_get_member(offline_cards_root, card_id_str);
         if (card_node && JSON_NODE_HOLDS_OBJECT(card_node)) {
-            // 复制卡片对象（调用者需要 unref）
             result = json_object_ref(json_node_get_object(card_node));
         }
     }
-    
-    g_object_unref(parser);
+    g_mutex_unlock(&offline_cache_mutex);
     return result;
+}
+
+/**
+ * 通过卡片ID获取英文卡名（使用共享缓存）
+ * @return 新分配的字符串，由调用者用 g_free 释放；找不到返回 NULL
+ */
+gchar* offline_get_en_name_by_id(int card_id) {
+    if (card_id <= 0) return NULL;
+
+    g_mutex_lock(&offline_cache_mutex);
+    if (!offline_cache_ensure_loaded_locked()) {
+        g_mutex_unlock(&offline_cache_mutex);
+        return NULL;
+    }
+
+    char id_str[32];
+    g_snprintf(id_str, sizeof(id_str), "%d", card_id);
+
+    gchar *result = NULL;
+    if (json_object_has_member(offline_cards_root, id_str)) {
+        JsonNode *card_node = json_object_get_member(offline_cards_root, id_str);
+        if (card_node && JSON_NODE_HOLDS_OBJECT(card_node)) {
+            JsonObject *card_obj = json_node_get_object(card_node);
+            if (json_object_has_member(card_obj, "en_name")) {
+                const char *en = json_object_get_string_member(card_obj, "en_name");
+                if (en && *en) result = g_strdup(en);
+            }
+        }
+    }
+    g_mutex_unlock(&offline_cache_mutex);
+    return result;
+}
+
+/**
+ * 通过 Konami img_id（八位码）查找 ygocdb 短 cid
+ * @return cid（短 ID），找不到返回 0
+ */
+int offline_get_cid_by_img_id(int img_id) {
+    if (img_id <= 0) return 0;
+
+    g_mutex_lock(&offline_cache_mutex);
+    if (!offline_cache_ensure_loaded_locked()) {
+        g_mutex_unlock(&offline_cache_mutex);
+        return 0;
+    }
+
+    char img_str[32];
+    g_snprintf(img_str, sizeof(img_str), "%d", img_id);
+    int cid = 0;
+    if (offline_img_to_cid) {
+        gpointer val = g_hash_table_lookup(offline_img_to_cid, img_str);
+        if (val) cid = GPOINTER_TO_INT(val);
+    }
+    g_mutex_unlock(&offline_cache_mutex);
+    return cid;
 }
 
 /**

@@ -20,6 +20,8 @@ extern void on_result_row_pressed(GtkGestureClick *gesture, int n_press, double 
 extern void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data);
 extern void on_result_row_enter(GtkEventControllerMotion *controller, double x, double y, gpointer user_data);
 extern void update_genesys_score(SearchUI *ui);  // GENESYS 总分更新
+extern void apply_overlay_to_widget(GtkWidget *w, SearchUI *ui);  // 设置卡图角标
+extern void update_deck_overlays(SearchUI *ui);  // 批量更新卡组角标
 
 // 先行卡异步加载的数据结构
 typedef struct {
@@ -317,6 +319,12 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
     gtk_widget_add_css_class(picture, "thumb-fixed");
     gtk_stack_add_named(GTK_STACK(thumb_stack), picture, "picture");
     gtk_stack_set_visible_child_name(GTK_STACK(thumb_stack), "placeholder");
+    // 将 cid 和英文卡名存储到图片控件，以便设置禁限角标
+    g_object_set_data(G_OBJECT(picture), "card_id", GINT_TO_POINTER(cid));
+    if (json_object_has_member(obj, "en_name")) {
+        slot_set_en_name(picture, json_object_get_string_member(obj, "en_name"));
+    }
+    apply_overlay_to_widget(picture, ui);
     
     // 检查是否是先行卡（优先通过ID位数判断，9位数=先行卡）
     gboolean is_prerelease = (id > 0 && is_prerelease_id(id));
@@ -660,6 +668,8 @@ void on_forbidden_dropdown_changed(GtkDropDown *dropdown, GParamSpec *pspec, gpo
     
     // 更新 GENESYS 总分显示
     update_genesys_score(ui);
+    // 更新卡组槽位的限制角标
+    update_deck_overlays(ui);
 
     // 重新触发搜索以更新禁限状态显示
     const char *q = gtk_editable_get_text(GTK_EDITABLE(ui->entry));

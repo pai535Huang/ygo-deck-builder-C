@@ -64,6 +64,8 @@ gboolean show_prerelease_cards = TRUE;
 
 // 前向声明：GENESYS 总分更新
 void update_genesys_score(SearchUI *ui);
+// 前向声明：更新所有卡组槽位的限制角标
+void update_deck_overlays(SearchUI *ui);
 
 // 全局筛选状态（保持默认值）
 // FilterState 定义在 search_filter.h 中
@@ -180,6 +182,75 @@ void list_clear(GtkListBox *list) {
     }
 }
 
+/* ── 卡图左上角限制数字/GENESYS 分值角标 ──────────────────────────────────
+ * overlay_number : 要显示的数字（< 0 表示不显示）
+ * overlay_type   : 0 = 禁限模式（按数值着色），1 = GENESYS 模式（蓝色）
+ * ────────────────────────────────────────────────────────────────────── */
+static void draw_overlay_badge(cairo_t *cr, int width, int height,
+                                int number, int overlay_type) {
+    (void)width;
+    char text[16];
+    g_snprintf(text, sizeof(text), "%d", number);
+
+    cairo_save(cr);
+
+    /* 字体：粗体无衬线，高度约为卡图高度的 19%，限制在 8~15px */
+    cairo_select_font_face(cr, "Sans",
+                           CAIRO_FONT_SLANT_NORMAL,
+                           CAIRO_FONT_WEIGHT_BOLD);
+    double font_size = height * 0.19;
+    if (font_size < 8.0)  font_size = 8.0;
+    if (font_size > 15.0) font_size = 15.0;
+    cairo_set_font_size(cr, font_size);
+
+    cairo_text_extents_t te;
+    cairo_text_extents(cr, text, &te);
+
+    double pad_x = 3.0;
+    double pad_y = 2.0;
+    double bw = te.width  + pad_x * 2.0;
+    double bh = te.height + pad_y * 2.0;
+    double bx = 1.5;
+    double by = 1.5;
+    double radius = 3.0;
+
+    /* 背景颜色：GENESYS=蓝，禁限模式统一红底 */
+    double cr_, cg, cb;
+    if (overlay_type == 1) {
+        cr_ = 0.08; cg = 0.42; cb = 0.88;   /* GENESYS 蓝 */
+    } else {
+        cr_ = 0.88; cg = 0.10; cb = 0.10;   /* 禁止/限制/准限制 统一红底 */
+    }
+
+    /* 绘制圆角矩形背景 */
+    cairo_new_sub_path(cr);
+    cairo_arc(cr, bx + bw - radius, by + radius,        radius, -G_PI / 2.0, 0.0);
+    cairo_arc(cr, bx + bw - radius, by + bh - radius,   radius,  0.0,        G_PI / 2.0);
+    cairo_arc(cr, bx + radius,      by + bh - radius,   radius,  G_PI / 2.0, G_PI);
+    cairo_arc(cr, bx + radius,      by + radius,         radius,  G_PI,       3.0 * G_PI / 2.0);
+    cairo_close_path(cr);
+    cairo_set_source_rgba(cr, cr_, cg, cb, 0.88);
+    cairo_fill(cr);
+
+    /* 绘制白色粗体文字 */
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
+    cairo_move_to(cr,
+                  bx + pad_x - te.x_bearing,
+                  by + pad_y - te.y_bearing);
+    cairo_show_text(cr, text);
+
+    cairo_restore(cr);
+}
+
+/* 读取 area 上存储的 overlay 数据并绘制角标 */
+static void draw_badge_if_set(GtkDrawingArea *area, cairo_t *cr,
+                               int width, int height) {
+    int *num_ptr = (int *)g_object_get_data(G_OBJECT(area), "overlay_number");
+    if (!num_ptr || *num_ptr < 0) return;
+    int type = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(area), "overlay_type"));
+    draw_overlay_badge(cr, width, height, *num_ptr, type);
+}
+
 void draw_pixbuf_scaled(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
     (void)user_data;
     GdkPixbuf *pb = (GdkPixbuf*)g_object_get_data(G_OBJECT(area), "pixbuf");
@@ -222,6 +293,8 @@ void draw_pixbuf_scaled(GtkDrawingArea *area, cairo_t *cr, int width, int height
         cairo_restore(cr);
         g_object_unref(cached);
         g_object_unref(pb);
+        // 绘制限制数量/GENESYS分值角标
+        draw_badge_if_set(area, cr, width, height);
         return;
     }
 
@@ -317,6 +390,8 @@ void draw_pixbuf_scaled(GtkDrawingArea *area, cairo_t *cr, int width, int height
     cairo_restore(cr);
     g_object_unref(pb);
     if (disk_pb) g_object_unref(disk_pb);
+    // 绘制限制数量/GENESYS分值角标
+    draw_badge_if_set(area, cr, width, height);
 }
 
 // 当 DrawingArea 销毁时
@@ -357,18 +432,21 @@ static void on_slot_clicked(GtkGestureClick *gesture, int n_press, double x, dou
             shift_delete_slots(ui->main_pics, &ui->main_idx, index);
             update_count_label(ui->main_count, ui->main_idx);
             update_genesys_score(ui);
+            update_deck_overlays(ui);
         }
     } else if (g_strcmp0(region, "extra") == 0) {
         if (index < ui->extra_idx) {
             shift_delete_slots(ui->extra_pics, &ui->extra_idx, index);
             update_count_label(ui->extra_count, ui->extra_idx);
             update_genesys_score(ui);
+            update_deck_overlays(ui);
         }
     } else if (g_strcmp0(region, "side") == 0) {
         if (index < ui->side_idx) {
             shift_delete_slots(ui->side_pics, &ui->side_idx, index);
             update_count_label(ui->side_count, ui->side_idx);
             update_genesys_score(ui);
+            update_deck_overlays(ui);
         }
     }
     // 清理按下坐标
@@ -590,6 +668,7 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
     update_count_label(from_label, *from_count);
     update_count_label(to_label, *to_count);
     update_genesys_score(ui);
+    update_deck_overlays(ui);
     g_object_unref(moving_pb_ref);
 }
 
@@ -643,6 +722,94 @@ void update_genesys_score(SearchUI *ui) {
     g_snprintf(buf, sizeof(buf), "总分: %d/100", total);
     gtk_label_set_text(ui->genesys_score_label, buf);
     gtk_widget_set_visible(GTK_WIDGET(ui->genesys_score_label), TRUE);
+}
+
+/* ── 计算并写入指定卡图 widget 的角标信息 ─────────────────────────────────
+ * w        : GtkDrawingArea（中栏槽位或右栏搜索结果图片）
+ * card_id  : 卡片 cid（用于普通禁限卡表查询）
+ * en_name  : 英文卡名（用于 GENESYS 分值查询）
+ * ─────────────────────────────────────────────────────────────────────── */
+void apply_overlay_to_widget(GtkWidget *w, SearchUI *ui) {
+    if (!w || !ui) return;
+
+    int card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(w), "card_id"));
+    const char *en_name = slot_get_en_name(w);
+
+    int overlay_number = -1;  /* -1 = 不显示 */
+    int overlay_type   = 0;   /* 0 = 禁限, 1 = GENESYS */
+
+    if (ui->forbidden_dropdown) {
+        guint selected = gtk_drop_down_get_selected(ui->forbidden_dropdown);
+
+        if (selected == 4) {
+            /* GENESYS 模式：按英文卡名查分值 */
+            overlay_type = 1;
+            if (en_name && *en_name && ui->genesys_forbidden) {
+                const char *pts = g_hash_table_lookup(ui->genesys_forbidden, en_name);
+                if (pts && *pts) {
+                    int score = atoi(pts);
+                    overlay_number = (score > 0) ? score : -1;
+                }
+            }
+        } else {
+            /* OCG / TCG / AE / SC 模式 */
+            overlay_type = 0;
+            GHashTable *table = NULL;
+            if      (selected == 0 && ui->ocg_forbidden) table = ui->ocg_forbidden;
+            else if (selected == 1 && ui->tcg_forbidden) table = ui->tcg_forbidden;
+            else if (selected == 2 && ui->ae_forbidden)  table = ui->ae_forbidden;
+            else if (selected == 3 && ui->sc_forbidden)  table = ui->sc_forbidden;
+
+            if (card_id > 0 && table) {
+                char cid_str[32];
+                g_snprintf(cid_str, sizeof(cid_str), "%d", card_id);
+                const char *status = g_hash_table_lookup(table, cid_str);
+                if (status) {
+                    if      (g_strcmp0(status, "禁止")  == 0) overlay_number = 0;
+                    else if (g_strcmp0(status, "限制")  == 0) overlay_number = 1;
+                    else if (g_strcmp0(status, "准限制") == 0) overlay_number = 2;
+                }
+            }
+        }
+    }
+
+    /* 将计算结果写入 widget 数据（堆分配，由 GObject 负责释放） */
+    int *num_ptr = g_new(int, 1);
+    *num_ptr = overlay_number;
+    g_object_set_data_full(G_OBJECT(w), "overlay_number", num_ptr, g_free);
+    g_object_set_data(G_OBJECT(w), "overlay_type", GINT_TO_POINTER(overlay_type));
+    gtk_widget_queue_draw(w);
+}
+
+/* 批量更新所有卡组槽位（main / extra / side）的角标 */
+void update_deck_overlays(SearchUI *ui) {
+    if (!ui) return;
+
+    // GENESYS 模式下，对缺少 en_name 的槽位做一次批量补全
+    // （YDK 导入只存 img_id，不含 en_name，需从离线库查询）
+    gboolean is_genesys = (ui->forbidden_dropdown &&
+                           gtk_drop_down_get_selected(ui->forbidden_dropdown) == 4);
+
+    // 内联辅助宏：补全 en_name 并计算角标
+    #define APPLY_OVERLAYS_TO_REGION(pics, count) \
+        for (int _i = 0; _i < (count); _i++) { \
+            GtkWidget *_w = GTK_WIDGET(g_ptr_array_index((pics), _i)); \
+            if (!_w) continue; \
+            int _cid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(_w), "card_id")); \
+            if (_cid <= 0) continue; \
+            /* GENESYS 模式：若 en_name 缺失，尝试从离线数据库补全 */ \
+            if (is_genesys && !slot_get_en_name(_w)) { \
+                gchar *_en = offline_get_en_name_by_id(_cid); \
+                if (_en) { slot_set_en_name(_w, _en); g_free(_en); } \
+            } \
+            apply_overlay_to_widget(_w, ui); \
+        }
+
+    APPLY_OVERLAYS_TO_REGION(ui->main_pics,  ui->main_idx)
+    APPLY_OVERLAYS_TO_REGION(ui->extra_pics, ui->extra_idx)
+    APPLY_OVERLAYS_TO_REGION(ui->side_pics,  ui->side_idx)
+
+    #undef APPLY_OVERLAYS_TO_REGION
 }
 
 typedef struct {
@@ -709,6 +876,7 @@ static void on_import_file_open_finish(GObject *source, GAsyncResult *result, gp
             path
         );
         update_genesys_score(import_data->ui);
+        update_deck_overlays(import_data->ui);
         
         // 保存导入目录到缓存
         char *dir = g_path_get_dirname(path);
@@ -1854,6 +2022,7 @@ static void on_import_url_clicked(GtkButton *btn, gpointer user_data) {
     update_count_label(ui->extra_count, ui->extra_idx);
     update_count_label(ui->side_count, ui->side_idx);
     update_genesys_score(ui);
+    update_deck_overlays(ui);
     
     // 清理
     g_free(main_cards);
@@ -2064,6 +2233,7 @@ static void on_clear_dialog_response(AdwAlertDialog *dialog, const char *respons
             ui->side_pics, &ui->side_idx, ui->side_count
         );
         update_genesys_score(ui);
+        update_deck_overlays(ui);
     }
     // 如果是 "cancel"，则不做任何操作
 }
@@ -2504,6 +2674,7 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
         }
     }
     update_genesys_score(ui);
+    update_deck_overlays(ui);
 }
 
 void on_result_row_enter(GtkEventControllerMotion *controller, double x, double y, gpointer user_data) {

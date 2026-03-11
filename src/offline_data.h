@@ -73,4 +73,18 @@ void offline_data_clear_cache(void);
  */
 JsonObject* get_card_by_id_offline(int card_id);
 
+/**
+ * 通过卡片ID获取英文卡名（使用共享缓存，高效）
+ * @param card_id 卡片ID
+ * @return 新分配的英文名字符串（调用者用 g_free 释放），找不到返回 NULL
+ */
+gchar* offline_get_en_name_by_id(int card_id);
+
+/**
+ * 通过 Konami img_id（八位码）查找 ygocdb 短 cid
+ * 使用构建好的反向索引，O(1) 常数时间
+ * @return cid（短 ID），找不到返回 0
+ */
+int offline_get_cid_by_img_id(int img_id);
+
 #endif // OFFLINE_DATA_H

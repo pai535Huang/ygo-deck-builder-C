@@ -11,6 +11,8 @@ extern void update_count_label(GtkLabel *label, int count);
 extern int array_find_first_empty(GPtrArray *arr);
 extern void array_shift_right(GPtrArray *arr, int start, int end);
 extern void update_genesys_score(SearchUI *ui);  // GENESYS 总分更新
+extern void apply_overlay_to_widget(GtkWidget *w, SearchUI *ui);  // 设置卡图角标
+extern void update_deck_overlays(SearchUI *ui);  // 批量更新卡组角标
 
 // DnD: drag setup
 GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, double y, gpointer user_data) {
@@ -268,6 +270,8 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
         g_object_set_data(G_OBJECT(place_w), "img_id", GINT_TO_POINTER(img_id));
         // 存储英文和名（GENESYS 分值查找用）
         slot_set_en_name(place_w, (en_name_str && *en_name_str) ? en_name_str : NULL);
+        // 立即设置角标数据（图片加载后会显示）
+        apply_overlay_to_widget(place_w, ui);
         
         // 如果是先行卡，从本地加载图片
         if (is_prerelease) {
@@ -310,6 +314,7 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
         if (*to_count < place_index + 1) *to_count = place_index + 1;
         update_count_label(to_label, *to_count);
         update_genesys_score(ui);
+        update_deck_overlays(ui);
         return;
     }
     // 原有 region:index 处理

@@ -168,7 +168,20 @@ gboolean import_deck_from_ydk(
         
         slot_set_is_extra(target_pic, is_extra);
         g_object_set_data(G_OBJECT(target_pic), "img_id", GINT_TO_POINTER(img_id));
-        g_object_set_data(G_OBJECT(target_pic), "card_id", GINT_TO_POINTER(img_id));
+        /* YDK 存的是八位 Konami 码（img_id），要移拿到禁限卡表里需要的短 cid。
+         * 从离线数据库做反向查找，同时获取英文卡名以支持 GENESYS 模式角标。 */
+        int card_cid = offline_get_cid_by_img_id(img_id);
+        if (card_cid > 0) {
+            g_object_set_data(G_OBJECT(target_pic), "card_id", GINT_TO_POINTER(card_cid));
+            gchar *en_name = offline_get_en_name_by_id(card_cid);
+            if (en_name) {
+                slot_set_en_name(target_pic, en_name);
+                g_free(en_name);
+            }
+        } else {
+            /* 离线库未提供时回落到 img_id（正常卡片不应此路径） */
+            g_object_set_data(G_OBJECT(target_pic), "card_id", GINT_TO_POINTER(img_id));
+        }
         
         // 加载卡片图片
         if (img_id > 0 && session) {
