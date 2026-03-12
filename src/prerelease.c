@@ -346,7 +346,14 @@ static gpointer download_prerelease_thread(gpointer data) {
     gchar *ypk_path = g_build_filename(data_dir, "ygopro-super-pre.ypk", NULL);
     
     SoupSession *session = soup_session_new();
+    // 设置超时时间为300秒，YPK文件较大需要更长时间
+    g_object_set(session, "timeout", 300u, NULL);
     SoupMessage *msg = soup_message_new("GET", PRERELEASE_URL);
+    
+    // 设置User-Agent避免被服务器拒绝或限速
+    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
+    soup_message_headers_append(headers, "User-Agent",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
     
     g_message("Downloading pre-release cards from %s", PRERELEASE_URL);
     
