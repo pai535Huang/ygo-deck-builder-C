@@ -40,6 +40,7 @@
 #include "forbidden_list.h"
 #include "deck_clear.h"
 #include "deck_io.h"
+#include "deck_export_sheet.h"
 #include "image_loader.h"
 #include "dnd_manager.h"
 #include "search_filter.h"
@@ -58,6 +59,8 @@ static void free_user_data_closure_notify(gpointer data, GClosure *closure) {
 // 全局变量：缓存最后导出和导入的目录
 static char *last_export_directory = NULL;
 static char *last_import_directory = NULL;
+// 全局变量：个人信息（Konami ID）
+static char *personal_konami_id = NULL;
 
 // 全局变量：是否在搜索结果中显示先行卡（默认显示）
 gboolean show_prerelease_cards = TRUE;
@@ -172,6 +175,8 @@ static gchar *get_forbidden_list_path(const char *filename) {
 
 // 前置声明
 static void on_export_clicked(GtkButton *btn, gpointer user_data);
+static void on_action_generate_sheet(GSimpleAction *action, GVariant *parameter, gpointer user_data);
+static void on_action_edit_personal_info(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 
 void list_clear(GtkListBox *list) {
     GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(list));
@@ -822,6 +827,12 @@ typedef struct {
     GtkFileDialog *dialog;
 } ImportData;
 
+typedef struct {
+    SearchUI *ui;
+    AdwDialog *dialog;
+    GtkWidget *konami_id_entry;
+} PersonalInfoDialogData;
+
 
 
 // 文件保存对话框回调
@@ -856,6 +867,58 @@ static void on_export_file_save_finish(GObject *source, GAsyncResult *result, gp
         g_error_free(error);
     }
     
+    g_object_unref(export_data->dialog);
+    g_free(export_data);
+}
+
+// 卡表保存回调
+static void on_sheet_save_finish(GObject *source, GAsyncResult *result, gpointer user_data) {
+    ExportData *export_data = (ExportData*)user_data;
+    GError *error = NULL;
+    GFile *file = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(source), result, &error);
+
+    if (file) {
+        char *path = g_file_get_path(file);
+        GError *gen_error = NULL;
+        gboolean ok = generate_deck_sheet_pdf(
+            export_data->ui->main_pics, export_data->ui->main_idx,
+            export_data->ui->extra_pics, export_data->ui->extra_idx,
+            export_data->ui->side_pics, export_data->ui->side_idx,
+            personal_konami_id,
+            path,
+            &gen_error
+        );
+
+        if (ok) {
+            char *dir = g_path_get_dirname(path);
+            g_free(last_export_directory);
+            last_export_directory = dir;
+            save_io_config(last_export_directory, last_import_directory);
+
+            if (export_data->ui && export_data->ui->toast_overlay) {
+                AdwToast *toast = adw_toast_new("卡表已生成");
+                adw_toast_set_timeout(toast, 2);
+                adw_toast_overlay_add_toast(export_data->ui->toast_overlay, toast);
+            }
+        } else {
+            g_warning("生成卡表失败: %s", gen_error ? gen_error->message : "未知错误");
+            if (export_data->ui && export_data->ui->toast_overlay) {
+                AdwToast *toast = adw_toast_new("卡表生成失败");
+                adw_toast_set_timeout(toast, 2);
+                adw_toast_overlay_add_toast(export_data->ui->toast_overlay, toast);
+            }
+        }
+
+        g_clear_error(&gen_error);
+        g_free(path);
+        g_object_unref(file);
+    } else if (error) {
+        if (!g_error_matches(error, GTK_DIALOG_ERROR, GTK_DIALOG_ERROR_DISMISSED)) {
+            g_warning("保存卡表失败: %s", error->message);
+        }
+        g_error_free(error);
+    }
+
     g_object_unref(export_data->dialog);
     g_free(export_data);
 }
@@ -1875,6 +1938,126 @@ static void on_action_export_to_file(GSimpleAction *action, GVariant *parameter,
     SearchUI *ui = (SearchUI*)user_data;
     // 复用现有的按钮回调实现（传入 NULL 作为 GtkButton）
     on_export_clicked(NULL, ui);
+}
+
+// GAction 激活回调：从菜单中选择“生成卡表”时触发
+static void on_action_generate_sheet(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+    (void)action;
+    (void)parameter;
+    SearchUI *ui = (SearchUI*)user_data;
+
+    GtkFileDialog *dialog = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dialog, "生成卡表");
+
+    if (last_export_directory && g_file_test(last_export_directory, G_FILE_TEST_IS_DIR)) {
+        char *full_path = g_build_filename(last_export_directory, "deck_ja_filled.pdf", NULL);
+        GFile *initial_file = g_file_new_for_path(full_path);
+        gtk_file_dialog_set_initial_file(dialog, initial_file);
+        g_object_unref(initial_file);
+        g_free(full_path);
+    } else {
+        GFile *initial_file = g_file_new_for_path("deck_ja_filled.pdf");
+        gtk_file_dialog_set_initial_file(dialog, initial_file);
+        g_object_unref(initial_file);
+    }
+
+    GtkFileFilter *filter = gtk_file_filter_new();
+    gtk_file_filter_add_pattern(filter, "*.pdf");
+    gtk_file_filter_set_name(filter, "PDF文件 (*.pdf)");
+
+    GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
+    g_list_store_append(filters, filter);
+    gtk_file_dialog_set_filters(dialog, G_LIST_MODEL(filters));
+    g_object_unref(filters);
+    g_object_unref(filter);
+
+    ExportData *data = g_new0(ExportData, 1);
+    data->ui = ui;
+    data->dialog = g_object_ref(dialog);
+
+    gtk_file_dialog_save(dialog,
+                        NULL,
+                        NULL,
+                        on_sheet_save_finish,
+                        data);
+}
+
+static void on_personal_info_save_clicked(GtkButton *btn, gpointer user_data) {
+    (void)btn;
+    PersonalInfoDialogData *data = (PersonalInfoDialogData*)user_data;
+    if (!data || !data->konami_id_entry) return;
+
+    const char *entry_text = gtk_editable_get_text(GTK_EDITABLE(data->konami_id_entry));
+    char *new_id = g_strdup(entry_text ? entry_text : "");
+    g_strstrip(new_id);
+
+    save_personal_konami_id(new_id);
+
+    g_free(personal_konami_id);
+    personal_konami_id = (*new_id) ? g_strdup(new_id) : NULL;
+
+    if (data->ui && data->ui->toast_overlay) {
+        AdwToast *toast = adw_toast_new("个人信息已保存");
+        adw_toast_set_timeout(toast, 2);
+        adw_toast_overlay_add_toast(data->ui->toast_overlay, toast);
+    }
+
+    g_free(new_id);
+    adw_dialog_close(data->dialog);
+}
+
+static void on_action_edit_personal_info(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+    (void)action;
+    (void)parameter;
+    SearchUI *ui = (SearchUI*)user_data;
+    if (!ui || !ui->window) return;
+
+    AdwDialog *dialog = ADW_DIALOG(adw_dialog_new());
+    adw_dialog_set_title(dialog, "个人信息");
+    adw_dialog_set_content_width(dialog, 420);
+
+    GtkWidget *content_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
+    gtk_widget_set_margin_start(content_box, 24);
+    gtk_widget_set_margin_end(content_box, 24);
+    gtk_widget_set_margin_top(content_box, 24);
+    gtk_widget_set_margin_bottom(content_box, 24);
+
+    GtkWidget *heading = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(heading), "<span size='x-large' weight='bold'>个人信息</span>");
+    gtk_label_set_xalign(GTK_LABEL(heading), 0.0);
+    gtk_widget_add_css_class(heading, "heading");
+    gtk_box_append(GTK_BOX(content_box), heading);
+
+    GtkWidget *konami_id_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(konami_id_entry), "Konami ID");
+    if (personal_konami_id && *personal_konami_id) {
+        gtk_editable_set_text(GTK_EDITABLE(konami_id_entry), personal_konami_id);
+    }
+    gtk_box_append(GTK_BOX(content_box), konami_id_entry);
+
+    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
+    gtk_widget_set_margin_top(button_box, 16);
+    gtk_widget_set_halign(button_box, GTK_ALIGN_END);
+
+    GtkWidget *cancel_btn = gtk_button_new_with_label("取消");
+    GtkWidget *save_btn = gtk_button_new_with_label("保存");
+    gtk_widget_add_css_class(save_btn, "suggested-action");
+    gtk_box_append(GTK_BOX(button_box), cancel_btn);
+    gtk_box_append(GTK_BOX(button_box), save_btn);
+    gtk_box_append(GTK_BOX(content_box), button_box);
+
+    PersonalInfoDialogData *dialog_data = g_new0(PersonalInfoDialogData, 1);
+    dialog_data->ui = ui;
+    dialog_data->dialog = dialog;
+    dialog_data->konami_id_entry = konami_id_entry;
+
+    g_signal_connect(save_btn, "clicked", G_CALLBACK(on_personal_info_save_clicked), dialog_data);
+    g_signal_connect_swapped(cancel_btn, "clicked", G_CALLBACK(adw_dialog_close), dialog);
+    g_signal_connect(konami_id_entry, "activate", G_CALLBACK(on_personal_info_save_clicked), dialog_data);
+
+    g_object_set_data_full(G_OBJECT(dialog), "personal-info-data", dialog_data, g_free);
+    adw_dialog_set_child(dialog, content_box);
+    adw_dialog_present(dialog, GTK_WIDGET(ui->window));
 }
 
 // 复制按钮回调：将URL文本视图中的文本复制到剪贴板
@@ -2984,6 +3167,9 @@ static void on_offline_data_switch_changed(GtkSwitch *switch_widget, GParamSpec 
     if (!ui) return;
     
     gboolean active = gtk_switch_get_active(switch_widget);
+
+    // 无论离线数据当前是否存在，开关状态变化都应立即持久化
+    save_offline_data_switch_state(active);
     
     if (active && !offline_data_exists()) {
         // 从关闭改为开启：下载离线数据
@@ -2998,8 +3184,6 @@ static void on_offline_data_switch_changed(GtkSwitch *switch_widget, GParamSpec 
         // 启动后台下载
         download_offline_data(on_download_offline_data_complete, data);
         
-        // 保存状态到配置文件
-        save_offline_data_switch_state(TRUE);
     } else if (!active && offline_data_exists()) {
         // 从开启改为关闭：清理离线数据
         g_message("Clearing offline data...");
@@ -3016,8 +3200,6 @@ static void on_offline_data_switch_changed(GtkSwitch *switch_widget, GParamSpec 
             }
             g_message("Offline data cleared successfully");
             
-            // 保存状态到配置文件
-            save_offline_data_switch_state(FALSE);
         } else {
             // 清理失败，恢复开关状态
             gtk_switch_set_active(switch_widget, TRUE);
@@ -3213,6 +3395,7 @@ on_activate(GApplication *app, gpointer user_data)
     GMenu *app_menu = g_menu_new();
     g_menu_append(app_menu, "下载先行卡", "win.download-prerelease");
     g_menu_append(app_menu, "显示先行卡", "win.show-prerelease");
+    g_menu_append(app_menu, "个人信息", "win.edit-personal-info");
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(app_menu_button), G_MENU_MODEL(app_menu));
     g_object_unref(app_menu);
 
@@ -3319,6 +3502,7 @@ on_activate(GApplication *app, gpointer user_data)
     g_menu_append(export_menu, "到文件...", "win.export-to-file");
     // 占位菜单项（UI 审查）：到 URL...，不执行实际功能
     g_menu_append(export_menu, "到URL...", "win.export-to-url");
+    g_menu_append(export_menu, "生成卡表", "win.generate-sheet");
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(export_button), G_MENU_MODEL(export_menu));
     g_object_unref(export_menu);
     
@@ -3617,6 +3801,10 @@ on_activate(GApplication *app, gpointer user_data)
     g_signal_connect(export_action, "activate", G_CALLBACK(on_action_export_to_file), sui);
     g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(export_action));
     g_object_unref(export_action);
+    GSimpleAction *generate_sheet_action = g_simple_action_new("generate-sheet", NULL);
+    g_signal_connect(generate_sheet_action, "activate", G_CALLBACK(on_action_generate_sheet), sui);
+    g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(generate_sheet_action));
+    g_object_unref(generate_sheet_action);
     // 注册一个占位 action 用于菜单项 "到URL..."（UI 审查用）
     GSimpleAction *export_url_action = g_simple_action_new("export-to-url", NULL);
     g_signal_connect(export_url_action, "activate", G_CALLBACK(on_action_export_to_url), sui);
@@ -3771,6 +3959,11 @@ on_activate(GApplication *app, gpointer user_data)
     g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(show_action));
     g_object_unref(show_action);
 
+    GSimpleAction *edit_personal_info_action = g_simple_action_new("edit-personal-info", NULL);
+    g_signal_connect(edit_personal_info_action, "activate", G_CALLBACK(on_action_edit_personal_info), sui);
+    g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(edit_personal_info_action));
+    g_object_unref(edit_personal_info_action);
+
     gtk_window_present(GTK_WINDOW(win));
 }
 
@@ -3809,6 +4002,8 @@ main(int argc, char *argv[])
 
     // 加载导出目录配置
     load_io_config(&last_export_directory, &last_import_directory);
+    // 加载个人信息
+    personal_konami_id = load_personal_konami_id();
 
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
     return g_application_run(G_APPLICATION(app), argc, argv);

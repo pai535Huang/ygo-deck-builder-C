@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gresources>
+  <gresource prefix="/com/pai535/YGODeckBuilder">
+    <file>deck_ja_template.png</file>
+    <file>deck_ja.pdf</file>
+  </gresource>
+</gresources>

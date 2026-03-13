@@ -415,3 +415,68 @@ void save_offline_data_switch_state(gboolean enabled) {
     g_key_file_free(keyfile);
     g_free(config_path);
 }
+
+// 加载个人信息中的 Konami ID
+char* load_personal_konami_id(void) {
+    char *config_path;
+
+    if (is_portable_mode()) {
+        const char *prog_dir = get_program_directory();
+        config_path = g_build_filename(prog_dir, CONFIG_FILE, NULL);
+    } else {
+        const char *config_home = g_get_user_config_dir();
+        config_path = g_build_filename(config_home, "ygo-deck-builder", CONFIG_FILE, NULL);
+    }
+
+    GKeyFile *keyfile = g_key_file_new();
+    GError *error = NULL;
+    char *konami_id = NULL;
+
+    if (g_key_file_load_from_file(keyfile, config_path, G_KEY_FILE_NONE, &error)) {
+        konami_id = g_key_file_get_string(keyfile, "PersonalInfo", "KonamiId", NULL);
+        if (konami_id && !*konami_id) {
+            g_clear_pointer(&konami_id, g_free);
+        }
+    } else if (error) {
+        g_error_free(error);
+    }
+
+    g_key_file_free(keyfile);
+    g_free(config_path);
+
+    return konami_id;
+}
+
+// 保存个人信息中的 Konami ID
+void save_personal_konami_id(const char *konami_id) {
+    char *config_path;
+
+    if (is_portable_mode()) {
+        const char *prog_dir = get_program_directory();
+        config_path = g_build_filename(prog_dir, CONFIG_FILE, NULL);
+    } else {
+        const char *config_home = g_get_user_config_dir();
+        config_path = g_build_filename(config_home, "ygo-deck-builder", CONFIG_FILE, NULL);
+        char *config_dir = g_path_get_dirname(config_path);
+        g_mkdir_with_parents(config_dir, 0755);
+        g_free(config_dir);
+    }
+
+    GKeyFile *keyfile = g_key_file_new();
+    g_key_file_load_from_file(keyfile, config_path, G_KEY_FILE_NONE, NULL);
+
+    if (konami_id && *konami_id) {
+        g_key_file_set_string(keyfile, "PersonalInfo", "KonamiId", konami_id);
+    } else {
+        g_key_file_remove_key(keyfile, "PersonalInfo", "KonamiId", NULL);
+    }
+
+    GError *error = NULL;
+    if (!g_key_file_save_to_file(keyfile, config_path, &error)) {
+        g_warning("无法保存个人信息配置: %s", error->message);
+        g_error_free(error);
+    }
+
+    g_key_file_free(keyfile);
+    g_free(config_path);
+}

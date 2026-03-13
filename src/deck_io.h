@@ -70,4 +70,16 @@ gboolean load_offline_data_switch_state(void);
  */
 void save_offline_data_switch_state(gboolean enabled);
 
+/**
+ * 加载个人信息中的 Konami ID。
+ * @return 新分配的字符串，调用者需 g_free；若未设置返回 NULL
+ */
+char* load_personal_konami_id(void);
+
+/**
+ * 保存个人信息中的 Konami ID。
+ * @param konami_id 可为 NULL 或空串，表示清空
+ */
+void save_personal_konami_id(const char *konami_id);
+
 #endif // DECK_IO_H
