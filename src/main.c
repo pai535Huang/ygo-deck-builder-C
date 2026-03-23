@@ -2388,6 +2388,9 @@ static void on_sort_clicked(GtkButton *btn, gpointer user_data) {
     if (ui->side_pics && ui->side_idx > 0) {
         sort_deck_region(ui->side_pics, &ui->side_idx, ui->side_count);
     }
+
+    // 整理后重新计算角标，确保禁限图标跟随卡片新位置
+    update_deck_overlays(ui);
 }
 
 // 打乱按钮回调：只打乱Main区域
@@ -2401,6 +2404,9 @@ static void on_shuffle_clicked(GtkButton *btn, gpointer user_data) {
     if (ui->main_pics && ui->main_idx > 0) {
         shuffle_deck_region(ui->main_pics, &ui->main_idx, ui->main_count);
     }
+
+    // 打乱后重新计算角标，确保禁限图标跟随卡片新位置
+    update_deck_overlays(ui);
 }
 
 // 清空确认对话框的响应回调

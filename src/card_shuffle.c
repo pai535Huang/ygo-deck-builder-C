@@ -13,14 +13,15 @@ void shuffle_deck_region(GPtrArray *pics, int *count, GtkLabel *count_label) {
         int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "img_id"));
         
         if (img_id > 0) {
-            // 存储卡片信息：img_id, card_id, pixbuf, is_extra
-            gpointer *card_info = g_new(gpointer, 4);
+            // 存储卡片信息：img_id, card_id, pixbuf, is_extra, en_name
+            gpointer *card_info = g_new(gpointer, 5);
             card_info[0] = GINT_TO_POINTER(img_id);
             card_info[1] = g_object_get_data(G_OBJECT(pic), "card_id");
             GdkPixbuf *pixbuf = slot_get_pixbuf(pic);
             if (pixbuf) g_object_ref(pixbuf);
             card_info[2] = pixbuf;
             card_info[3] = GINT_TO_POINTER(slot_get_is_extra(pic));
+            card_info[4] = (gpointer)g_strdup(slot_get_en_name(pic));
             g_ptr_array_add(cards, card_info);
         }
     }
@@ -40,6 +41,7 @@ void shuffle_deck_region(GPtrArray *pics, int *count, GtkLabel *count_label) {
         slot_set_is_extra(pic, FALSE);
         g_object_set_data(G_OBJECT(pic), "card_id", GINT_TO_POINTER(0));
         g_object_set_data(G_OBJECT(pic), "img_id", GINT_TO_POINTER(0));
+        slot_set_en_name(pic, NULL);
     }
     
     // 按打乱后的顺序重新放置卡片（严格从序号0开始紧密排列）
@@ -51,6 +53,7 @@ void shuffle_deck_region(GPtrArray *pics, int *count, GtkLabel *count_label) {
         int card_id = GPOINTER_TO_INT(card_info[1]);
         GdkPixbuf *pixbuf = (GdkPixbuf *)card_info[2];
         gboolean is_extra = GPOINTER_TO_INT(card_info[3]);
+        const char *en_name = (const char *)card_info[4];
         
         if (pixbuf) {
             slot_set_pixbuf(pic, pixbuf);
@@ -59,6 +62,8 @@ void shuffle_deck_region(GPtrArray *pics, int *count, GtkLabel *count_label) {
         slot_set_is_extra(pic, is_extra);
         g_object_set_data(G_OBJECT(pic), "card_id", GINT_TO_POINTER(card_id));
         g_object_set_data(G_OBJECT(pic), "img_id", GINT_TO_POINTER(img_id));
+        slot_set_en_name(pic, en_name);
+        g_free(card_info[4]);
         
         g_free(card_info);
     }

@@ -997,9 +997,11 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
             gint64 card_def = GET_CARD_INT_FIELD("def", 0);
             
             // 检查连接箭头是否完全匹配
+            // 注意：这里不能直接 return，否则会跳过后续其它筛选条件（属性/种族/攻防/等级等）
             gboolean link_match = ((card_def & required_markers) == required_markers);
-            
-            return link_match;
+            if (!link_match) {
+                return FALSE;
+            }
         }
         
         // 检查灵摆刻度筛选（仅对灵摆怪兽有效）
