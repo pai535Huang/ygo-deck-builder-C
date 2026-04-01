@@ -13,9 +13,28 @@
 - 卡图左上角显示禁限数量/GENESYS 分值角标，直观展示卡片状态
 
 ## 依赖环境
+
+以下依赖以 `meson.build` 为准。
+
+### 1. 构建工具链依赖
+- C 编译器：GCC 或 Clang（支持 C11）
+- Meson >= 0.59.0
+- Ninja
+- pkg-config
+
+### 2. 编译依赖（开发头文件）
 - GTK4 >= 4.8
-- libadwaita >= 1.2
-- json-glib
+- libadwaita-1 >= 1.2
+- json-glib-1.0
+- libsoup-3.0
+- gdk-pixbuf-2.0
+- libarchive
+- sqlite3
+
+### 3. 运行时依赖
+- gtk4
+- libadwaita-1
+- json-glib-1.0
 - libsoup-3.0
 - gdk-pixbuf-2.0
 - libarchive
@@ -26,15 +45,22 @@
 
 1. 安装依赖（以 Debian/Ubuntu 为例）：
 	```bash
-	sudo apt install libgtk-4-dev libadwaita-1-dev libjson-glib-dev libsoup-3.0-dev libgdk-pixbuf-2.0-dev libarchive-dev libsqlite3-dev meson ninja-build
+	sudo apt install build-essential clang meson ninja-build pkg-config \
+	  libgtk-4-dev libadwaita-1-dev libjson-glib-dev libsoup-3.0-dev \
+	  libgdk-pixbuf-2.0-dev libarchive-dev libsqlite3-dev
 	```
-2. 	```bash
-	meson setup build
+2. （可选）仅运行程序所需依赖：
+	```bash
+	sudo apt install libgtk-4-1 libadwaita-1-0 libjson-glib-1.0-0 libsoup-3.0-0 \
+	  libgdk-pixbuf-2.0-0 libarchive13 libsqlite3-0
 	```
 3. 	```bash
-	meson compile -C build
+	meson setup build
 	```
 4. 	```bash
+	meson compile -C build
+	```
+5. 	```bash
 	./build/src/ygo-deck-builder
 	```
 
