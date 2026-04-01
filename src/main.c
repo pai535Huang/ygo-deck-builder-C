@@ -177,6 +177,7 @@ static gchar *get_forbidden_list_path(const char *filename) {
 static void on_export_clicked(GtkButton *btn, gpointer user_data);
 static void on_action_generate_sheet(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 static void on_action_edit_personal_info(GSimpleAction *action, GVariant *parameter, gpointer user_data);
+static void on_show_forbidden_changes_action(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 
 void list_clear(GtkListBox *list) {
     GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(list));
@@ -3271,6 +3272,128 @@ static void on_show_prerelease_action(GSimpleAction *action, GVariant *parameter
     g_message("Displayed %u pre-release cards", len);
 }
 
+// 显示禁限变更（按当前下拉所选 OCG/TCG/AE/SC）
+static void on_show_forbidden_changes_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+    (void)action;
+    (void)parameter;
+    SearchUI *ui = (SearchUI*)user_data;
+
+    if (!ui || !ui->forbidden_dropdown) return;
+
+    // 先清空当前结果和图片加载队列
+    list_clear(GTK_LIST_BOX(ui->list));
+    if (ui->search_image_loader_id > 0) {
+        g_source_remove(ui->search_image_loader_id);
+        ui->search_image_loader_id = 0;
+    }
+    if (ui->search_image_queue) {
+        g_ptr_array_free(ui->search_image_queue, TRUE);
+        ui->search_image_queue = NULL;
+    }
+
+    guint selected = gtk_drop_down_get_selected(ui->forbidden_dropdown);
+    GHashTable **changes_slot = NULL;
+    const char *changes_filename = NULL;
+    if (selected == 0) {
+        changes_slot = &ui->ocg_forbidden_changes;
+        changes_filename = "ocg_forbidden_changes.json";
+    } else if (selected == 1) {
+        changes_slot = &ui->tcg_forbidden_changes;
+        changes_filename = "tcg_forbidden_changes.json";
+    } else if (selected == 2) {
+        changes_slot = &ui->ae_forbidden_changes;
+        changes_filename = "ae_forbidden_changes.json";
+    } else if (selected == 3) {
+        changes_slot = &ui->sc_forbidden_changes;
+        changes_filename = "sc_forbidden_changes.json";
+    }
+
+    if (selected == 4) {
+        g_message("GENESYS mode has no forbidden changes list");
+        return;
+    }
+
+    if (!changes_slot || !changes_filename) {
+        return;
+    }
+
+    // 每次点击都从磁盘重载当前模式的变更表，避免启动异步下载后内存仍是旧空表。
+    gchar *changes_path = get_forbidden_list_path(changes_filename);
+    if (changes_path) {
+        GHashTable *new_table = load_forbidden_changes(changes_path);
+        g_free(changes_path);
+        if (new_table) {
+            if (*changes_slot) {
+                g_hash_table_unref(*changes_slot);
+            }
+            *changes_slot = new_table;
+        }
+    }
+
+    GHashTable *changes_table = *changes_slot;
+    if (!changes_table || g_hash_table_size(changes_table) == 0) {
+        g_message("No forbidden changes data available for current mode");
+        if (ui->toast_overlay) {
+            AdwToast *toast = adw_toast_new("没有读取到禁限变更，请检查");
+            adw_toast_set_timeout(toast, 3);
+            adw_toast_overlay_add_toast(ui->toast_overlay, toast);
+        }
+        return;
+    }
+
+    JsonArray *all_cards = get_all_offline_cards();
+    if (!all_cards) {
+        g_warning("Failed to load offline cards for forbidden changes view");
+        return;
+    }
+
+    guint len = json_array_get_length(all_cards);
+    guint shown = 0;
+    for (guint i = 0; i < len; i++) {
+        JsonObject *card = json_array_get_object_element(all_cards, i);
+        if (!card) {
+            continue;
+        }
+
+        int cid = 0;
+        if (json_object_has_member(card, "cid")) {
+            cid = json_object_get_int_member(card, "cid");
+        }
+        if (cid <= 0 && json_object_has_member(card, "id")) {
+            int img_id = json_object_get_int_member(card, "id");
+            if (img_id > 0) {
+                cid = offline_get_cid_by_img_id(img_id);
+            }
+        }
+
+        if (cid <= 0) {
+            continue;
+        }
+
+        char cid_key[32];
+        g_snprintf(cid_key, sizeof(cid_key), "%d", cid);
+        const char *change_str = (const char *)g_hash_table_lookup(changes_table, cid_key);
+        if (!change_str || !*change_str) {
+            continue;
+        }
+
+        JsonObject *marked_item = json_object_ref(card);
+        json_object_set_string_member(marked_item, "forbidden_change", change_str);
+        queue_result_for_render(ui, marked_item);
+        json_object_unref(marked_item);
+        shown++;
+    }
+
+    json_array_unref(all_cards);
+    g_message("Displayed %u forbidden changes for mode index %u", shown, selected);
+
+    if (shown == 0 && ui->toast_overlay) {
+        AdwToast *toast = adw_toast_new("没有读取到禁限变更，请检查");
+        adw_toast_set_timeout(toast, 3);
+        adw_toast_overlay_add_toast(ui->toast_overlay, toast);
+    }
+}
+
 static GtkWidget* make_section_header(const char *title_text) {
     GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
@@ -3401,6 +3524,7 @@ on_activate(GApplication *app, gpointer user_data)
     GMenu *app_menu = g_menu_new();
     g_menu_append(app_menu, "下载先行卡", "win.download-prerelease");
     g_menu_append(app_menu, "显示先行卡", "win.show-prerelease");
+    g_menu_append(app_menu, "显示禁限变更", "win.show-forbidden-changes");
     g_menu_append(app_menu, "个人信息", "win.edit-personal-info");
     gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(app_menu_button), G_MENU_MODEL(app_menu));
     g_object_unref(app_menu);
@@ -3762,6 +3886,10 @@ on_activate(GApplication *app, gpointer user_data)
     startup_update_ae_forbidden();
     startup_update_sc_forbidden();
     startup_update_genesys_forbidden();
+    startup_update_ocg_forbidden_changes();
+    startup_update_tcg_forbidden_changes();
+    startup_update_ae_forbidden_changes();
+    startup_update_sc_forbidden_changes();
     
     // 加载禁限卡表（从配置目录）
     gchar *ocg_path = get_forbidden_list_path("ocg_forbidden.json");
@@ -3769,18 +3897,30 @@ on_activate(GApplication *app, gpointer user_data)
     gchar *ae_path = get_forbidden_list_path("ae_forbidden.json");
     gchar *sc_path = get_forbidden_list_path("sc_forbidden.json");
     gchar *genesys_path = get_forbidden_list_path("genesys_forbidden.json");
+    gchar *ocg_changes_path = get_forbidden_list_path("ocg_forbidden_changes.json");
+    gchar *tcg_changes_path = get_forbidden_list_path("tcg_forbidden_changes.json");
+    gchar *ae_changes_path = get_forbidden_list_path("ae_forbidden_changes.json");
+    gchar *sc_changes_path = get_forbidden_list_path("sc_forbidden_changes.json");
     
     sui->ocg_forbidden = load_forbidden_list(ocg_path ? ocg_path : "");
     sui->tcg_forbidden = load_forbidden_list(tcg_path ? tcg_path : "");
     sui->ae_forbidden = load_forbidden_list(ae_path ? ae_path : "");
     sui->sc_forbidden = load_forbidden_list(sc_path ? sc_path : "");
     sui->genesys_forbidden = load_forbidden_list(genesys_path ? genesys_path : "");
+    sui->ocg_forbidden_changes = load_forbidden_changes(ocg_changes_path ? ocg_changes_path : "");
+    sui->tcg_forbidden_changes = load_forbidden_changes(tcg_changes_path ? tcg_changes_path : "");
+    sui->ae_forbidden_changes = load_forbidden_changes(ae_changes_path ? ae_changes_path : "");
+    sui->sc_forbidden_changes = load_forbidden_changes(sc_changes_path ? sc_changes_path : "");
     
     g_free(ocg_path);
     g_free(tcg_path);
     g_free(ae_path);
     g_free(sc_path);
     g_free(genesys_path);
+    g_free(ocg_changes_path);
+    g_free(tcg_changes_path);
+    g_free(ae_changes_path);
+    g_free(sc_changes_path);
     
     // 连接下拉菜单变化信号
     g_signal_connect(forbidden_dropdown, "notify::selected", G_CALLBACK(on_forbidden_dropdown_changed), sui);
@@ -3964,6 +4104,11 @@ on_activate(GApplication *app, gpointer user_data)
     g_signal_connect(show_action, "activate", G_CALLBACK(on_show_prerelease_action), sui);
     g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(show_action));
     g_object_unref(show_action);
+
+    GSimpleAction *show_forbidden_changes_action = g_simple_action_new("show-forbidden-changes", NULL);
+    g_signal_connect(show_forbidden_changes_action, "activate", G_CALLBACK(on_show_forbidden_changes_action), sui);
+    g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(show_forbidden_changes_action));
+    g_object_unref(show_forbidden_changes_action);
 
     GSimpleAction *edit_personal_info_action = g_simple_action_new("edit-personal-info", NULL);
     g_signal_connect(edit_personal_info_action, "activate", G_CALLBACK(on_action_edit_personal_info), sui);

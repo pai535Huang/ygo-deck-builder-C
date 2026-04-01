@@ -6,6 +6,7 @@
 #include "dnd_manager.h"
 #include "deck_slot.h"
 #include "card_info.h"
+#include "forbidden_list.h"
 #include <string.h>
 
 // 全局变量：是否在搜索结果中显示先行卡（默认显示）
@@ -426,6 +427,39 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
     gtk_box_append(GTK_BOX(vbox), title);
     gtk_box_append(GTK_BOX(vbox), subtitle);
     
+    // 显示禁限变更（如果有的话）
+    if (json_object_has_member(obj, "forbidden_change")) {
+        const char *change_str = json_object_get_string_member(obj, "forbidden_change");
+        if (change_str && *change_str != '\0') {
+            GtkWidget *forbidden_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
+            gtk_widget_set_halign(forbidden_box, GTK_ALIGN_START);
+
+            GtkWidget *forbidden_label = gtk_label_new(NULL);
+            char *markup = g_strdup_printf("<b>[%s]</b>", change_str);
+            gtk_label_set_markup(GTK_LABEL(forbidden_label), markup);
+            g_free(markup);
+            gtk_label_set_xalign(GTK_LABEL(forbidden_label), 0.0);
+
+            // 根据新状态（→后面的部分）设置颜色
+            const char *arrow = strstr(change_str, "→");
+            if (arrow) {
+                const char *new_status = arrow + 3;  // 跳过"→"的UTF-8编码（3字节）
+                if (g_str_has_prefix(new_status, "禁止")) {
+                    gtk_widget_add_css_class(forbidden_label, "error");
+                } else if (g_str_has_prefix(new_status, "限制")) {
+                    gtk_widget_add_css_class(forbidden_label, "warning");
+                } else if (g_str_has_prefix(new_status, "准限制")) {
+                    gtk_widget_add_css_class(forbidden_label, "accent");
+                }
+            }
+
+            gtk_box_append(GTK_BOX(forbidden_box), forbidden_label);
+            gtk_box_append(GTK_BOX(vbox), forbidden_box);
+        }
+        // 如果有禁限变更字段，跳过后续的禁限状态显示
+        goto skip_forbidden_status;
+    }
+    
     // 显示禁限状态（使用cid而非id）
     if (ui->forbidden_dropdown) {
         guint selected = gtk_drop_down_get_selected(ui->forbidden_dropdown);
@@ -537,6 +571,7 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
         }
     }
 
+    skip_forbidden_status:
     // 防止 row 扩展
     gtk_widget_set_hexpand(row, FALSE);
     gtk_widget_set_halign(row, GTK_ALIGN_START);

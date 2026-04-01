@@ -57,6 +57,11 @@ typedef struct {
     GHashTable *ae_forbidden;
     GHashTable *sc_forbidden;
     GHashTable *genesys_forbidden;  // GENESYS模式：英文卡名 -> 分值字符串
+    // 禁限卡表变更信息
+    GHashTable *ocg_forbidden_changes;  // 卡片cid字符串 -> "old→new"
+    GHashTable *tcg_forbidden_changes;
+    GHashTable *ae_forbidden_changes;
+    GHashTable *sc_forbidden_changes;
     // 过滤选项
     GtkWidget *filter_popover;
     gboolean filter_by_monster;

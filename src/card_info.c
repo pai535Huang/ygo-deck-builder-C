@@ -1,6 +1,7 @@
 // card_info.c
 // 用于分解卡片类别信息
 #include "card_info.h"
+#include "app_path.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -380,8 +381,11 @@ uint32_t get_race_from_string(const char* race) {
 
 // 获取strings.conf文件路径
 static gchar* get_strings_conf_path(void) {
-    // 从offline_data模块获取cards目录路径
-    // 这里需要包含app_path.h和offline_data相关的逻辑
+    if (is_portable_mode()) {
+        const char *prog_dir = get_program_directory();
+        return g_build_filename(prog_dir, "data", "cards", "strings.conf", NULL);
+    }
+
     const char *data_home = g_get_user_data_dir();
     return g_build_filename(data_home, "ygo-deck-builder", "cards", "strings.conf", NULL);
 }
