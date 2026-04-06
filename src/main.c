@@ -2901,14 +2901,16 @@ typedef struct {
 // 异步读取响应数据的工作线程
 static void card_info_read_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
     (void)source_object;
+    (void)task_data;
+    (void)cancellable;
     
-    GInputStream *in = (GInputStream*)g_task_get_task_data(task);
+    GBytes *body = (GBytes*)g_task_get_task_data(task);
+    gsize size = 0;
+    const guint8 *bytes_data = g_bytes_get_data(body, &size);
     GByteArray *ba = g_byte_array_new();
-    guint8 bufread[4096];
-    gssize n;
-    
-    while ((n = g_input_stream_read(in, bufread, sizeof bufread, cancellable, NULL)) > 0) {
-        g_byte_array_append(ba, bufread, (guint)n);
+
+    if (bytes_data && size > 0) {
+        g_byte_array_append(ba, bytes_data, (guint)size);
     }
     
     g_task_return_pointer(task, ba, (GDestroyNotify)g_byte_array_unref);
@@ -2997,15 +2999,15 @@ static void on_slot_card_info_received(GObject *source, GAsyncResult *res, gpoin
     SoupSession *session = SOUP_SESSION(source);
     SearchUI *ui = (SearchUI*)user_data;
     GError *err = NULL;
-    GInputStream *in = soup_session_send_finish(session, res, &err);
-    if (!in) { 
+    GBytes *body = soup_session_send_and_read_finish(session, res, &err);
+    if (!body) {
         if (err) g_error_free(err); 
         return; 
     }
     
     // 使用GTask异步读取数据，避免阻塞主线程
     GTask *task = g_task_new(NULL, NULL, card_info_read_finished, ui);
-    g_task_set_task_data(task, in, g_object_unref);  // in的所有权转移给task
+    g_task_set_task_data(task, body, (GDestroyNotify)g_bytes_unref);
     g_task_run_in_thread(task, card_info_read_thread);
     g_object_unref(task);
 }
@@ -3071,7 +3073,7 @@ static void on_slot_enter(GtkEventControllerMotion *controller, double x, double
     SoupMessage *msg = soup_message_new("GET", url);
     if (!msg) return;
     
-    soup_session_send_async(ui->session, msg, G_PRIORITY_DEFAULT, NULL, on_slot_card_info_received, ui);
+    soup_session_send_and_read_async(ui->session, msg, G_PRIORITY_DEFAULT, NULL, on_slot_card_info_received, ui);
     g_object_unref(msg);
 }
 

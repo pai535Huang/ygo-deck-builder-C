@@ -656,7 +656,7 @@ void search_response_cb(GObject *source, GAsyncResult *res, gpointer user_data) 
     SoupSession *session = SOUP_SESSION(source);
     SearchUI *ui = (SearchUI*)user_data;
     GError *err = NULL;
-    GInputStream *in = soup_session_send_finish(session, res, &err);
+    GBytes *response_body = soup_session_send_and_read_finish(session, res, &err);
     
     // 如果请求被取消（例如新搜索开始），直接返回
     if (err && g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
@@ -664,19 +664,17 @@ void search_response_cb(GObject *source, GAsyncResult *res, gpointer user_data) 
         return;
     }
     
-    if (!in) { 
+    if (!response_body) {
         if (err) g_error_free(err); 
         return; 
     }
-    GByteArray *ba = g_byte_array_new();
-    guint8 bufread[4096];
-    gssize n;
-    while ((n = g_input_stream_read(in, bufread, sizeof bufread, NULL, NULL)) > 0) {
-        g_byte_array_append(ba, bufread, (guint)n);
-    }
+
+    gsize body_size = 0;
+    const guint8 *body_data = g_bytes_get_data(response_body, &body_size);
+
     JsonParser *parser = json_parser_new();
     GError *jerr = NULL;
-    if (ba->len > 0 && json_parser_load_from_data(parser, (const char*)ba->data, (gssize)ba->len, &jerr)) {
+    if (body_data && body_size > 0 && json_parser_load_from_data(parser, (const char*)body_data, (gssize)body_size, &jerr)) {
         JsonNode *root = json_parser_get_root(parser);
         if (JSON_NODE_TYPE(root) == JSON_NODE_OBJECT) {
             JsonObject *robj = json_node_get_object(root);
@@ -692,8 +690,7 @@ void search_response_cb(GObject *source, GAsyncResult *res, gpointer user_data) 
     }
     if (jerr) g_error_free(jerr);
     g_object_unref(parser);
-    g_byte_array_free(ba, TRUE);
-    g_object_unref(in);
+    g_bytes_unref(response_body);
 }
 
 void on_forbidden_dropdown_changed(GtkDropDown *dropdown, GParamSpec *pspec, gpointer user_data) {
@@ -880,8 +877,8 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
         if (!msg) return;
         // 搜索请求不使用 cancellable，让请求自然完成
         // 回调中会检查是否应该处理结果
-        soup_session_send_async(ui->session, msg, G_PRIORITY_DEFAULT, NULL, search_response_cb, ui);
-        g_object_unref(msg);  // soup_session_send_async 会内部增加引用
+        soup_session_send_and_read_async(ui->session, msg, G_PRIORITY_DEFAULT, NULL, search_response_cb, ui);
+        g_object_unref(msg);  // soup_session_send_and_read_async 会内部增加引用
     } else {
         // 搜索框为空但有筛选条件，且离线数据未启用
         // 在这种情况下，只显示先行卡的筛选结果（如果有）
