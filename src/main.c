@@ -1272,7 +1272,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     // 创建 PreferencesPage
     AdwPreferencesPage *page = ADW_PREFERENCES_PAGE(adw_preferences_page_new());
     adw_preferences_page_set_title(page, "卡片筛选");
-    adw_preferences_page_set_icon_name(page, "nautilus-search-filters-symbolic");
+    adw_preferences_page_set_icon_name(page, "preferences-system-symbolic");
     
     // === 恢复默认按钮组 ===
     AdwPreferencesGroup *reset_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
@@ -3508,7 +3508,7 @@ on_activate(GApplication *app, gpointer user_data)
 
     // 头部按钮：切换左侧边栏显示/隐藏
     GtkWidget *sidebar_toggle = gtk_toggle_button_new();
-    GtkWidget *sidebar_icon = gtk_image_new_from_icon_name("view-sidebar-symbolic");
+    GtkWidget *sidebar_icon = gtk_image_new_from_icon_name("sidebar-show-symbolic");
     gtk_button_set_child(GTK_BUTTON(sidebar_toggle), sidebar_icon);
     gtk_widget_set_tooltip_text(sidebar_toggle, "显示/隐藏左侧栏");
     // 双向绑定状态，初始值从 outer 的 show-sidebar 同步到按钮
@@ -3980,7 +3980,7 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_box_append(GTK_BOX(search_bar), sui->button);
     
     // 添加筛选选项按钮
-    GtkWidget *filter_button = gtk_button_new_from_icon_name("nautilus-search-filters-symbolic");
+    GtkWidget *filter_button = gtk_button_new_from_icon_name("preferences-system-symbolic");
     gtk_widget_set_tooltip_text(filter_button, "筛选选项");
     gtk_widget_add_css_class(filter_button, "flat");
     g_signal_connect(filter_button, "clicked", G_CALLBACK(on_filter_button_clicked), win);
