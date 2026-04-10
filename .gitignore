@@ -25,3 +25,6 @@ meson-logs/
 
 # Development desktop file (local only)
 *.dev.desktop
+
+# Release note
+release_notes.md

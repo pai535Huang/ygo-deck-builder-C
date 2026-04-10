@@ -1,5 +1,5 @@
 project('ygo-deck-builder', 'c',
-  version: '0.2.3',
+  version: '0.2.4',
   license: 'MIT',
   meson_version: '>=0.59.0',
   default_options: [
