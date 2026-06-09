@@ -87,4 +87,16 @@ gchar* offline_get_en_name_by_id(int card_id);
  */
 int offline_get_cid_by_img_id(int img_id);
 
+/**
+ * 获取用于同名卡/异画卡张数审核的规范卡片 ID。
+ *
+ * 传入值通常是 ygocdb 短 cid；如果传入 Konami img_id，也会尽量映射回 cid。
+ * 当数据包含 alias 时，按 YGOPro 数据库规则使用 alias 指向的实际卡作为
+ * copy-limit key；如果当前离线 JSON 缺少 alias，则仅对明确的“规则上当作
+ * 「具体卡名」使用”文本做兜底解析。
+ *
+ * @return 用于卡位审核的 ID。可解析时为目标卡 cid；无法解析时返回原 card_id。
+ */
+int offline_get_effective_card_id(int card_id);
+
 #endif // OFFLINE_DATA_H

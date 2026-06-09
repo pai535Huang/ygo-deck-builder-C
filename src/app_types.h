@@ -69,12 +69,17 @@ typedef struct {
     gboolean filter_by_trap;
     // 搜索结果图片加载队列
     GPtrArray *search_image_queue;
+    guint search_image_queue_pos;
     guint search_image_loader_id;
     // 批量渲染队列
     GPtrArray *pending_results;  // 存储待渲染的JsonObject
+    guint pending_results_pos;
     guint batch_render_id;       // idle callback的ID
     // 搜索代次计数器（每次搜索递增，用于检测过期回调）
     guint64 search_generation;
+    // 中间卡组区正在拖拽时跳过 hover 预览加载
+    guint deck_drag_depth;
+    int hovered_slot_img_id;
     // 窗口引用（用于显示对话框）
     AdwApplicationWindow *window;
     // Toast overlay（用于显示通知）

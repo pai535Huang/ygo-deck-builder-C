@@ -1,6 +1,7 @@
 #include "deck_export_sheet.h"
 
 #include "offline_data.h"
+#include "pixbuf_utils.h"
 #include <cairo-pdf.h>
 #include <pango/pangocairo.h>
 #include <ctype.h>
@@ -351,8 +352,7 @@ static gboolean load_and_draw_template(cairo_t *cr, GError **error) {
 
     cairo_save(cr);
     cairo_scale(cr, page_w / bg_w, page_h / bg_h);
-    gdk_cairo_set_source_pixbuf(cr, template, 0, 0);
-    cairo_paint(cr);
+    pixbuf_utils_paint_to_cairo(cr, template, 0, 0, CAIRO_FILTER_BILINEAR);
     cairo_restore(cr);
 
     g_object_unref(template);

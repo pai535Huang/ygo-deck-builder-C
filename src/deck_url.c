@@ -242,7 +242,7 @@ bool deck_decode_from_url(
     
     // 提取d参数值（到&或字符串结尾）
     const char *param_end = strchr(d_param, '&');
-    int param_len = param_end ? (param_end - d_param) : strlen(d_param);
+    gsize param_len = param_end ? (gsize)(param_end - d_param) : strlen(d_param);
     char *base64_data = g_strndup(d_param, param_len);
     
     // 解码Base64Url为位数组

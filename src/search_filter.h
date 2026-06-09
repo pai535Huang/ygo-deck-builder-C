@@ -9,6 +9,8 @@
 typedef struct {
     int img_id;
     gboolean is_prerelease;
+    GtkWidget *target;
+    GtkStack *stack;
 } SearchImageToLoad;
 
 // 搜索与过滤相关回调

@@ -1,5 +1,6 @@
 #include "image_loader.h"
 #include "app_path.h"
+#include "pixbuf_utils.h"
 #include <gdk-pixbuf/gdk-pixbuf.h>
 
 // 全局缓存变量
@@ -451,7 +452,7 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
             }
         } else if (GTK_IS_PICTURE(ctx->target)) {
             // 目标是GtkPicture（左侧预览）
-            GdkTexture *tex = gdk_texture_new_for_pixbuf(pixbuf);
+            GdkTexture *tex = pixbuf_utils_texture_from_pixbuf(pixbuf);
             if (tex) {
                 gtk_picture_set_paintable(GTK_PICTURE(ctx->target), GDK_PAINTABLE(tex));
                 if (ctx->stack && GTK_IS_STACK(ctx->stack)) {
@@ -493,7 +494,7 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
                         gtk_stack_set_visible_child_name(waiting_ctx->stack, "picture");
                     }
                 } else if (GTK_IS_WIDGET(waiting_ctx->target) && GTK_IS_PICTURE(waiting_ctx->target)) {
-                    GdkTexture *tex = gdk_texture_new_for_pixbuf(pixbuf);
+                    GdkTexture *tex = pixbuf_utils_texture_from_pixbuf(pixbuf);
                     if (tex) {
                         gtk_picture_set_paintable(GTK_PICTURE(waiting_ctx->target),
                                                  GDK_PAINTABLE(tex));

@@ -5,6 +5,7 @@
 #include <archive.h>
 #include <archive_entry.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <glib/gstdio.h>
 #include <sys/stat.h>
@@ -20,6 +21,8 @@ static gchar *offline_cards_json_path = NULL;
 static gint64 offline_cards_json_mtime = 0;
 // img_id（Konami 八位码）→ cid（ygocdb 短 ID）反向索引缓存
 static GHashTable *offline_img_to_cid = NULL;  // key: g_strdup(img_id), value: GINT_TO_POINTER(cid)
+static GHashTable *offline_name_to_cid = NULL; // key: normalized card name, value: GINT_TO_POINTER(cid)
+static GHashTable *offline_effective_cid = NULL; // key: GINT_TO_POINTER(input id), value: GINT_TO_POINTER(effective cid)
 
 static gchar *get_cards_dir(void);
 
@@ -56,7 +59,31 @@ void offline_data_clear_cache(void) {
         g_hash_table_unref(offline_img_to_cid);
         offline_img_to_cid = NULL;
     }
+    if (offline_name_to_cid) {
+        g_hash_table_unref(offline_name_to_cid);
+        offline_name_to_cid = NULL;
+    }
+    if (offline_effective_cid) {
+        g_hash_table_unref(offline_effective_cid);
+        offline_effective_cid = NULL;
+    }
     g_mutex_unlock(&offline_cache_mutex);
+}
+
+static void offline_add_name_to_cid_locked(const char *name, int cid) {
+    if (!offline_name_to_cid || !name || !*name || cid <= 0) return;
+
+    gchar *stripped = g_strdup(name);
+    if (!stripped) return;
+    g_strstrip(stripped);
+    if (*stripped) {
+        gpointer existing = g_hash_table_lookup(offline_name_to_cid, stripped);
+        if (!existing) {
+            g_hash_table_insert(offline_name_to_cid, stripped, GINT_TO_POINTER(cid));
+            return;
+        }
+    }
+    g_free(stripped);
 }
 
 static gboolean offline_cache_ensure_loaded_locked(void) {
@@ -114,24 +141,42 @@ static gboolean offline_cache_ensure_loaded_locked(void) {
     if (offline_img_to_cid) {
         g_hash_table_unref(offline_img_to_cid);
     }
+    if (offline_name_to_cid) {
+        g_hash_table_unref(offline_name_to_cid);
+    }
+    if (offline_effective_cid) {
+        g_hash_table_unref(offline_effective_cid);
+    }
     offline_img_to_cid = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    offline_name_to_cid = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    offline_effective_cid = g_hash_table_new(g_direct_hash, g_direct_equal);
     GList *members_for_idx = json_object_get_members(offline_cards_root);
     for (GList *l = members_for_idx; l != NULL; l = l->next) {
         const char *cid_key = (const char *)l->data;
         JsonNode *cn = json_object_get_member(offline_cards_root, cid_key);
         if (!cn || !JSON_NODE_HOLDS_OBJECT(cn)) continue;
         JsonObject *co = json_node_get_object(cn);
-        if (!json_object_has_member(co, "id")) continue;
-        gint64 raw_id = json_object_get_int_member(co, "id");
-        if (raw_id <= 0) continue;
-        char img_id_str[32];
-        g_snprintf(img_id_str, sizeof(img_id_str), "%" G_GINT64_FORMAT, raw_id);
-        /* cid_key 是 root 的 JSON key，生命周期与 parser 绑定，直接 GINT 存 cid */
         int cid_val = atoi(cid_key);
         if (cid_val > 0) {
-            g_hash_table_insert(offline_img_to_cid,
-                                g_strdup(img_id_str),
-                                GINT_TO_POINTER(cid_val));
+            if (json_object_has_member(co, "id")) {
+                gint64 raw_id = json_object_get_int_member(co, "id");
+                if (raw_id > 0) {
+                    char img_id_str[32];
+                    g_snprintf(img_id_str, sizeof(img_id_str), "%" G_GINT64_FORMAT, raw_id);
+                    g_hash_table_insert(offline_img_to_cid,
+                                        g_strdup(img_id_str),
+                                        GINT_TO_POINTER(cid_val));
+                }
+            }
+
+            const char *name_fields[] = {
+                "cn_name", "sc_name", "md_name", "jp_name", "en_name", "nwbbs_n", "cnocg_n", NULL
+            };
+            for (int i = 0; name_fields[i] != NULL; i++) {
+                if (json_object_has_member(co, name_fields[i])) {
+                    offline_add_name_to_cid_locked(json_object_get_string_member(co, name_fields[i]), cid_val);
+                }
+            }
         }
     }
     g_list_free(members_for_idx);
@@ -1124,6 +1169,247 @@ int offline_get_cid_by_img_id(int img_id) {
     }
     g_mutex_unlock(&offline_cache_mutex);
     return cid;
+}
+
+static JsonObject *offline_get_card_object_by_cid_locked(int cid) {
+    if (!offline_cards_root || cid <= 0) return NULL;
+
+    char cid_str[32];
+    g_snprintf(cid_str, sizeof(cid_str), "%d", cid);
+    JsonNode *card_node = json_object_get_member(offline_cards_root, cid_str);
+    if (!card_node || !JSON_NODE_HOLDS_OBJECT(card_node)) return NULL;
+    return json_node_get_object(card_node);
+}
+
+static int offline_lookup_cid_by_img_id_locked(gint64 img_id) {
+    if (!offline_img_to_cid || img_id <= 0) return 0;
+
+    char img_str[32];
+    g_snprintf(img_str, sizeof(img_str), "%" G_GINT64_FORMAT, img_id);
+    gpointer val = g_hash_table_lookup(offline_img_to_cid, img_str);
+    return val ? GPOINTER_TO_INT(val) : 0;
+}
+
+static int offline_lookup_cid_by_name_locked(const char *name) {
+    if (!offline_name_to_cid || !name || !*name) return 0;
+
+    gchar *stripped = g_strdup(name);
+    if (!stripped) return 0;
+    g_strstrip(stripped);
+    int cid = 0;
+    if (*stripped) {
+        gpointer val = g_hash_table_lookup(offline_name_to_cid, stripped);
+        if (val) cid = GPOINTER_TO_INT(val);
+    }
+    g_free(stripped);
+    return cid;
+}
+
+static int offline_alias_to_cid_locked(gint64 alias_img_id) {
+    if (alias_img_id <= 0) return 0;
+
+    int alias_cid = offline_lookup_cid_by_img_id_locked(alias_img_id);
+    if (alias_cid > 0) return alias_cid;
+
+    if (alias_img_id <= G_MAXINT) {
+        JsonObject *by_cid = offline_get_card_object_by_cid_locked((int)alias_img_id);
+        if (by_cid) return (int)alias_img_id;
+    }
+
+    return 0;
+}
+
+static const char *offline_segment_start_for_marker(const char *desc, const char *marker) {
+    const char *start = desc;
+    const char *p = desc;
+    while (p && *p && p < marker) {
+        if (*p == '\r' || *p == '\n') {
+            start = p + 1;
+            p++;
+            continue;
+        }
+        if (g_str_has_prefix(p, "。")) {
+            start = p + strlen("。");
+            p += strlen("。");
+            continue;
+        }
+        p = g_utf8_next_char(p);
+    }
+    return start;
+}
+
+static const char *offline_segment_end_for_marker(const char *marker) {
+    const char *end = NULL;
+    const char *line_end = strpbrk(marker, "\r\n");
+    const char *period = strstr(marker, "。");
+    if (line_end && period) {
+        end = (line_end < period) ? line_end : period;
+    } else {
+        end = line_end ? line_end : period;
+    }
+    return end;
+}
+
+static gchar *offline_extract_alias_name_from_segment(const char *segment) {
+    if (!segment || !*segment) return NULL;
+
+    gchar *candidate = g_strdup(segment);
+    if (!candidate) return NULL;
+    g_strstrip(candidate);
+    if (!*candidate) {
+        g_free(candidate);
+        return NULL;
+    }
+
+    gboolean name_rule = (strstr(candidate, "这个卡名") != NULL ||
+                          strstr(candidate, "这张卡名") != NULL ||
+                          strstr(candidate, "这张卡的卡名") != NULL);
+    gboolean treated_as = strstr(candidate, "当作") != NULL;
+    gboolean scoped_rule = (strstr(candidate, "只要") != NULL ||
+                            strstr(candidate, "直到") != NULL ||
+                            strstr(candidate, "结束阶段") != NULL);
+
+    if (!name_rule || !treated_as || scoped_rule) {
+        g_free(candidate);
+        return NULL;
+    }
+
+    char *open = strstr(candidate, "「");
+    char *close = open ? strstr(open + strlen("「"), "」") : NULL;
+    if (!open || !close || close <= open) {
+        g_free(candidate);
+        return NULL;
+    }
+
+    const char *after_close = close + strlen("」");
+    if (g_str_has_prefix(after_close, "卡使用") || strstr(after_close, "」")) {
+        g_free(candidate);
+        return NULL;
+    }
+    if (!strstr(after_close, "使用")) {
+        g_free(candidate);
+        return NULL;
+    }
+
+    gchar *alias_name = g_strndup(open + strlen("「"), (gsize)(close - (open + strlen("「"))));
+    g_free(candidate);
+    if (!alias_name) return NULL;
+
+    g_strstrip(alias_name);
+    if (!*alias_name) {
+        g_free(alias_name);
+        return NULL;
+    }
+    return alias_name;
+}
+
+static gchar *offline_extract_rules_alias_name_from_desc(const char *desc) {
+    if (!desc || !*desc) return NULL;
+
+    const char *scan = desc;
+    for (int i = 0; i < 8; i++) {
+        const char *marker = strstr(scan, "当作");
+        if (!marker) break;
+
+        const char *start = offline_segment_start_for_marker(desc, marker);
+        const char *end = offline_segment_end_for_marker(marker);
+        gsize len = end ? (gsize)(end - start) : strlen(start);
+        if (len > 0 && len <= 512) {
+            gchar *segment = g_strndup(start, len);
+            gchar *alias_name = offline_extract_alias_name_from_segment(segment);
+            g_free(segment);
+            if (alias_name) return alias_name;
+        }
+
+        scan = marker + strlen("当作");
+    }
+
+    return NULL;
+}
+
+static int offline_get_text_alias_cid_locked(JsonObject *card) {
+    if (!card || !json_object_has_member(card, "text")) return 0;
+
+    JsonNode *text_node = json_object_get_member(card, "text");
+    if (!text_node || !JSON_NODE_HOLDS_OBJECT(text_node)) return 0;
+
+    JsonObject *text = json_node_get_object(text_node);
+    if (!text || !json_object_has_member(text, "desc")) return 0;
+
+    const char *desc = json_object_get_string_member(text, "desc");
+    gchar *alias_name = offline_extract_rules_alias_name_from_desc(desc);
+    if (!alias_name) return 0;
+
+    int alias_cid = offline_lookup_cid_by_name_locked(alias_name);
+    g_free(alias_name);
+    return alias_cid;
+}
+
+static int offline_resolve_effective_card_id_locked(int card_id, int depth) {
+    if (card_id <= 0) return 0;
+    if (depth > 8) return card_id;
+
+    if (offline_effective_cid) {
+        gpointer cached = g_hash_table_lookup(offline_effective_cid, GINT_TO_POINTER(card_id));
+        if (cached) return GPOINTER_TO_INT(cached);
+    }
+
+    int source_cid = card_id;
+    JsonObject *card = offline_get_card_object_by_cid_locked(source_cid);
+    if (!card) {
+        int mapped_cid = offline_lookup_cid_by_img_id_locked(card_id);
+        if (mapped_cid > 0) {
+            source_cid = mapped_cid;
+            card = offline_get_card_object_by_cid_locked(source_cid);
+        }
+    }
+
+    int effective_cid = source_cid;
+    if (card) {
+        gint64 alias_img_id = 0;
+        if (json_object_has_member(card, "alias")) {
+            alias_img_id = json_object_get_int_member(card, "alias");
+        }
+
+        if (alias_img_id > 0) {
+            int alias_cid = offline_alias_to_cid_locked(alias_img_id);
+            if (alias_cid > 0 && alias_cid != source_cid) {
+                effective_cid = offline_resolve_effective_card_id_locked(alias_cid, depth + 1);
+            }
+        } else if (!json_object_has_member(card, "alias")) {
+            int alias_cid = offline_get_text_alias_cid_locked(card);
+            if (alias_cid > 0 && alias_cid != source_cid) {
+                effective_cid = offline_resolve_effective_card_id_locked(alias_cid, depth + 1);
+            }
+        }
+    }
+
+    if (offline_effective_cid && effective_cid > 0) {
+        g_hash_table_insert(offline_effective_cid,
+                            GINT_TO_POINTER(card_id),
+                            GINT_TO_POINTER(effective_cid));
+        if (source_cid != card_id) {
+            g_hash_table_insert(offline_effective_cid,
+                                GINT_TO_POINTER(source_cid),
+                                GINT_TO_POINTER(effective_cid));
+        }
+    }
+
+    return effective_cid > 0 ? effective_cid : card_id;
+}
+
+int offline_get_effective_card_id(int card_id) {
+    if (card_id <= 0) return card_id;
+
+    g_mutex_lock(&offline_cache_mutex);
+    if (!offline_cache_ensure_loaded_locked()) {
+        g_mutex_unlock(&offline_cache_mutex);
+        return card_id;
+    }
+
+    int effective_id = offline_resolve_effective_card_id_locked(card_id, 0);
+    g_mutex_unlock(&offline_cache_mutex);
+    return effective_id > 0 ? effective_id : card_id;
 }
 
 /**

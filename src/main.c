@@ -33,6 +33,7 @@
 #include "startup_update.h"
 #include "prerelease.h"
 #include "offline_data.h"
+#include "pixbuf_utils.h"
 #include "card_info.h"
 #include "card_sort.h"
 #include "card_shuffle.h"
@@ -69,6 +70,8 @@ gboolean show_prerelease_cards = TRUE;
 void update_genesys_score(SearchUI *ui);
 // 前向声明：更新所有卡组槽位的限制角标
 void update_deck_overlays(SearchUI *ui);
+// 前向声明：清除中间卡组区 hover 预览去重状态
+static void clear_slot_hover_cache(SearchUI *ui);
 
 // 全局筛选状态（保持默认值）
 // FilterState 定义在 search_filter.h 中
@@ -292,10 +295,7 @@ void draw_pixbuf_scaled(GtkDrawingArea *area, cairo_t *cr, int width, int height
         // 直接绘制缓存（缓存是 device-pixel 尺寸，因此绘制前需要把坐标系缩回 logical）
         cairo_save(cr);
         cairo_scale(cr, 1.0 / (double)scale_factor, 1.0 / (double)scale_factor);
-        gdk_cairo_set_source_pixbuf(cr, cached, 0, 0);
-        cairo_pattern_t *pattern = cairo_get_source(cr);
-        if (pattern) cairo_pattern_set_filter(pattern, CAIRO_FILTER_BEST);
-        cairo_paint(cr);
+        pixbuf_utils_paint_to_cairo(cr, cached, 0, 0, CAIRO_FILTER_BEST);
         cairo_restore(cr);
         g_object_unref(cached);
         g_object_unref(pb);
@@ -389,10 +389,7 @@ void draw_pixbuf_scaled(GtkDrawingArea *area, cairo_t *cr, int width, int height
     // 绘制缓存
     cairo_save(cr);
     cairo_scale(cr, 1.0 / (double)scale_factor, 1.0 / (double)scale_factor);
-    gdk_cairo_set_source_pixbuf(cr, render, 0, 0);
-    cairo_pattern_t *pattern = cairo_get_source(cr);
-    if (pattern) cairo_pattern_set_filter(pattern, CAIRO_FILTER_BEST);
-    cairo_paint(cr);
+    pixbuf_utils_paint_to_cairo(cr, render, 0, 0, CAIRO_FILTER_BEST);
     cairo_restore(cr);
     g_object_unref(pb);
     if (disk_pb) g_object_unref(disk_pb);
@@ -410,11 +407,19 @@ void on_drawing_area_destroy(GtkWidget *widget, gpointer user_data) {
     // 在 destroy 信号回调里手动 cairo_surface_destroy 会与 GTK/Cairo 的销毁链交叉，导致堆损坏/崩溃。
 }
 
-// 槽位点击：删除并前移
+// 槽位右键点击：删除并前移
 static void on_slot_clicked(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data) {
-    (void)n_press; (void)x; (void)y;
+    (void)n_press;
     SearchUI *ui = (SearchUI*)user_data;
     GtkWidget *pic = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(gesture));
+    if (!pic) return;
+
+    guint button = gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture));
+    if (button != 3) {
+        g_object_set_data_full(G_OBJECT(pic), "press_xy", NULL, NULL);
+        return;
+    }
+
     // 区分点击与拖拽：比较按下与释放位置（安全存储为 double[2]）
     double *press_xy = (double*)g_object_get_data(G_OBJECT(pic), "press_xy");
     if (press_xy) {
@@ -433,12 +438,14 @@ static void on_slot_clicked(GtkGestureClick *gesture, int n_press, double x, dou
     const char *region = (const char*)g_object_get_data(G_OBJECT(pic), "slot_region");
     int index = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "slot_index"));
     if (!region) return;
+    gboolean deleted = FALSE;
     if (g_strcmp0(region, "main") == 0) {
         if (index < ui->main_idx) {
             shift_delete_slots(ui->main_pics, &ui->main_idx, index);
             update_count_label(ui->main_count, ui->main_idx);
             update_genesys_score(ui);
             update_deck_overlays(ui);
+            deleted = TRUE;
         }
     } else if (g_strcmp0(region, "extra") == 0) {
         if (index < ui->extra_idx) {
@@ -446,6 +453,7 @@ static void on_slot_clicked(GtkGestureClick *gesture, int n_press, double x, dou
             update_count_label(ui->extra_count, ui->extra_idx);
             update_genesys_score(ui);
             update_deck_overlays(ui);
+            deleted = TRUE;
         }
     } else if (g_strcmp0(region, "side") == 0) {
         if (index < ui->side_idx) {
@@ -453,8 +461,10 @@ static void on_slot_clicked(GtkGestureClick *gesture, int n_press, double x, dou
             update_count_label(ui->side_count, ui->side_idx);
             update_genesys_score(ui);
             update_deck_overlays(ui);
+            deleted = TRUE;
         }
     }
+    if (deleted) clear_slot_hover_cache(ui);
     // 清理按下坐标
     g_object_set_data_full(G_OBJECT(pic), "press_xy", NULL, NULL);
 }
@@ -519,7 +529,10 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
 
     if (from_arr == to_arr) {
         // Intra-region: if dropping onto filled slot, swap; else move to empty
-        if (to_index == from_index) return;
+        if (to_index == from_index) {
+            g_object_unref(moving_pb_ref);
+            return;
+        }
         if (to_index < *from_count) {
             GtkWidget *to_widget = GTK_WIDGET(g_ptr_array_index(from_arr, to_index));
             GdkPixbuf *dest_pb = slot_get_pixbuf(to_widget);
@@ -675,6 +688,7 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
     update_count_label(to_label, *to_count);
     update_genesys_score(ui);
     update_deck_overlays(ui);
+    clear_slot_hover_cache(ui);
     g_object_unref(moving_pb_ref);
 }
 
@@ -768,8 +782,13 @@ void apply_overlay_to_widget(GtkWidget *w, SearchUI *ui) {
 
             if (card_id > 0 && table) {
                 char cid_str[32];
-                g_snprintf(cid_str, sizeof(cid_str), "%d", card_id);
+                int limit_card_id = get_effective_card_id_for_limit(card_id);
+                g_snprintf(cid_str, sizeof(cid_str), "%d", limit_card_id);
                 const char *status = g_hash_table_lookup(table, cid_str);
+                if (!status && limit_card_id != card_id) {
+                    g_snprintf(cid_str, sizeof(cid_str), "%d", card_id);
+                    status = g_hash_table_lookup(table, cid_str);
+                }
                 if (status) {
                     if      (g_strcmp0(status, "禁止")  == 0) overlay_number = 0;
                     else if (g_strcmp0(status, "限制")  == 0) overlay_number = 1;
@@ -816,6 +835,11 @@ void update_deck_overlays(SearchUI *ui) {
     APPLY_OVERLAYS_TO_REGION(ui->side_pics,  ui->side_idx)
 
     #undef APPLY_OVERLAYS_TO_REGION
+}
+
+static void clear_slot_hover_cache(SearchUI *ui) {
+    if (!ui) return;
+    ui->hovered_slot_img_id = 0;
 }
 
 typedef struct {
@@ -2206,6 +2230,7 @@ static void on_import_url_clicked(GtkButton *btn, gpointer user_data) {
     update_count_label(ui->extra_count, ui->extra_idx);
     update_count_label(ui->side_count, ui->side_idx);
     update_genesys_score(ui);
+    clear_slot_hover_cache(ui);
     update_deck_overlays(ui);
     
     // 清理
@@ -2392,6 +2417,7 @@ static void on_sort_clicked(GtkButton *btn, gpointer user_data) {
 
     // 整理后重新计算角标，确保禁限图标跟随卡片新位置
     update_deck_overlays(ui);
+    clear_slot_hover_cache(ui);
 }
 
 // 打乱按钮回调：只打乱Main区域
@@ -2408,6 +2434,7 @@ static void on_shuffle_clicked(GtkButton *btn, gpointer user_data) {
 
     // 打乱后重新计算角标，确保禁限图标跟随卡片新位置
     update_deck_overlays(ui);
+    clear_slot_hover_cache(ui);
 }
 
 // 清空确认对话框的响应回调
@@ -2424,6 +2451,7 @@ static void on_clear_dialog_response(AdwAlertDialog *dialog, const char *respons
         );
         update_genesys_score(ui);
         update_deck_overlays(ui);
+        clear_slot_hover_cache(ui);
     }
     // 如果是 "cancel"，则不做任何操作
 }
@@ -2561,7 +2589,7 @@ static void preview_load_finished(GObject *source, GAsyncResult *res, gpointer u
     // 检查picture和stack是否仍然有效
     if (pixbuf && data->picture && GTK_IS_PICTURE(data->picture) && 
         data->stack && GTK_IS_STACK(data->stack)) {
-        GdkTexture *tex = gdk_texture_new_for_pixbuf(pixbuf);
+        GdkTexture *tex = pixbuf_utils_texture_from_pixbuf(pixbuf);
         if (tex) {
             gtk_picture_set_paintable(data->picture, GDK_PAINTABLE(tex));
             g_object_unref(tex);
@@ -2612,7 +2640,7 @@ static void show_card_preview(SearchUI *ui, const CardPreview *pv) {
             GdkPixbuf *cached_pixbuf = load_from_disk_cache(pv->id);
             if (cached_pixbuf) {
                 // 从缓存加载成功
-                GdkTexture *tex = gdk_texture_new_for_pixbuf(cached_pixbuf);
+                GdkTexture *tex = pixbuf_utils_texture_from_pixbuf(cached_pixbuf);
                 if (tex) {
                     gtk_picture_set_paintable(ui->left_picture, GDK_PAINTABLE(tex));
                     g_object_unref(tex);
@@ -2865,6 +2893,7 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
     }
     update_genesys_score(ui);
     update_deck_overlays(ui);
+    clear_slot_hover_cache(ui);
 }
 
 void on_result_row_enter(GtkEventControllerMotion *controller, double x, double y, gpointer user_data) {
@@ -3016,11 +3045,15 @@ static void on_slot_card_info_received(GObject *source, GAsyncResult *res, gpoin
 static void on_slot_enter(GtkEventControllerMotion *controller, double x, double y, gpointer user_data) {
     (void)x; (void)y;
     SearchUI *ui = (SearchUI*)user_data;
+    if (ui && ui->deck_drag_depth > 0) return;
+
     GtkWidget *pic = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(controller));
     
     // 获取 img_id
     int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "img_id"));
     if (img_id <= 0) return;  // 没有卡片
+    if (ui && ui->hovered_slot_img_id == img_id) return;
+    if (ui) ui->hovered_slot_img_id = img_id;
     
     // 首先尝试从先行卡中查找
     JsonObject *prerelease_card = find_prerelease_card_by_id(img_id);
@@ -3079,34 +3112,29 @@ static void on_slot_enter(GtkEventControllerMotion *controller, double x, double
 
 
 
-// 用于存储下载进度对话框和窗口的数据结构
+// 用于存储下载通知数据
 typedef struct {
-    GtkWidget *window;
-    AdwDialog *progress_dialog;
     AdwToastOverlay *toast_overlay;
 } DownloadDialogData;
 
 // 下载先行卡完成后的回调
 static gboolean on_download_prerelease_complete(gpointer user_data) {
     DownloadDialogData *data = (DownloadDialogData*)user_data;
-    GtkWidget *window = data->window;
-    AdwDialog *progress_dialog = data->progress_dialog;
+    AdwToastOverlay *toast_overlay = data->toast_overlay;
     
-    // 关闭进度对话框
-    if (progress_dialog) {
-        adw_dialog_close(progress_dialog);
-    }
-    
-    // 显示结果对话框
     if (prerelease_data_exists()) {
-        AdwDialog *dialog = adw_alert_dialog_new("下载完成", "先行卡数据已成功下载和处理");
-        adw_alert_dialog_add_response(ADW_ALERT_DIALOG(dialog), "ok", "确定");
-        adw_dialog_present(dialog, window);
+        if (toast_overlay) {
+            AdwToast *toast = adw_toast_new("先行卡下载完成");
+            adw_toast_set_timeout(toast, 2);
+            adw_toast_overlay_add_toast(toast_overlay, toast);
+        }
         g_message("Pre-release cards downloaded and processed successfully");
     } else {
-        AdwDialog *dialog = adw_alert_dialog_new("下载失败", "下载或处理先行卡数据时出错");
-        adw_alert_dialog_add_response(ADW_ALERT_DIALOG(dialog), "ok", "确定");
-        adw_dialog_present(dialog, window);
+        if (toast_overlay) {
+            AdwToast *toast = adw_toast_new("先行卡下载失败");
+            adw_toast_set_timeout(toast, 3);
+            adw_toast_overlay_add_toast(toast_overlay, toast);
+        }
         g_warning("Failed to download pre-release cards");
     }
     
@@ -3120,19 +3148,18 @@ static gboolean on_download_prerelease_complete(gpointer user_data) {
 static void on_download_prerelease_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
     (void)action;
     (void)parameter;
-    GtkWidget *window = GTK_WIDGET(user_data);
+    SearchUI *ui = (SearchUI*)user_data;
     
     g_message("Starting pre-release cards download...");
     
-    // 显示提示对话框
-    AdwDialog *dialog = adw_alert_dialog_new("正在下载", "正在下载先行卡数据，请稍候...");
-    adw_alert_dialog_add_response(ADW_ALERT_DIALOG(dialog), "ok", "确定");
-    adw_dialog_present(dialog, window);
+    if (ui && ui->toast_overlay) {
+        AdwToast *toast = adw_toast_new("正在下载先行卡");
+        adw_toast_set_timeout(toast, 2);
+        adw_toast_overlay_add_toast(ui->toast_overlay, toast);
+    }
     
-    // 创建数据结构，传递窗口和对话框引用
-    DownloadDialogData *data = g_new(DownloadDialogData, 1);
-    data->window = window;
-    data->progress_dialog = dialog;
+    DownloadDialogData *data = g_new0(DownloadDialogData, 1);
+    data->toast_overlay = ui ? ui->toast_overlay : NULL;
     
     // 启动后台下载
     download_prerelease_cards(on_download_prerelease_complete, data);
@@ -3186,8 +3213,6 @@ static void on_offline_data_switch_changed(GtkSwitch *switch_widget, GParamSpec 
         
         // 创建数据结构，仅传递 toast_overlay 引用
         DownloadDialogData *data = g_new(DownloadDialogData, 1);
-        data->window = NULL;
-        data->progress_dialog = NULL;
         data->toast_overlay = ui->toast_overlay;
         
         // 启动后台下载
@@ -3248,6 +3273,12 @@ static void on_show_prerelease_action(GSimpleAction *action, GVariant *parameter
         g_ptr_array_free(ui->search_image_queue, TRUE);
         ui->search_image_queue = NULL;
     }
+    ui->search_image_queue_pos = 0;
+    if (ui->pending_results) {
+        g_ptr_array_free(ui->pending_results, TRUE);
+        ui->pending_results = NULL;
+    }
+    ui->pending_results_pos = 0;
     
     // 获取所有先行卡
     JsonArray *all_cards = get_all_prerelease_cards();
@@ -3292,6 +3323,12 @@ static void on_show_forbidden_changes_action(GSimpleAction *action, GVariant *pa
         g_ptr_array_free(ui->search_image_queue, TRUE);
         ui->search_image_queue = NULL;
     }
+    ui->search_image_queue_pos = 0;
+    if (ui->pending_results) {
+        g_ptr_array_free(ui->pending_results, TRUE);
+        ui->pending_results = NULL;
+    }
+    ui->pending_results_pos = 0;
 
     guint selected = gtk_drop_down_get_selected(ui->forbidden_dropdown);
     GHashTable **changes_slot = NULL;
@@ -3870,10 +3907,12 @@ on_activate(GApplication *app, gpointer user_data)
     
     // 初始化图片加载队列
     sui->search_image_queue = NULL;
+    sui->search_image_queue_pos = 0;
     sui->search_image_loader_id = 0;
     
     // 初始化批量渲染队列
     sui->pending_results = NULL;
+    sui->pending_results_pos = 0;
     sui->batch_render_id = 0;
     
     // 保存窗口引用（用于显示对话框）
@@ -4020,16 +4059,19 @@ on_activate(GApplication *app, gpointer user_data)
         for (guint i = 0; i < sui->main_pics->len; ++i) {
             GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(sui->main_pics, i));
             GtkGesture *slot_click = gtk_gesture_click_new();
-            // 记录按下位置
+            gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(slot_click), 3);
+            // 记录右键按下位置
             g_signal_connect(slot_click, "pressed", G_CALLBACK(on_slot_pressed), sui);
-            // 使用 released，结合位移判断触发删除
+            // 使用 released，结合位移判断触发右键删除
             g_signal_connect(slot_click, "released", G_CALLBACK(on_slot_clicked), sui);
             gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(slot_click));
             // Drag source
             GtkDragSource *ds = gtk_drag_source_new();
             gtk_drag_source_set_actions(ds, GDK_ACTION_MOVE);
             g_signal_connect(ds, "prepare", G_CALLBACK(on_drag_prepare), NULL);
-            g_signal_connect(ds, "drag-begin", G_CALLBACK(on_drag_begin), NULL);
+            g_signal_connect(ds, "drag-begin", G_CALLBACK(on_deck_drag_begin), sui);
+            g_signal_connect(ds, "drag-end", G_CALLBACK(on_deck_drag_end), sui);
+            g_signal_connect(ds, "drag-cancel", G_CALLBACK(on_deck_drag_cancel), sui);
             gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(ds));
             // Drop target
             GtkDropTarget *dt = gtk_drop_target_new(G_TYPE_STRING, GDK_ACTION_COPY | GDK_ACTION_MOVE);
@@ -4046,13 +4088,16 @@ on_activate(GApplication *app, gpointer user_data)
         for (guint i = 0; i < sui->extra_pics->len; ++i) {
             GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(sui->extra_pics, i));
             GtkGesture *slot_click = gtk_gesture_click_new();
+            gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(slot_click), 3);
             g_signal_connect(slot_click, "pressed", G_CALLBACK(on_slot_pressed), sui);
             g_signal_connect(slot_click, "released", G_CALLBACK(on_slot_clicked), sui);
             gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(slot_click));
             GtkDragSource *ds = gtk_drag_source_new();
             gtk_drag_source_set_actions(ds, GDK_ACTION_MOVE);
             g_signal_connect(ds, "prepare", G_CALLBACK(on_drag_prepare), NULL);
-            g_signal_connect(ds, "drag-begin", G_CALLBACK(on_drag_begin), NULL);
+            g_signal_connect(ds, "drag-begin", G_CALLBACK(on_deck_drag_begin), sui);
+            g_signal_connect(ds, "drag-end", G_CALLBACK(on_deck_drag_end), sui);
+            g_signal_connect(ds, "drag-cancel", G_CALLBACK(on_deck_drag_cancel), sui);
             gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(ds));
             GtkDropTarget *dt = gtk_drop_target_new(G_TYPE_STRING, GDK_ACTION_COPY | GDK_ACTION_MOVE);
             g_signal_connect(dt, "accept", G_CALLBACK(on_drop_accept), NULL);
@@ -4068,13 +4113,16 @@ on_activate(GApplication *app, gpointer user_data)
         for (guint i = 0; i < sui->side_pics->len; ++i) {
             GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(sui->side_pics, i));
             GtkGesture *slot_click = gtk_gesture_click_new();
+            gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(slot_click), 3);
             g_signal_connect(slot_click, "pressed", G_CALLBACK(on_slot_pressed), sui);
             g_signal_connect(slot_click, "released", G_CALLBACK(on_slot_clicked), sui);
             gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(slot_click));
             GtkDragSource *ds = gtk_drag_source_new();
             gtk_drag_source_set_actions(ds, GDK_ACTION_MOVE);
             g_signal_connect(ds, "prepare", G_CALLBACK(on_drag_prepare), NULL);
-            g_signal_connect(ds, "drag-begin", G_CALLBACK(on_drag_begin), NULL);
+            g_signal_connect(ds, "drag-begin", G_CALLBACK(on_deck_drag_begin), sui);
+            g_signal_connect(ds, "drag-end", G_CALLBACK(on_deck_drag_end), sui);
+            g_signal_connect(ds, "drag-cancel", G_CALLBACK(on_deck_drag_cancel), sui);
             gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(ds));
             GtkDropTarget *dt = gtk_drop_target_new(G_TYPE_STRING, GDK_ACTION_COPY | GDK_ACTION_MOVE);
             g_signal_connect(dt, "accept", G_CALLBACK(on_drop_accept), NULL);
@@ -4098,7 +4146,7 @@ on_activate(GApplication *app, gpointer user_data)
 
     // 注册应用菜单动作
     GSimpleAction *download_action = g_simple_action_new("download-prerelease", NULL);
-    g_signal_connect(download_action, "activate", G_CALLBACK(on_download_prerelease_action), win);
+    g_signal_connect(download_action, "activate", G_CALLBACK(on_download_prerelease_action), sui);
     g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(download_action));
     g_object_unref(download_action);
     

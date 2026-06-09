@@ -15,6 +15,7 @@ executable(
     'startup_update.c',
     'prerelease.c',
     'offline_data.c',
+    'pixbuf_utils.c',
     'card_info.c',
     'card_sort.c',
     'card_shuffle.c',

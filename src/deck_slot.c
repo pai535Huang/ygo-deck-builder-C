@@ -11,6 +11,8 @@ void slot_set_pixbuf(GtkWidget *pic, GdkPixbuf *pb) {
     g_object_set_data_full(G_OBJECT(pic), "cached_surface", NULL, NULL);
     // 清除渲染缓存（缩放后的 pixbuf）
     g_object_set_data_full(G_OBJECT(pic), "cached_render", NULL, NULL);
+    // 图片变更后拖拽图标也需要重新生成
+    g_object_set_data_full(G_OBJECT(pic), "drag_icon_texture", NULL, NULL);
     
     if (pb) {
         // 槽位展示为固定缩略图：按 HiDPI scale_factor 生成 device-pixel 尺寸，避免模糊

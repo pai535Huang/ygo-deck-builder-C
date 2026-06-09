@@ -1,9 +1,14 @@
 #include "dnd_manager.h"
 #include "deck_slot.h"
 #include "image_loader.h"
+#include "offline_data.h"
+#include "pixbuf_utils.h"
 #include "prerelease.h"
 #include <string.h>
 #include <stdlib.h>
+
+#define DRAG_ICON_W 50
+#define DRAG_ICON_H 79
 
 // 外部函数声明
 extern void perform_move(SearchUI *ui, const char *from_region, int from_index, const char *to_region, int to_index);
@@ -98,16 +103,98 @@ void on_drag_begin(GtkDragSource *source, GdkDrag *drag, gpointer user_data) {
         pb = slot_get_pixbuf(pic);
     }
     if (!pb) return;
-    // 将拖拽预览缩放到 50x79
-    GdkPixbuf *scaled = gdk_pixbuf_scale_simple(pb, 50, 79, GDK_INTERP_BILINEAR);
-    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
-    GdkTexture *tex = scaled ? gdk_texture_new_for_pixbuf(scaled) : gdk_texture_new_for_pixbuf(pb);
-    G_GNUC_END_IGNORE_DEPRECATIONS
+    GdkTexture *tex = NULL;
+    if (!drag_kind) {
+        tex = g_object_get_data(G_OBJECT(pic), "drag_icon_texture");
+        if (tex) g_object_ref(tex);
+    }
+
+    if (!tex) {
+        // 将拖拽预览缩放到 50x79
+        GdkPixbuf *scaled = gdk_pixbuf_scale_simple(pb, DRAG_ICON_W, DRAG_ICON_H, GDK_INTERP_BILINEAR);
+        tex = pixbuf_utils_texture_from_pixbuf(scaled ? scaled : pb);
+        if (!drag_kind && tex) {
+            g_object_set_data_full(G_OBJECT(pic),
+                                   "drag_icon_texture",
+                                   g_object_ref(tex),
+                                   (GDestroyNotify)g_object_unref);
+        }
+        if (scaled) g_object_unref(scaled);
+    }
+
     if (tex) {
-        gtk_drag_source_set_icon(source, GDK_PAINTABLE(tex), 25, 39);
+        gtk_drag_source_set_icon(source, GDK_PAINTABLE(tex), DRAG_ICON_W / 2, DRAG_ICON_H / 2);
         g_object_unref(tex);
     }
-    if (scaled) g_object_unref(scaled);
+}
+
+void on_deck_drag_begin(GtkDragSource *source, GdkDrag *drag, gpointer user_data) {
+    SearchUI *ui = (SearchUI*)user_data;
+    if (ui) ui->deck_drag_depth++;
+    on_drag_begin(source, drag, NULL);
+}
+
+void on_deck_drag_end(GtkDragSource *source, GdkDrag *drag, gboolean delete_data, gpointer user_data) {
+    (void)source;
+    (void)drag;
+    (void)delete_data;
+    SearchUI *ui = (SearchUI*)user_data;
+    if (ui && ui->deck_drag_depth > 0) ui->deck_drag_depth--;
+}
+
+gboolean on_deck_drag_cancel(GtkDragSource *source, GdkDrag *drag, GdkDragCancelReason reason, gpointer user_data) {
+    (void)source;
+    (void)drag;
+    (void)reason;
+    SearchUI *ui = (SearchUI*)user_data;
+    if (ui && ui->deck_drag_depth > 0) ui->deck_drag_depth--;
+    return FALSE;
+}
+
+static int get_prerelease_effective_card_id(int card_id) {
+    JsonObject *card = find_prerelease_card_by_id(card_id);
+    if (!card) return card_id;
+
+    int effective_id = card_id;
+    if (json_object_has_member(card, "alias")) {
+        gint64 alias_id = json_object_get_int_member(card, "alias");
+        if (alias_id > 0) {
+            int alias_cid = offline_get_cid_by_img_id((int)alias_id);
+            if (alias_cid > 0) {
+                effective_id = offline_get_effective_card_id(alias_cid);
+            } else if (alias_id <= G_MAXINT) {
+                effective_id = (int)alias_id;
+            }
+        }
+    }
+
+    json_object_unref(card);
+    return effective_id > 0 ? effective_id : card_id;
+}
+
+int get_effective_card_id_for_limit(int card_id) {
+    if (card_id <= 0) return card_id;
+
+    int effective_id = offline_get_effective_card_id(card_id);
+    if (effective_id != card_id) return effective_id;
+    if (!is_prerelease_id(card_id)) return effective_id;
+
+    return get_prerelease_effective_card_id(card_id);
+}
+
+static const char *lookup_forbidden_status(GHashTable *forbidden_table, int card_id) {
+    if (!forbidden_table || card_id <= 0) return NULL;
+
+    char cid_str[32];
+    g_snprintf(cid_str, sizeof(cid_str), "%d", card_id);
+    return g_hash_table_lookup(forbidden_table, cid_str);
+}
+
+static int limit_from_status(const char *status) {
+    if (g_strcmp0(status, "禁止") == 0) return 0;
+    if (g_strcmp0(status, "限制") == 0) return 1;
+    if (g_strcmp0(status, "准限制") == 0) return 2;
+    return 3;
 }
 
 // 获取卡片在当前禁限卡表中允许的最大数量
@@ -129,14 +216,13 @@ int get_card_limit(SearchUI *ui, int card_id) {
     }
     
     if (forbidden_table) {
-        char cid_str[32];
-        g_snprintf(cid_str, sizeof(cid_str), "%d", card_id);
-        const char *status = g_hash_table_lookup(forbidden_table, cid_str);
-        
+        int effective_id = get_effective_card_id_for_limit(card_id);
+        const char *status = lookup_forbidden_status(forbidden_table, effective_id);
+        if (!status && effective_id != card_id) {
+            status = lookup_forbidden_status(forbidden_table, card_id);
+        }
         if (status) {
-            if (g_strcmp0(status, "禁止") == 0) return 0;
-            if (g_strcmp0(status, "限制") == 0) return 1;
-            if (g_strcmp0(status, "准限制") == 0) return 2;
+            return limit_from_status(status);
         }
     }
     
@@ -147,6 +233,7 @@ int get_card_limit(SearchUI *ui, int card_id) {
 int count_card_in_deck(SearchUI *ui, int card_id, gboolean is_extra) {
     if (card_id <= 0) return 0;
     
+    int target_effective_id = get_effective_card_id_for_limit(card_id);
     int count = 0;
     GPtrArray *regions[2];
     int region_counts[2];
@@ -169,7 +256,10 @@ int count_card_in_deck(SearchUI *ui, int card_id, gboolean is_extra) {
             if (!w) continue;
             
             int stored_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(w), "card_id"));
-            if (stored_id == card_id) {
+            if (stored_id <= 0) continue;
+
+            int stored_effective_id = get_effective_card_id_for_limit(stored_id);
+            if (stored_effective_id == target_effective_id) {
                 count++;
             }
         }
@@ -182,8 +272,13 @@ gboolean on_drop_accept(GtkDropTarget *target, GdkDrop *drop, gpointer user_data
     (void)target; (void)user_data;
     // 仅接受字符串类型
     GdkContentFormats *fmts = gdk_drop_get_formats(drop);
-    gboolean ok = gdk_content_formats_match(fmts, gdk_content_formats_new_for_gtype(G_TYPE_STRING));
-    return ok;
+    static GdkContentFormats *string_formats = NULL;
+    static gsize string_formats_inited = 0;
+    if (g_once_init_enter(&string_formats_inited)) {
+        string_formats = gdk_content_formats_new_for_gtype(G_TYPE_STRING);
+        g_once_init_leave(&string_formats_inited, 1);
+    }
+    return gdk_content_formats_match(fmts, string_formats);
 }
 
 void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpointer user_data) {
@@ -315,6 +410,7 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
         update_count_label(to_label, *to_count);
         update_genesys_score(ui);
         update_deck_overlays(ui);
+        ui->hovered_slot_img_id = 0;
         return;
     }
     // 原有 region:index 处理
