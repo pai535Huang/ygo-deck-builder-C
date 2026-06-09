@@ -48,15 +48,17 @@ gboolean import_deck_from_ydk(
  * 加载导入导出目录配置
  * @param last_export_dir 存储最后导出目录的指针
  * @param last_import_dir 存储最后导入目录的指针
+ * @param last_deck_sheet_dir 存储最后生成卡表目录的指针
  */
-void load_io_config(char **last_export_dir, char **last_import_dir);
+void load_io_config(char **last_export_dir, char **last_import_dir, char **last_deck_sheet_dir);
 
 /**
  * 保存导入导出目录配置
  * @param last_export_dir 最后导出目录
  * @param last_import_dir 最后导入目录
+ * @param last_deck_sheet_dir 最后生成卡表目录
  */
-void save_io_config(const char *last_export_dir, const char *last_import_dir);
+void save_io_config(const char *last_export_dir, const char *last_import_dir, const char *last_deck_sheet_dir);
 
 /**
  * 加载离线数据开关状态

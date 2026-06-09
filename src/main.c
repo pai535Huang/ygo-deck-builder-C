@@ -60,6 +60,7 @@ static void free_user_data_closure_notify(gpointer data, GClosure *closure) {
 // 全局变量：缓存最后导出和导入的目录
 static char *last_export_directory = NULL;
 static char *last_import_directory = NULL;
+static char *last_deck_sheet_directory = NULL;
 // 全局变量：个人信息（Konami ID）
 static char *personal_konami_id = NULL;
 
@@ -881,7 +882,7 @@ static void on_export_file_save_finish(GObject *source, GAsyncResult *result, gp
         last_export_directory = dir;
         
         // 保存到配置文件
-        save_io_config(last_export_directory, last_import_directory);
+        save_io_config(last_export_directory, last_import_directory, last_deck_sheet_directory);
         
         g_free(path);
         g_object_unref(file);
@@ -916,9 +917,9 @@ static void on_sheet_save_finish(GObject *source, GAsyncResult *result, gpointer
 
         if (ok) {
             char *dir = g_path_get_dirname(path);
-            g_free(last_export_directory);
-            last_export_directory = dir;
-            save_io_config(last_export_directory, last_import_directory);
+            g_free(last_deck_sheet_directory);
+            last_deck_sheet_directory = dir;
+            save_io_config(last_export_directory, last_import_directory, last_deck_sheet_directory);
 
             if (export_data->ui && export_data->ui->toast_overlay) {
                 AdwToast *toast = adw_toast_new("卡表已生成");
@@ -972,7 +973,7 @@ static void on_import_file_open_finish(GObject *source, GAsyncResult *result, gp
         last_import_directory = dir;
         
         // 保存到配置文件
-        save_io_config(last_export_directory, last_import_directory);
+        save_io_config(last_export_directory, last_import_directory, last_deck_sheet_directory);
         
         g_free(path);
         g_object_unref(file);
@@ -1974,8 +1975,8 @@ static void on_action_generate_sheet(GSimpleAction *action, GVariant *parameter,
     GtkFileDialog *dialog = gtk_file_dialog_new();
     gtk_file_dialog_set_title(dialog, "生成卡表");
 
-    if (last_export_directory && g_file_test(last_export_directory, G_FILE_TEST_IS_DIR)) {
-        char *full_path = g_build_filename(last_export_directory, "deck_ja_filled.pdf", NULL);
+    if (last_deck_sheet_directory && g_file_test(last_deck_sheet_directory, G_FILE_TEST_IS_DIR)) {
+        char *full_path = g_build_filename(last_deck_sheet_directory, "deck_ja_filled.pdf", NULL);
         GFile *initial_file = g_file_new_for_path(full_path);
         gtk_file_dialog_set_initial_file(dialog, initial_file);
         g_object_unref(initial_file);
@@ -4202,7 +4203,7 @@ main(int argc, char *argv[])
     adw_init();
 
     // 加载导出目录配置
-    load_io_config(&last_export_directory, &last_import_directory);
+    load_io_config(&last_export_directory, &last_import_directory, &last_deck_sheet_directory);
     // 加载个人信息
     personal_konami_id = load_personal_konami_id();
 

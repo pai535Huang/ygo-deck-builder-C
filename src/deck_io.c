@@ -252,8 +252,22 @@ gboolean import_deck_from_ydk(
     return TRUE;
 }
 
+static void load_directory_config(GKeyFile *keyfile, const char *key, char **out_dir) {
+    char *dir = g_key_file_get_string(keyfile, "Directories", key, NULL);
+    if (dir && g_file_test(dir, G_FILE_TEST_IS_DIR)) {
+        if (out_dir) {
+            g_free(*out_dir);
+            *out_dir = dir;
+        } else {
+            g_free(dir);
+        }
+    } else {
+        g_free(dir);
+    }
+}
+
 // 加载导入导出目录配置
-void load_io_config(char **last_export_dir, char **last_import_dir) {
+void load_io_config(char **last_export_dir, char **last_import_dir, char **last_deck_sheet_dir) {
     char *config_path;
     
     if (is_portable_mode()) {
@@ -275,30 +289,13 @@ void load_io_config(char **last_export_dir, char **last_import_dir) {
     
     if (g_key_file_load_from_file(keyfile, config_path, G_KEY_FILE_NONE, &error)) {
         // 加载导出目录
-        char *export_dir = g_key_file_get_string(keyfile, "Directories", "LastExportDirectory", NULL);
-        if (export_dir && g_file_test(export_dir, G_FILE_TEST_IS_DIR)) {
-            if (last_export_dir) {
-                g_free(*last_export_dir);
-                *last_export_dir = export_dir;
-            } else {
-                g_free(export_dir);
-            }
-        } else {
-            g_free(export_dir);
-        }
+        load_directory_config(keyfile, "LastExportDirectory", last_export_dir);
         
         // 加载导入目录
-        char *import_dir = g_key_file_get_string(keyfile, "Directories", "LastImportDirectory", NULL);
-        if (import_dir && g_file_test(import_dir, G_FILE_TEST_IS_DIR)) {
-            if (last_import_dir) {
-                g_free(*last_import_dir);
-                *last_import_dir = import_dir;
-            } else {
-                g_free(import_dir);
-            }
-        } else {
-            g_free(import_dir);
-        }
+        load_directory_config(keyfile, "LastImportDirectory", last_import_dir);
+
+        // 加载生成卡表目录
+        load_directory_config(keyfile, "LastDeckSheetDirectory", last_deck_sheet_dir);
     } else if (error) {
         g_error_free(error);
     }
@@ -308,7 +305,7 @@ void load_io_config(char **last_export_dir, char **last_import_dir) {
 }
 
 // 保存导入导出目录配置
-void save_io_config(const char *last_export_dir, const char *last_import_dir) {
+void save_io_config(const char *last_export_dir, const char *last_import_dir, const char *last_deck_sheet_dir) {
     char *config_path;
     
     if (is_portable_mode()) {
@@ -336,6 +333,9 @@ void save_io_config(const char *last_export_dir, const char *last_import_dir) {
     }
     if (last_import_dir) {
         g_key_file_set_string(keyfile, "Directories", "LastImportDirectory", last_import_dir);
+    }
+    if (last_deck_sheet_dir) {
+        g_key_file_set_string(keyfile, "Directories", "LastDeckSheetDirectory", last_deck_sheet_dir);
     }
     
     // 保存到文件
