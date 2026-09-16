@@ -1,6 +1,7 @@
 // deck_url 编解码单元测试（meson test）
 // 覆盖：编码->解码往返、多种类合并、空卡组、协议边界（27 位 ID / 2 位数量）、
-// 非法输入（缺少 ygotype、Base64Url 非法字符、数据长度不足）
+// 非法输入（缺少 ygotype、Base64Url 非法字符、数据长度不足），
+// 以及与外部工具（deck.ourygo.top）生成的真实 URL 的互操作
 #include "deck_url.h"
 #include <stdio.h>
 #include <string.h>
@@ -13,6 +14,19 @@ static int failures = 0;
         failures++; \
     } \
 } while (0)
+
+// 返回数组中同一 ID 的最大出现次数（0 表示空数组）
+static int max_copies(const int *arr, int n) {
+    int worst = 0;
+    for (int i = 0; i < n; i++) {
+        int c = 0;
+        for (int j = 0; j < n; j++) {
+            if (arr[j] == arr[i]) c++;
+        }
+        if (c > worst) worst = c;
+    }
+    return worst;
+}
 
 static void test_roundtrip_doc_example(void) {
     // 文档示例卡组：单卡多张
@@ -179,6 +193,46 @@ static void test_count_clamped_to_protocol_max(void) {
     g_clear_error(&err);
 }
 
+static void test_real_world_url(void) {
+    // 外部工具（deck.ourygo.top）生成的真实分享链接。本项目的 URL 解析面向这类
+    // 真实链接，所以这里固定住它的解析结果：40 张主卡组 / 15 张额外卡组 / 14 张副卡组。
+    // 该链接由其它实现编码，可验证位序与协议文档一致，而非只验证自己编自己解。
+    const char *url =
+        "http://deck.ourygo.top?ygotype=deck&v=1&d=FNhefVLXC2RMpY_w-43iOvy2SnXARcGDa4Gf-WWVKlHxmGQN9gbi5Y-FDdvkNIpufUXGkPmlV3n70HzV3OV58le_LRnThgSJlIImmKZAMuPJSqBUEax8yF1rIQy7GidRET65azdhGIVy2w4rI9b5cwTxrZ5JsWGN-uRnxrXZ0jdujdvkOJ9zVDCtMtezkT-6CuKtQso-yA";
+
+    int *m = NULL, *e = NULL, *s = NULL;
+    int mc = 0, ec = 0, sc = 0;
+    GError *err = NULL;
+    CHECK(deck_decode_from_url(url, &m, &mc, &e, &ec, &s, &sc, &err),
+          "decode real world url");
+    CHECK(mc == 40 && ec == 15 && sc == 14, "real world region counts");
+    CHECK(mc + ec + sc == 69, "real world total card count");
+    CHECK(m && e && s, "real world arrays allocated");
+
+    // 抽查各区首张卡，锁住「前 2 位数量、后 27 位 ID」的位序
+    if (m && mc == 40) {
+        CHECK(m[0] == 63941210, "real world main[0]");
+        CHECK(m[1] == 70095154 && m[2] == 70095154 && m[3] == 70095154,
+              "real world main[1..3] are 3 copies of one card");
+    }
+    if (e && ec == 15) {
+        CHECK(e[0] == 87116928, "real world extra[0]");
+    }
+    if (s && sc == 14) {
+        CHECK(s[0] == 27204311, "real world side[0]");
+    }
+
+    // 数量字段只有 2 位：任何卡片都不应超过 3 张，超了说明计数位解码错误
+    if (m && mc == 40) CHECK(max_copies(m, mc) <= 3, "real world main within copy limit");
+    if (e && ec == 15) CHECK(max_copies(e, ec) <= 3, "real world extra within copy limit");
+    if (s && sc == 14) CHECK(max_copies(s, sc) <= 3, "real world side within copy limit");
+
+    g_free(m);
+    g_free(e);
+    g_free(s);
+    g_clear_error(&err);
+}
+
 int main(void) {
     test_roundtrip_doc_example();
     test_roundtrip_multi_unique();
@@ -188,6 +242,7 @@ int main(void) {
     test_truncated_data();
     test_out_of_range_card_id_skipped();
     test_count_clamped_to_protocol_max();
+    test_real_world_url();
 
     if (failures > 0) {
         fprintf(stderr, "%d check(s) failed\n", failures);

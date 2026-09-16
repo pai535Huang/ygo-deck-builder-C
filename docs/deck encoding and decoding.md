@@ -146,14 +146,17 @@ if (deck_decode_from_url(url,
 - ✅ 空卡组处理
 - ✅ 协议边界：27 位卡片 ID 上限（超范围卡片被跳过）、单卡数量上限（按 3 张编码）
 - ✅ 非法输入：缺少 `ygotype=deck`、Base64Url 非法字符、数据长度不足
+- ✅ 真实分享链接解析：下方 URL 由外部实现（deck.ourygo.top）生成，
+  断言各区数量、首张卡 ID 与数量位序，验证与其它实现的互操作
 
-以下真实卡组 URL 为手工验证：
+下面这条链接不是本项目编码产生的，可用于确认位序与协议文档一致：
 
 ```
 http://deck.ourygo.top?ygotype=deck&v=1&d=FNhefVLXC2RMpY_w-43iOvy2SnXARcGDa4Gf-WWVKlHxmGQN9gbi5Y-FDdvkNIpufUXGkPmlV3n70HzV3OV58le_LRnThgSJlIImmKZAMuPJSqBUEax8yF1rIQy7GidRET65azdhGIVy2w4rI9b5cwTxrZ5JsWGN-uRnxrXZ0jdujdvkOJ9zVDCtMtezkT-6CuKtQso-yA
 ```
 
-成功解码为包含40张主卡组、15张额外卡组、14张副卡组的完整卡组。
+解析结果为 40 张主卡组、15 张额外卡组、14 张副卡组，该用例已纳入
+`tests/test_deck_url.c` 的 `test_real_world_url()`。
 
 ## 注意事项
 
