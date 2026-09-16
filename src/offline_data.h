@@ -38,15 +38,8 @@ gboolean clear_offline_data(void);
 void check_offline_data_update(GSourceFunc callback, gpointer user_data);
 
 /**
- * 从离线数据中搜索卡片
- * @param query 搜索关键词（在卡名和效果描述中搜索）
- * @return JSON数组，包含匹配的卡片数据，需要调用者使用json_array_unref释放；如果失败返回NULL
- */
-JsonArray* search_offline_cards(const char *query);
-
-/**
  * 获取所有离线卡片数据
- * @return JSON数组，包含所有卡片数据，需要调用者使用json_array_unref释放；如果失败返回NULL
+ * @return JSON数组，包含所有卡片数据（共享缓存对象的引用），需要调用者使用json_array_unref释放；如果失败返回NULL
  */
 JsonArray* get_all_offline_cards(void);
 

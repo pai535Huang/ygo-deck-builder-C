@@ -23,6 +23,15 @@ deps = [gtk4_dep, adw_dep, json_glib_dep, libsoup_dep, gdk_pixbuf_dep, libarchiv
 
 subdir('src')
 
+# 单元测试：deck_url 编解码往返与协议边界
+test_deck_url = executable('test_deck_url',
+  'tests/test_deck_url.c',
+  'src/deck_url.c',
+  include_directories: ['src'],
+  dependencies: [json_glib_dep],
+)
+test('deck_url', test_deck_url)
+
 # 配置并安装 desktop 文件
 desktop_conf = configuration_data()
 desktop_conf.set('BINDIR', get_option('prefix') / get_option('bindir'))

@@ -766,20 +766,92 @@ void on_trap_filter_toggled(GtkCheckButton *btn, gpointer user_data) {
     ui->filter_by_trap = gtk_check_button_get_active(btn);
 }
 
+// 离线搜索后台任务：cards.json 全量扫描与匹配在工作线程执行，
+// 完成后回到主线程渲染，避免上万张卡的遍历阻塞 UI。
 typedef struct {
-    SearchUI *ui;
-    const FilterState *filter;
-    guint *result_count;
-} OfflineCollectCtx;
+    guint64 generation;          // 派发时的搜索代次，过期结果直接丢弃
+    guint64 result_count_before; // 派发前已入队的结果数（先行卡部分）
+    guint remaining;             // 本次扫描最多接受的结果数
+    gchar *query;                // strdup 的查询词（原指针指向 entry 内部文本）
+    gboolean search_all;
+    FilterState *filter;         // 主线程筛选状态快照（字符串深拷贝）
+    GPtrArray *results;          // 匹配到的 JsonObject*（引用计数持有，跨线程安全）
+} OfflineSearchTask;
 
-// offline_foreach_card 的 match_cb：返回 TRUE 表示“接受并计数”
-static gboolean offline_collect_match_cb(JsonObject *item, gpointer user_data) {
-    OfflineCollectCtx *c = (OfflineCollectCtx*)user_data;
-    if (!item || !c || !c->ui || !c->filter || !c->result_count) return FALSE;
-    if (!apply_filter(item, c->filter)) return FALSE;
-    queue_result_for_render(c->ui, item);
-    (*c->result_count)++;
+// 复制筛选状态：工作线程扫描期间主线程可能修改或释放原状态
+static FilterState *filter_state_snapshot(const FilterState *src) {
+    if (!src) return NULL;
+    FilterState *snap = g_new0(FilterState, 1);
+    *snap = *src;
+    snap->atk_text = g_strdup(src->atk_text);
+    snap->def_text = g_strdup(src->def_text);
+    snap->level_text = g_strdup(src->level_text);
+    snap->left_scale_text = g_strdup(src->left_scale_text);
+    snap->right_scale_text = g_strdup(src->right_scale_text);
+    snap->field_text = g_strdup(src->field_text);
+    return snap;
+}
+
+static void offline_search_task_free(OfflineSearchTask *t) {
+    if (!t) return;
+    g_free(t->query);
+    if (t->filter) {
+        g_free(t->filter->atk_text);
+        g_free(t->filter->def_text);
+        g_free(t->filter->level_text);
+        g_free(t->filter->left_scale_text);
+        g_free(t->filter->right_scale_text);
+        g_free(t->filter->field_text);
+        g_free(t->filter);
+    }
+    if (t->results) g_ptr_array_unref(t->results);
+    g_free(t);
+}
+
+// 工作线程收集回调：只做过滤与引用计数，禁止触碰任何 UI
+static gboolean offline_task_collect_cb(JsonObject *item, gpointer user_data) {
+    OfflineSearchTask *t = (OfflineSearchTask*)user_data;
+    if (!item || !t || !t->filter) return FALSE;
+    if (!apply_filter(item, t->filter)) return FALSE;
+    g_ptr_array_add(t->results, json_object_ref(item));
     return TRUE;
+}
+
+static void offline_search_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object;
+    (void)cancellable;
+    OfflineSearchTask *t = (OfflineSearchTask*)task_data;
+    if (t) {
+        offline_foreach_card(t->query, t->search_all, offline_task_collect_cb, t, t->remaining);
+    }
+    g_task_return_boolean(task, TRUE);
+}
+
+static void offline_search_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
+    (void)source;
+    SearchUI *ui = (SearchUI*)user_data;
+    OfflineSearchTask *t = (OfflineSearchTask*)g_task_get_task_data(G_TASK(res));
+    GError *err = NULL;
+    g_task_propagate_boolean(G_TASK(res), &err);
+    if (err) g_error_free(err);
+    // t 由 task_data 的 destroy notify 释放，此处只使用
+
+    // 过期搜索（派发后用户又触发了新搜索）：丢弃结果
+    if (!ui || !t || t->generation != ui->search_generation) {
+        return;
+    }
+
+    for (guint i = 0; i < t->results->len; i++) {
+        JsonObject *item = (JsonObject*)g_ptr_array_index(t->results, i);
+        queue_result_for_render(ui, item);
+    }
+
+    if (t->result_count_before + t->results->len >= SEARCH_MAX_RESULTS && ui->toast_overlay) {
+        g_message("Reached maximum result limit (%u), stopping search", SEARCH_MAX_RESULTS);
+        AdwToast *toast = adw_toast_new("搜索结果过多，已限制为 500 条。请缩小搜索范围。");
+        adw_toast_set_timeout(toast, 3);
+        adw_toast_overlay_add_toast(ui->toast_overlay, toast);
+    }
 }
 
 void on_search_clicked(GtkButton *btn, gpointer user_data) {
@@ -862,11 +934,15 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
                 if (item) {
                     // 应用筛选条件
                     if (apply_filter(item, filter)) {
-                        // 添加一个标记表示这是先行卡
-                        JsonObject *marked_item = json_object_ref(item);
-                        json_object_set_boolean_member(marked_item, "is_prerelease", TRUE);
-                        queue_result_for_render(ui, marked_item);
-                        json_object_unref(marked_item);
+                        // 添加一个标记表示这是先行卡。卡片对象来自共享解析缓存，
+                        // 直接写入会永久污染缓存，故先深拷贝再标记。
+                        JsonNode *marked_node = json_node_copy(json_array_get_element(prerelease_results, i));
+                        JsonObject *marked_item = marked_node ? json_node_get_object(marked_node) : NULL;
+                        if (marked_item) {
+                            json_object_set_boolean_member(marked_item, "is_prerelease", TRUE);
+                            queue_result_for_render(ui, marked_item);
+                        }
+                        if (marked_node) json_node_free(marked_node);
                         result_count++;
                     }
                 }
@@ -887,28 +963,24 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
 
     // 检查是否启用离线数据
     gboolean offline_enabled = load_offline_data_switch_state();
-    
+
     if (offline_enabled && offline_data_exists() && result_count < SEARCH_MAX_RESULTS) {
-        // 使用离线数据搜索：改为流式遍历 + 过滤 + 达到上限即停止
+        // 离线数据搜索：全量扫描移入后台线程，完成后回主线程渲染（达到上限即停止）
         g_message("Searching in offline data...");
 
-        OfflineCollectCtx ctx = {
-            .ui = ui,
-            .filter = filter,
-            .result_count = &result_count,
-        };
+        OfflineSearchTask *t = g_new0(OfflineSearchTask, 1);
+        t->generation = search_generation;
+        t->result_count_before = result_count;
+        t->remaining = (SEARCH_MAX_RESULTS > result_count) ? (SEARCH_MAX_RESULTS - result_count) : 0;
+        t->query = g_strdup(q ? q : "");
+        t->search_all = search_all;
+        t->filter = filter_state_snapshot(filter);
+        t->results = g_ptr_array_new_with_free_func((GDestroyNotify)json_object_unref);
 
-        guint remaining = (SEARCH_MAX_RESULTS > result_count) ? (SEARCH_MAX_RESULTS - result_count) : 0;
-        (void)offline_foreach_card(q, search_all, offline_collect_match_cb, &ctx, remaining);
-
-        if (result_count >= SEARCH_MAX_RESULTS) {
-            g_message("Reached maximum result limit (%u), stopping search", SEARCH_MAX_RESULTS);
-            if (ui->toast_overlay) {
-                AdwToast *toast = adw_toast_new("搜索结果过多，已限制为 500 条。请缩小搜索范围。");
-                adw_toast_set_timeout(toast, 3);
-                adw_toast_overlay_add_toast(ui->toast_overlay, toast);
-            }
-        }
+        GTask *task = g_task_new(NULL, NULL, offline_search_finished, ui);
+        g_task_set_task_data(task, t, (GDestroyNotify)offline_search_task_free);
+        g_task_run_in_thread(task, offline_search_thread);
+        g_object_unref(task);
     } else if (!search_all && result_count < SEARCH_MAX_RESULTS) {
         // 仅在有搜索关键词时进行在线API搜索
         // 如果搜索框为空但有筛选条件，不进行在线搜索

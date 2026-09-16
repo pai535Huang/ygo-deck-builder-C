@@ -513,408 +513,22 @@ static gboolean save_json_to_file(JsonNode *root, const char *filepath) {
 }
 
 /**
- * 下载完成后的回调函数
+ * 校验下载响应的 HTTP 状态码。
+ * 非 2xx 的错误页/限流页内容不能当作有效卡表数据解析保存，
+ * 否则会把无效内容写入禁限表 JSON。
  */
-static void on_download_complete(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
-    GError *error = NULL;
-    GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
-    
-    if (error) {
-        g_warning("Failed to download OCG forbidden list: %s", error->message);
-        g_error_free(error);
-        g_object_unref(session);
-        return;
-    }
-    
-    gsize size;
-    const char *html_content = g_bytes_get_data(response_body, &size);
-    
-    if (html_content && size > 0) {
-        // 确保配置数据目录存在
-        gchar *data_dir = get_config_data_dir();
-        if (!data_dir || !ensure_directory_exists(data_dir)) {
-            g_free(data_dir);
-            g_bytes_unref(response_body);
-            g_object_unref(session);
-            return;
-        }
-        g_free(data_dir);
-        
-        // 解析HTML并转换为JSON
-        JsonNode *json_root = parse_html_to_json_ocg(html_content);
-        
-        // 获取输出文件路径并保存
-        gchar *output_file = get_output_file_path(OCG_FORBIDDEN_FILENAME);
-        if (output_file) {
-            save_json_to_file(json_root, output_file);
-            g_free(output_file);
-        }
-        
-        json_node_free(json_root);
-    } else {
-        g_warning("Received empty response from OCG forbidden list URL");
-    }
-    
-    g_bytes_unref(response_body);
-    g_object_unref(session);
-}
-
-/**
- * 后台线程执行的下载任务
- */
-static gpointer download_thread_func(G_GNUC_UNUSED gpointer data) {
-    // 创建独立的SoupSession用于后台下载
-    SoupSession *session = soup_session_new();
-    
-    // 创建请求消息
-    SoupMessage *msg = soup_message_new("GET", OCG_FORBIDDEN_URL);
-    
+static gboolean download_status_ok(SoupSession *session, GAsyncResult *result, const char *label) {
+    SoupMessage *msg = soup_session_get_async_result_message(session, result);
     if (!msg) {
-        g_warning("Failed to create HTTP request for OCG forbidden list");
-        g_object_unref(session);
-        return NULL;
+        g_warning("Failed to download %s: no SoupMessage for result", label);
+        return FALSE;
     }
-    
-    // 设置User-Agent避免被服务器拒绝
-    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
-    soup_message_headers_append(headers, "User-Agent", 
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
-    
-    g_message("Starting background download of OCG forbidden list...");
-    
-    // 异步发送请求
-    soup_session_send_and_read_async(
-        session,
-        msg,
-        G_PRIORITY_LOW,
-        NULL,
-        (GAsyncReadyCallback)on_download_complete,
-        NULL
-    );
-    
-    g_object_unref(msg);
-    
-    return NULL;
-}
-
-/**
- * 下载完成后的回调函数 (AE)
- */
-static void on_download_complete_ae(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
-    GError *error = NULL;
-    GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
-    
-    if (error) {
-        g_warning("Failed to download AE forbidden list: %s", error->message);
-        g_error_free(error);
-        g_object_unref(session);
-        return;
+    guint status = soup_message_get_status(msg);
+    if (!SOUP_STATUS_IS_SUCCESSFUL(status)) {
+        g_warning("Failed to download %s: HTTP %u %s", label, status, soup_message_get_reason_phrase(msg));
+        return FALSE;
     }
-    
-    gsize size;
-    const char *html_content = g_bytes_get_data(response_body, &size);
-    
-    if (html_content && size > 0) {
-        // 确保配置数据目录存在
-        gchar *data_dir = get_config_data_dir();
-        if (!data_dir || !ensure_directory_exists(data_dir)) {
-            g_free(data_dir);
-            g_bytes_unref(response_body);
-            g_object_unref(session);
-            return;
-        }
-        g_free(data_dir);
-        
-        // 解析HTML并转换为JSON
-        JsonNode *json_root = parse_html_to_json_ae(html_content);
-        
-        // 获取输出文件路径并保存
-        gchar *output_file = get_output_file_path(AE_FORBIDDEN_FILENAME);
-        if (output_file) {
-            save_json_to_file(json_root, output_file);
-            g_free(output_file);
-        }
-        
-        json_node_free(json_root);
-    } else {
-        g_warning("Received empty response from AE forbidden list URL");
-    }
-    
-    g_bytes_unref(response_body);
-    g_object_unref(session);
-}
-
-/**
- * 下载完成后的回调函数 (TCG)
- */
-static void on_download_complete_tcg(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
-    GError *error = NULL;
-    GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
-    
-    if (error) {
-        g_warning("Failed to download TCG forbidden list: %s", error->message);
-        g_error_free(error);
-        g_object_unref(session);
-        return;
-    }
-    
-    gsize size;
-    const char *html_content = g_bytes_get_data(response_body, &size);
-    
-    if (html_content && size > 0) {
-        // 确保配置数据目录存在
-        gchar *data_dir = get_config_data_dir();
-        if (!data_dir || !ensure_directory_exists(data_dir)) {
-            g_free(data_dir);
-            g_bytes_unref(response_body);
-            g_object_unref(session);
-            return;
-        }
-        g_free(data_dir);
-        
-        // 解析HTML并转换为JSON
-        JsonNode *json_root = parse_html_to_json_tcg(html_content);
-        
-        // 获取输出文件路径并保存
-        gchar *output_file = get_output_file_path(TCG_FORBIDDEN_FILENAME);
-        if (output_file) {
-            save_json_to_file(json_root, output_file);
-            g_free(output_file);
-        }
-        
-        json_node_free(json_root);
-    } else {
-        g_warning("Received empty response from TCG forbidden list URL");
-    }
-    
-    g_bytes_unref(response_body);
-    g_object_unref(session);
-}
-
-/**
- * 下载完成后的回调函数 (SC)
- */
-static void on_download_complete_sc(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
-    GError *error = NULL;
-    GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
-    
-    if (error) {
-        g_warning("Failed to download SC forbidden list: %s", error->message);
-        g_error_free(error);
-        g_object_unref(session);
-        return;
-    }
-    
-    gsize size;
-    const char *json_content = g_bytes_get_data(response_body, &size);
-    
-    if (json_content && size > 0) {
-        // 确保配置数据目录存在
-        gchar *data_dir = get_config_data_dir();
-        if (!data_dir || !ensure_directory_exists(data_dir)) {
-            g_free(data_dir);
-            g_bytes_unref(response_body);
-            g_object_unref(session);
-            return;
-        }
-        g_free(data_dir);
-        
-        // 处理JSON数据
-        JsonNode *json_root = process_sc_json(json_content);
-        
-        if (json_root) {
-            // 获取输出文件路径并保存
-            gchar *output_file = get_output_file_path(SC_FORBIDDEN_FILENAME);
-            if (output_file) {
-                save_json_to_file(json_root, output_file);
-                g_free(output_file);
-            }
-            json_node_free(json_root);
-        }
-    } else {
-        g_warning("Received empty response from SC forbidden list URL");
-    }
-    
-    g_bytes_unref(response_body);
-    g_object_unref(session);
-}
-
-/**
- * 后台线程执行的下载任务 (AE)
- */
-static gpointer download_thread_func_ae(G_GNUC_UNUSED gpointer data) {
-    // 创建独立的SoupSession用于后台下载
-    SoupSession *session = soup_session_new();
-    
-    // 创建请求消息
-    SoupMessage *msg = soup_message_new("GET", AE_FORBIDDEN_URL);
-    
-    if (!msg) {
-        g_warning("Failed to create HTTP request for AE forbidden list");
-        g_object_unref(session);
-        return NULL;
-    }
-    
-    // 设置User-Agent避免被服务器拒绝
-    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
-    soup_message_headers_append(headers, "User-Agent", 
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
-    
-    g_message("Starting background download of AE forbidden list...");
-    
-    // 异步发送请求
-    soup_session_send_and_read_async(
-        session,
-        msg,
-        G_PRIORITY_LOW,
-        NULL,
-        (GAsyncReadyCallback)on_download_complete_ae,
-        NULL
-    );
-    
-    g_object_unref(msg);
-    
-    return NULL;
-}
-
-/**
- * 后台线程执行的下载任务 (TCG)
- */
-static gpointer download_thread_func_tcg(G_GNUC_UNUSED gpointer data) {
-    // 创建独立的SoupSession用于后台下载
-    SoupSession *session = soup_session_new();
-    
-    // 创建请求消息
-    SoupMessage *msg = soup_message_new("GET", TCG_FORBIDDEN_URL);
-    
-    if (!msg) {
-        g_warning("Failed to create HTTP request for TCG forbidden list");
-        g_object_unref(session);
-        return NULL;
-    }
-    
-    // 设置User-Agent避免被服务器拒绝
-    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
-    soup_message_headers_append(headers, "User-Agent", 
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
-    
-    g_message("Starting background download of TCG forbidden list...");
-    
-    // 异步发送请求
-    soup_session_send_and_read_async(
-        session,
-        msg,
-        G_PRIORITY_LOW,
-        NULL,
-        (GAsyncReadyCallback)on_download_complete_tcg,
-        NULL
-    );
-    
-    g_object_unref(msg);
-    
-    return NULL;
-}
-
-/**
- * 后台线程执行的下载任务 (SC)
- */
-static gpointer download_thread_func_sc(G_GNUC_UNUSED gpointer data) {
-    // 创建独立的SoupSession用于后台下载
-    SoupSession *session = soup_session_new();
-    
-    // 创建请求消息
-    SoupMessage *msg = soup_message_new("GET", SC_FORBIDDEN_URL);
-    
-    if (!msg) {
-        g_warning("Failed to create HTTP request for SC forbidden list");
-        g_object_unref(session);
-        return NULL;
-    }
-    
-    // 设置User-Agent避免被服务器拒绝
-    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
-    soup_message_headers_append(headers, "User-Agent", 
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
-    
-    g_message("Starting background download of SC forbidden list...");
-    
-    // 异步发送请求
-    soup_session_send_and_read_async(
-        session,
-        msg,
-        G_PRIORITY_LOW,
-        NULL,
-        (GAsyncReadyCallback)on_download_complete_sc,
-        NULL
-    );
-    
-    g_object_unref(msg);
-    
-    return NULL;
-}
-
-/**
- * 启动后台更新OCG禁限卡表
- * 此函数立即返回，实际下载在后台线程中进行
- */
-void startup_update_ocg_forbidden(void) {
-    GThread *thread = g_thread_new("ocg-forbidden-update", download_thread_func, NULL);
-    
-    if (thread) {
-        // 分离线程，让它在后台自行运行
-        g_thread_unref(thread);
-        g_message("OCG forbidden list update started in background");
-    } else {
-        g_warning("Failed to start OCG forbidden list update thread");
-    }
-}
-
-/**
- * 启动后台更新TCG禁限卡表
- * 此函数立即返回，实际下载在后台线程中进行
- */
-void startup_update_tcg_forbidden(void) {
-    GThread *thread = g_thread_new("tcg-forbidden-update", download_thread_func_tcg, NULL);
-    
-    if (thread) {
-        // 分离线程，让它在后台自行运行
-        g_thread_unref(thread);
-        g_message("TCG forbidden list update started in background");
-    } else {
-        g_warning("Failed to start TCG forbidden list update thread");
-    }
-}
-
-/**
- * 启动后台更新AE禁限卡表
- * 此函数立即返回，实际下载在后台线程中进行
- */
-void startup_update_ae_forbidden(void) {
-    GThread *thread = g_thread_new("ae-forbidden-update", download_thread_func_ae, NULL);
-    
-    if (thread) {
-        // 分离线程，让它在后台自行运行
-        g_thread_unref(thread);
-        g_message("AE forbidden list update started in background");
-    } else {
-        g_warning("Failed to start AE forbidden list update thread");
-    }
-}
-
-/**
- * 启动后台更新SC禁限卡表
- * 此函数立即返回，实际下载在后台线程中进行
- */
-void startup_update_sc_forbidden(void) {
-    GThread *thread = g_thread_new("sc-forbidden-update", download_thread_func_sc, NULL);
-    
-    if (thread) {
-        // 分离线程，让它在后台自行运行
-        g_thread_unref(thread);
-        g_message("SC forbidden list update started in background");
-    } else {
-        g_warning("Failed to start SC forbidden list update thread");
-    }
+    return TRUE;
 }
 
 // ============================================================
@@ -1050,99 +664,6 @@ static JsonNode *parse_html_to_json_genesys(const char *html_content) {
 
     g_message("GENESYS: Parsed %d card point entries", entry_count);
     return root;
-}
-
-/**
- * GENESYS下载完成后的回调
- */
-static void on_download_complete_genesys(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
-    GError *error = NULL;
-    GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
-
-    if (error) {
-        g_warning("Failed to download GENESYS points list: %s", error->message);
-        g_error_free(error);
-        g_object_unref(session);
-        return;
-    }
-
-    gsize size;
-    const char *html_content = g_bytes_get_data(response_body, &size);
-
-    if (html_content && size > 0) {
-        gchar *data_dir = get_config_data_dir();
-        if (!data_dir || !ensure_directory_exists(data_dir)) {
-            g_free(data_dir);
-            g_bytes_unref(response_body);
-            g_object_unref(session);
-            return;
-        }
-        g_free(data_dir);
-
-        JsonNode *json_root = parse_html_to_json_genesys(html_content);
-
-        gchar *output_file = get_output_file_path(GENESYS_FORBIDDEN_FILENAME);
-        if (output_file) {
-            save_json_to_file(json_root, output_file);
-            g_free(output_file);
-        }
-        json_node_free(json_root);
-    } else {
-        g_warning("Received empty response from GENESYS points URL");
-    }
-
-    g_bytes_unref(response_body);
-    g_object_unref(session);
-}
-
-/**
- * 后台线程：下载GENESYS分值表
- */
-static gpointer download_thread_func_genesys(G_GNUC_UNUSED gpointer data) {
-    SoupSession *session = soup_session_new();
-    SoupMessage *msg = soup_message_new("GET", GENESYS_FORBIDDEN_URL);
-
-    if (!msg) {
-        g_warning("Failed to create HTTP request for GENESYS points list");
-        g_object_unref(session);
-        return NULL;
-    }
-
-    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
-    soup_message_headers_append(headers, "User-Agent",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
-    // Accept cookies/HTML
-    soup_message_headers_append(headers, "Accept",
-        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-
-    g_message("Starting background download of GENESYS points list...");
-
-    soup_session_send_and_read_async(
-        session,
-        msg,
-        G_PRIORITY_LOW,
-        NULL,
-        (GAsyncReadyCallback)on_download_complete_genesys,
-        NULL
-    );
-
-    g_object_unref(msg);
-    return NULL;
-}
-
-/**
- * 启动后台更新GENESYS分值表
- * 此函数立即返回，实际下载在后台线程中进行
- */
-void startup_update_genesys_forbidden(void) {
-    GThread *thread = g_thread_new("genesys-forbidden-update", download_thread_func_genesys, NULL);
-
-    if (thread) {
-        g_thread_unref(thread);
-        g_message("GENESYS points list update started in background");
-    } else {
-        g_warning("Failed to start GENESYS points list update thread");
-    }
 }
 
 // ============================================================
@@ -1584,159 +1105,73 @@ static JsonNode *parse_sc_forbidden_changes_json(const char *json_content) {
     return out;
 }
 
-/**
- * 下载完成后的回调函数（OCG变更）
- */
-static void on_download_complete_ocg_changes(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
-    GError *error = NULL;
-    GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
-    
-    if (error) {
-        g_warning("Failed to download OCG forbidden list changes: %s", error->message);
-        g_error_free(error);
-        g_object_unref(session);
-        return;
-    }
-    
-    gsize size;
-    const char *html_content = g_bytes_get_data(response_body, &size);
-    
-    if (html_content && size > 0) {
-        gchar *data_dir = get_config_data_dir();
-        if (!data_dir || !ensure_directory_exists(data_dir)) {
-            g_free(data_dir);
-            g_bytes_unref(response_body);
-            g_object_unref(session);
-            return;
-        }
-        g_free(data_dir);
-        
-        JsonNode *json_root = parse_html_forbidden_changes_ocg(html_content);
-        
-        if (json_root) {
-            gchar *output_file = get_output_file_path(OCG_FORBIDDEN_CHANGES_FILENAME);
-            if (output_file) {
-                save_json_to_file(json_root, output_file);
-                g_free(output_file);
-            }
-            json_node_free(json_root);
-        }
-    } else {
-        g_warning("Received empty response from OCG forbidden list URL");
-    }
-    
-    g_bytes_unref(response_body);
-    g_object_unref(session);
-}
+// ============================================================
+// 表驱动的下载流程：每个"卡表/变更"目标由 {URL, 日志标签, 输出文件名,
+// 解析函数, 附加请求头, 线程名} 描述，下载线程、完成回调与入口函数
+// 统一由配置表驱动，收敛此前 9 套近乎相同的重复代码。
+// ============================================================
 
-/**
- * 下载完成后的回调函数（TCG变更）
- */
-static void on_download_complete_tcg_changes(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
-    GError *error = NULL;
-    GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
-    
-    if (error) {
-        g_warning("Failed to download TCG forbidden list changes: %s", error->message);
-        g_error_free(error);
-        g_object_unref(session);
-        return;
-    }
-    
-    gsize size;
-    const char *html_content = g_bytes_get_data(response_body, &size);
-    
-    if (html_content && size > 0) {
-        gchar *data_dir = get_config_data_dir();
-        if (!data_dir || !ensure_directory_exists(data_dir)) {
-            g_free(data_dir);
-            g_bytes_unref(response_body);
-            g_object_unref(session);
-            return;
-        }
-        g_free(data_dir);
-        
-        JsonNode *json_root = parse_html_forbidden_changes_tcg(html_content);
-        
-        if (json_root) {
-            gchar *output_file = get_output_file_path(TCG_FORBIDDEN_CHANGES_FILENAME);
-            if (output_file) {
-                save_json_to_file(json_root, output_file);
-                g_free(output_file);
-            }
-            json_node_free(json_root);
-        }
-    } else {
-        g_warning("Received empty response from TCG forbidden list URL");
-    }
-    
-    g_bytes_unref(response_body);
-    g_object_unref(session);
-}
+typedef struct {
+    const char *url;
+    const char *label;      // 日志标签
+    const char *filename;   // 输出文件名
+    JsonNode *(*parse)(const char *content);  // HTML 或 JSON 内容解析函数
+    const char *accept;     // 附加 Accept 请求头（可为 NULL）
+    const char *thread_name;
+} DownloadSpec;
 
-/**
- * 下载完成后的回调函数（AE变更）
- */
-static void on_download_complete_ae_changes(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
-    GError *error = NULL;
-    GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
-    
-    if (error) {
-        g_warning("Failed to download AE forbidden list changes: %s", error->message);
-        g_error_free(error);
-        g_object_unref(session);
-        return;
-    }
-    
-    gsize size;
-    const char *html_content = g_bytes_get_data(response_body, &size);
-    
-    if (html_content && size > 0) {
-        gchar *data_dir = get_config_data_dir();
-        if (!data_dir || !ensure_directory_exists(data_dir)) {
-            g_free(data_dir);
-            g_bytes_unref(response_body);
-            g_object_unref(session);
-            return;
-        }
-        g_free(data_dir);
-        
-        JsonNode *json_root = parse_html_forbidden_changes_ae(html_content);
-        
-        if (json_root) {
-            gchar *output_file = get_output_file_path(AE_FORBIDDEN_CHANGES_FILENAME);
-            if (output_file) {
-                save_json_to_file(json_root, output_file);
-                g_free(output_file);
-            }
-            json_node_free(json_root);
-        }
-    } else {
-        g_warning("Received empty response from AE forbidden list URL");
-    }
-    
-    g_bytes_unref(response_body);
-    g_object_unref(session);
-}
+static const DownloadSpec download_specs[] = {
+    // 禁限卡表
+    { OCG_FORBIDDEN_URL,     "OCG forbidden list",         OCG_FORBIDDEN_FILENAME,         parse_html_to_json_ocg,           NULL, "ocg-forbidden-update" },
+    { TCG_FORBIDDEN_URL,     "TCG forbidden list",         TCG_FORBIDDEN_FILENAME,         parse_html_to_json_tcg,           NULL, "tcg-forbidden-update" },
+    { AE_FORBIDDEN_URL,      "AE forbidden list",          AE_FORBIDDEN_FILENAME,          parse_html_to_json_ae,            NULL, "ae-forbidden-update" },
+    { SC_FORBIDDEN_URL,      "SC forbidden list",          SC_FORBIDDEN_FILENAME,          process_sc_json,                  NULL, "sc-forbidden-update" },
+    { GENESYS_FORBIDDEN_URL, "GENESYS points list",        GENESYS_FORBIDDEN_FILENAME,     parse_html_to_json_genesys,
+      "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", "genesys-forbidden-update" },
+    // 禁限变更记录
+    { OCG_FORBIDDEN_URL,     "OCG forbidden list changes", OCG_FORBIDDEN_CHANGES_FILENAME, parse_html_forbidden_changes_ocg, NULL, "ocg-forbidden-changes-update" },
+    { TCG_FORBIDDEN_URL,     "TCG forbidden list changes", TCG_FORBIDDEN_CHANGES_FILENAME, parse_html_forbidden_changes_tcg, NULL, "tcg-forbidden-changes-update" },
+    { AE_FORBIDDEN_URL,      "AE forbidden list changes",  AE_FORBIDDEN_CHANGES_FILENAME,  parse_html_forbidden_changes_ae,  NULL, "ae-forbidden-changes-update" },
+    { SC_FORBIDDEN_URL,      "SC forbidden list changes",  SC_FORBIDDEN_CHANGES_FILENAME,  parse_sc_forbidden_changes_json,  NULL, "sc-forbidden-changes-update" },
+};
 
-/**
- * 下载完成后的回调函数（SC变更）
- */
-static void on_download_complete_sc_changes(SoupSession *session, GAsyncResult *result, G_GNUC_UNUSED gpointer user_data) {
+typedef enum {
+    SPEC_OCG_FORBIDDEN = 0,
+    SPEC_TCG_FORBIDDEN,
+    SPEC_AE_FORBIDDEN,
+    SPEC_SC_FORBIDDEN,
+    SPEC_GENESYS_FORBIDDEN,
+    SPEC_OCG_CHANGES,
+    SPEC_TCG_CHANGES,
+    SPEC_AE_CHANGES,
+    SPEC_SC_CHANGES,
+    SPEC_COUNT
+} DownloadSpecId;
+
+// 下载完成后的统一回调：状态码校验 -> 解析 -> 保存
+static void on_download_complete_spec(SoupSession *session, GAsyncResult *result, gpointer user_data) {
+    const DownloadSpec *spec = (const DownloadSpec*)user_data;
     GError *error = NULL;
     GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
 
     if (error) {
-        g_warning("Failed to download SC forbidden list changes: %s", error->message);
+        g_warning("Failed to download %s: %s", spec->label, error->message);
         g_error_free(error);
         g_object_unref(session);
         return;
     }
 
-    gsize size;
-    const char *json_content = g_bytes_get_data(response_body, &size);
+    if (!download_status_ok(session, result, spec->label)) {
+        g_bytes_unref(response_body);
+        g_object_unref(session);
+        return;
+    }
 
-    if (json_content && size > 0) {
+    gsize size;
+    const char *content = (const char *)g_bytes_get_data(response_body, &size);
+
+    if (content && size > 0) {
+        // 确保配置数据目录存在
         gchar *data_dir = get_config_data_dir();
         if (!data_dir || !ensure_directory_exists(data_dir)) {
             g_free(data_dir);
@@ -1746,203 +1181,83 @@ static void on_download_complete_sc_changes(SoupSession *session, GAsyncResult *
         }
         g_free(data_dir);
 
-        JsonNode *json_root = parse_sc_forbidden_changes_json(json_content);
+        JsonNode *json_root = spec->parse(content);
         if (json_root) {
-            gchar *output_file = get_output_file_path(SC_FORBIDDEN_CHANGES_FILENAME);
+            gchar *output_file = get_output_file_path(spec->filename);
             if (output_file) {
                 save_json_to_file(json_root, output_file);
                 g_free(output_file);
             }
             json_node_free(json_root);
+        } else {
+            g_warning("Failed to parse %s content", spec->label);
         }
     } else {
-        g_warning("Received empty response from SC forbidden list URL");
+        g_warning("Received empty response from %s URL", spec->label);
     }
 
     g_bytes_unref(response_body);
     g_object_unref(session);
 }
 
-/**
- * 后台线程函数（OCG变更下载）
- */
-static gpointer download_thread_func_ocg_changes(G_GNUC_UNUSED gpointer data) {
-    SoupSession *session = soup_session_new();
-    SoupMessage *msg = soup_message_new("GET", OCG_FORBIDDEN_URL);
-    
-    if (!msg) {
-        g_warning("Failed to create HTTP request for OCG forbidden list changes");
-        g_object_unref(session);
-        return NULL;
-    }
-    
-    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
-    soup_message_headers_append(headers, "User-Agent", 
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
-    
-    g_message("Starting background download of OCG forbidden list changes...");
-    
-    soup_session_send_and_read_async(
-        session,
-        msg,
-        G_PRIORITY_LOW,
-        NULL,
-        (GAsyncReadyCallback)on_download_complete_ocg_changes,
-        NULL
-    );
-    
-    g_object_unref(msg);
-    return NULL;
-}
+// 后台线程执行的统一下载任务
+static gpointer download_thread_func_spec(gpointer data) {
+    const DownloadSpec *spec = (const DownloadSpec*)data;
 
-/**
- * 后台线程函数（TCG变更下载）
- */
-static gpointer download_thread_func_tcg_changes(G_GNUC_UNUSED gpointer data) {
+    // 创建独立的SoupSession用于后台下载
     SoupSession *session = soup_session_new();
-    SoupMessage *msg = soup_message_new("GET", TCG_FORBIDDEN_URL);
-    
-    if (!msg) {
-        g_warning("Failed to create HTTP request for TCG forbidden list changes");
-        g_object_unref(session);
-        return NULL;
-    }
-    
-    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
-    soup_message_headers_append(headers, "User-Agent", 
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
-    
-    g_message("Starting background download of TCG forbidden list changes...");
-    
-    soup_session_send_and_read_async(
-        session,
-        msg,
-        G_PRIORITY_LOW,
-        NULL,
-        (GAsyncReadyCallback)on_download_complete_tcg_changes,
-        NULL
-    );
-    
-    g_object_unref(msg);
-    return NULL;
-}
 
-/**
- * 后台线程函数（AE变更下载）
- */
-static gpointer download_thread_func_ae_changes(G_GNUC_UNUSED gpointer data) {
-    SoupSession *session = soup_session_new();
-    SoupMessage *msg = soup_message_new("GET", AE_FORBIDDEN_URL);
-    
+    SoupMessage *msg = soup_message_new("GET", spec->url);
     if (!msg) {
-        g_warning("Failed to create HTTP request for AE forbidden list changes");
-        g_object_unref(session);
-        return NULL;
-    }
-    
-    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
-    soup_message_headers_append(headers, "User-Agent", 
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
-    
-    g_message("Starting background download of AE forbidden list changes...");
-    
-    soup_session_send_and_read_async(
-        session,
-        msg,
-        G_PRIORITY_LOW,
-        NULL,
-        (GAsyncReadyCallback)on_download_complete_ae_changes,
-        NULL
-    );
-    
-    g_object_unref(msg);
-    return NULL;
-}
-
-/**
- * 后台线程函数（SC变更下载）
- */
-static gpointer download_thread_func_sc_changes(G_GNUC_UNUSED gpointer data) {
-    SoupSession *session = soup_session_new();
-    SoupMessage *msg = soup_message_new("GET", SC_FORBIDDEN_URL);
-
-    if (!msg) {
-        g_warning("Failed to create HTTP request for SC forbidden list changes");
+        g_warning("Failed to create HTTP request for %s", spec->label);
         g_object_unref(session);
         return NULL;
     }
 
+    // 设置User-Agent避免被服务器拒绝
     SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
     soup_message_headers_append(headers, "User-Agent",
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
+    if (spec->accept) {
+        soup_message_headers_append(headers, "Accept", spec->accept);
+    }
 
-    g_message("Starting background download of SC forbidden list changes...");
+    g_message("Starting background download of %s...", spec->label);
 
     soup_session_send_and_read_async(
         session,
         msg,
         G_PRIORITY_LOW,
         NULL,
-        (GAsyncReadyCallback)on_download_complete_sc_changes,
-        NULL
+        (GAsyncReadyCallback)on_download_complete_spec,
+        (gpointer)spec
     );
 
     g_object_unref(msg);
     return NULL;
 }
 
-/**
- * 启动后台更新OCG禁限变更
- */
-void startup_update_ocg_forbidden_changes(void) {
-    GThread *thread = g_thread_new("ocg-forbidden-changes-update", download_thread_func_ocg_changes, NULL);
-    
+// 启动指定目标的后台更新
+static void startup_update_spec_run(DownloadSpecId id) {
+    const DownloadSpec *spec = &download_specs[id];
+    GThread *thread = g_thread_new(spec->thread_name, download_thread_func_spec, (gpointer)spec);
+
     if (thread) {
+        // 分离线程，让它在后台自行运行
         g_thread_unref(thread);
-        g_message("OCG forbidden changes update started in background");
+        g_message("%s update started in background", spec->label);
     } else {
-        g_warning("Failed to start OCG forbidden changes update thread");
+        g_warning("Failed to start %s update thread", spec->label);
     }
 }
 
-/**
- * 启动后台更新TCG禁限变更
- */
-void startup_update_tcg_forbidden_changes(void) {
-    GThread *thread = g_thread_new("tcg-forbidden-changes-update", download_thread_func_tcg_changes, NULL);
-    
-    if (thread) {
-        g_thread_unref(thread);
-        g_message("TCG forbidden changes update started in background");
-    } else {
-        g_warning("Failed to start TCG forbidden changes update thread");
-    }
-}
+void startup_update_ocg_forbidden(void)         { startup_update_spec_run(SPEC_OCG_FORBIDDEN); }
+void startup_update_tcg_forbidden(void)         { startup_update_spec_run(SPEC_TCG_FORBIDDEN); }
+void startup_update_ae_forbidden(void)          { startup_update_spec_run(SPEC_AE_FORBIDDEN); }
+void startup_update_sc_forbidden(void)          { startup_update_spec_run(SPEC_SC_FORBIDDEN); }
+void startup_update_genesys_forbidden(void)     { startup_update_spec_run(SPEC_GENESYS_FORBIDDEN); }
+void startup_update_ocg_forbidden_changes(void) { startup_update_spec_run(SPEC_OCG_CHANGES); }
+void startup_update_tcg_forbidden_changes(void) { startup_update_spec_run(SPEC_TCG_CHANGES); }
+void startup_update_ae_forbidden_changes(void)  { startup_update_spec_run(SPEC_AE_CHANGES); }
+void startup_update_sc_forbidden_changes(void)  { startup_update_spec_run(SPEC_SC_CHANGES); }
 
-/**
- * 启动后台更新AE禁限变更
- */
-void startup_update_ae_forbidden_changes(void) {
-    GThread *thread = g_thread_new("ae-forbidden-changes-update", download_thread_func_ae_changes, NULL);
-    
-    if (thread) {
-        g_thread_unref(thread);
-        g_message("AE forbidden changes update started in background");
-    } else {
-        g_warning("Failed to start AE forbidden changes update thread");
-    }
-}
-
-/**
- * 启动后台更新SC禁限变更
- */
-void startup_update_sc_forbidden_changes(void) {
-    GThread *thread = g_thread_new("sc-forbidden-changes-update", download_thread_func_sc_changes, NULL);
-
-    if (thread) {
-        g_thread_unref(thread);
-        g_message("SC forbidden changes update started in background");
-    } else {
-        g_warning("Failed to start SC forbidden changes update thread");
-    }
-}

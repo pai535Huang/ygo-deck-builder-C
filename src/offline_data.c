@@ -626,8 +626,7 @@ static gpointer download_offline_data_thread(gpointer data) {
             g_error_free(md5_error);
             g_object_unref(md5_input);
             g_object_unref(md5_file);
-            g_object_unref(md5_session);
-            g_free(md5_path);
+            // md5_session 与 md5_path 由本分支末尾统一释放
             // MD5 保存失败不影响主流程
         } else {
             // 复制数据
@@ -679,8 +678,7 @@ static gpointer download_offline_data_thread(gpointer data) {
             g_error_free(strings_error);
             g_object_unref(strings_input);
             g_object_unref(strings_file);
-            g_object_unref(strings_session);
-            g_free(strings_path);
+            // strings_session 与 strings_path 由本分支末尾统一释放
             // strings.conf 保存失败不影响主流程
         } else {
             // 复制数据
@@ -972,122 +970,6 @@ void check_offline_data_update(GSourceFunc callback, gpointer user_data) {
     // 在新线程中执行检查
     GThread *thread = g_thread_new("check-offline-data-update", check_offline_data_update_thread, ctx);
     g_thread_unref(thread);
-}
-
-/**
- * 从离线数据中搜索卡片
- */
-JsonArray* search_offline_cards(const char *query) {
-    if (!query || strlen(query) == 0) {
-        return NULL;
-    }
-    
-    // 获取 cards.json 文件路径
-    gchar *cards_dir = get_cards_dir();
-    if (!cards_dir) {
-        return NULL;
-    }
-    
-    gchar *json_path = g_build_filename(cards_dir, "cards.json", NULL);
-    g_free(cards_dir);
-    
-    if (!g_file_test(json_path, G_FILE_TEST_EXISTS)) {
-        g_warning("cards.json not found");
-        g_free(json_path);
-        return NULL;
-    }
-    
-    // 加载 JSON 文件
-    JsonParser *parser = json_parser_new();
-    GError *error = NULL;
-    
-    if (!json_parser_load_from_file(parser, json_path, &error)) {
-        g_warning("Failed to parse cards.json: %s", error ? error->message : "unknown error");
-        if (error) g_error_free(error);
-        g_object_unref(parser);
-        g_free(json_path);
-        return NULL;
-    }
-    
-    g_free(json_path);
-    
-    JsonNode *root = json_parser_get_root(parser);
-    if (!root || !JSON_NODE_HOLDS_OBJECT(root)) {
-        g_warning("Invalid JSON structure in cards.json");
-        g_object_unref(parser);
-        return NULL;
-    }
-    
-    JsonObject *root_obj = json_node_get_object(root);
-    
-    // 创建结果数组
-    JsonArray *results = json_array_new();
-    
-    // 转换查询字符串为小写以进行不区分大小写的搜索
-    gchar *query_lower = g_utf8_strdown(query, -1);
-    
-    // 遍历所有卡片
-    GList *members = json_object_get_members(root_obj);
-    for (GList *l = members; l != NULL; l = l->next) {
-        const gchar *card_id = (const gchar*)l->data;
-        JsonNode *card_node = json_object_get_member(root_obj, card_id);
-        
-        if (!card_node || !JSON_NODE_HOLDS_OBJECT(card_node)) {
-            continue;
-        }
-        
-        JsonObject *card = json_node_get_object(card_node);
-        gboolean match = FALSE;
-        
-        // 在卡名中搜索（支持多种语言的卡名）
-        const gchar *name_fields[] = {"cn_name", "sc_name", "md_name", "jp_name", "en_name", "nwbbs_n", "cnocg_n", NULL};
-        for (int i = 0; name_fields[i] != NULL && !match; i++) {
-            if (json_object_has_member(card, name_fields[i])) {
-                const gchar *name = json_object_get_string_member(card, name_fields[i]);
-                if (name) {
-                    gchar *name_lower = g_utf8_strdown(name, -1);
-                    if (strstr(name_lower, query_lower) != NULL) {
-                        match = TRUE;
-                    }
-                    g_free(name_lower);
-                }
-            }
-        }
-        
-        // 如果卡名不匹配，在效果描述中搜索
-        if (!match && json_object_has_member(card, "text")) {
-            JsonObject *text = json_object_get_object_member(card, "text");
-            if (text && json_object_has_member(text, "desc")) {
-                const gchar *desc = json_object_get_string_member(text, "desc");
-                if (desc) {
-                    gchar *desc_lower = g_utf8_strdown(desc, -1);
-                    if (strstr(desc_lower, query_lower) != NULL) {
-                        match = TRUE;
-                    }
-                    g_free(desc_lower);
-                }
-            }
-        }
-        
-        // 如果匹配，添加到结果中
-        if (match) {
-            // 复制整个卡片对象到结果数组
-            JsonNode *card_copy = json_node_copy(card_node);
-            json_array_add_element(results, card_copy);
-        }
-    }
-    
-    g_list_free(members);
-    g_free(query_lower);
-    g_object_unref(parser);
-    
-    // 如果没有结果，返回 NULL
-    if (json_array_get_length(results) == 0) {
-        json_array_unref(results);
-        return NULL;
-    }
-    
-    return results;
 }
 
 /**
@@ -1414,70 +1296,49 @@ int offline_get_effective_card_id(int card_id) {
 
 /**
  * 获取所有离线卡片数据
+ * 遍历带 mtime 缓存的共享解析根对象，返回卡片对象的引用数组（浅引用）。
+ * 此前每次调用都重新解析 cards.json 并逐卡 json_node_copy 深拷贝，
+ * 禁限变更视图每次打开都会产生一次全量解析 + 上万次深拷贝。
  */
 JsonArray* get_all_offline_cards(void) {
-    // 获取 cards.json 文件路径
-    gchar *cards_dir = get_cards_dir();
-    if (!cards_dir) {
+    JsonParser *parser_ref = NULL;
+    JsonObject *root_obj = NULL;
+    g_mutex_lock(&offline_cache_mutex);
+    gboolean ok = offline_cache_ensure_loaded_locked();
+    if (ok && offline_cards_parser && offline_cards_root) {
+        // 遍历期间必须持有解析器引用：并发的 reload/clear 会释放共享根对象，
+        // 否则下面无锁遍历 root_obj 会读到已释放内存
+        parser_ref = g_object_ref(offline_cards_parser);
+        root_obj = offline_cards_root;
+    }
+    g_mutex_unlock(&offline_cache_mutex);
+
+    if (!parser_ref || !root_obj) {
+        if (parser_ref) g_object_unref(parser_ref);
         return NULL;
     }
-    
-    gchar *json_path = g_build_filename(cards_dir, "cards.json", NULL);
-    g_free(cards_dir);
-    
-    if (!g_file_test(json_path, G_FILE_TEST_EXISTS)) {
-        g_warning("cards.json not found");
-        g_free(json_path);
-        return NULL;
-    }
-    
-    // 加载 JSON 文件
-    JsonParser *parser = json_parser_new();
-    GError *error = NULL;
-    
-    if (!json_parser_load_from_file(parser, json_path, &error)) {
-        g_warning("Failed to parse cards.json: %s", error ? error->message : "unknown error");
-        if (error) g_error_free(error);
-        g_object_unref(parser);
-        g_free(json_path);
-        return NULL;
-    }
-    
-    g_free(json_path);
-    
-    JsonNode *root = json_parser_get_root(parser);
-    if (!root || !JSON_NODE_HOLDS_OBJECT(root)) {
-        g_warning("Invalid JSON structure in cards.json");
-        g_object_unref(parser);
-        return NULL;
-    }
-    
-    JsonObject *root_obj = json_node_get_object(root);
-    
-    // 创建结果数组
+
     JsonArray *results = json_array_new();
-    
-    // 遍历所有卡片并添加到结果数组
+
     GList *members = json_object_get_members(root_obj);
     for (GList *l = members; l != NULL; l = l->next) {
-        const gchar *card_id = (const gchar*)l->data;
-        JsonNode *card_node = json_object_get_member(root_obj, card_id);
-        
+        JsonNode *card_node = json_object_get_member(root_obj, (const gchar*)l->data);
         if (card_node && JSON_NODE_HOLDS_OBJECT(card_node)) {
-            // 复制整个卡片对象到结果数组
-            JsonNode *card_copy = json_node_copy(card_node);
-            json_array_add_element(results, card_copy);
+            JsonObject *card = json_node_get_object(card_node);
+            if (card) {
+                // add_object_element 接管调用者传入的引用（transfer full）
+                json_array_add_object_element(results, json_object_ref(card));
+            }
         }
     }
-    
     g_list_free(members);
-    g_object_unref(parser);
-    
+    g_object_unref(parser_ref);
+
     // 如果没有结果，返回 NULL
     if (json_array_get_length(results) == 0) {
         json_array_unref(results);
         return NULL;
     }
-    
+
     return results;
 }

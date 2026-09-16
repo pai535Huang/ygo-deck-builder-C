@@ -18,6 +18,7 @@ extern void array_shift_right(GPtrArray *arr, int start, int end);
 extern void update_genesys_score(SearchUI *ui);  // GENESYS 总分更新
 extern void apply_overlay_to_widget(GtkWidget *w, SearchUI *ui);  // 设置卡图角标
 extern void update_deck_overlays(SearchUI *ui);  // 批量更新卡组角标
+extern void load_card_image(GtkWidget *slot, int img_id, SoupSession *session);  // 异步加载卡图（含先行卡/磁盘缓存/网络回退）
 
 // DnD: drag setup
 GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, double y, gpointer user_data) {
@@ -297,9 +298,9 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
         int card_id = 0;  // cid，用于禁限卡检查和统计
         int img_id = 0;   // id，用于图片URL
         int is_extra = 0;
-        int is_prerelease = 0;
         const char *en_name_str = NULL;  // GENESYS 分值查找用
-        // 解析 search:cid:id:isExtra:isPrerelease:en_name
+        // 解析 search:cid:id:isExtra:isPrerelease:en_name（isPrerelease 字段保留兼容，
+        // 是否先行卡由 load_card_image 按卡片数据自行判断）
         const char *p = payload + 7;
         const char *colon1 = strchr(p, ':');
         if (colon1) {
@@ -312,12 +313,8 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
                     is_extra = atoi(colon2 + 1);
                     const char *colon4 = strchr(colon3 + 1, ':');
                     if (colon4) {
-                        is_prerelease = atoi(colon3 + 1);
                         // en_name 是第5个冒号之后直到行尾
                         en_name_str = colon4 + 1;
-                    } else {
-                        is_extra = atoi(colon2 + 1);
-                        is_prerelease = atoi(colon3 + 1);
                     }
                 } else {
                     is_extra = atoi(colon2 + 1);
@@ -368,43 +365,11 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
         // 立即设置角标数据（图片加载后会显示）
         apply_overlay_to_widget(place_w, ui);
         
-        // 如果是先行卡，从本地加载图片
-        if (is_prerelease) {
-            gchar *local_path = get_prerelease_card_image_path(img_id);
-            if (local_path && g_file_test(local_path, G_FILE_TEST_EXISTS)) {
-                GError *error = NULL;
-                GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(local_path, &error);
-                if (pixbuf) {
-                    slot_set_pixbuf(place_w, pixbuf);
-                    g_object_unref(pixbuf);
-                } else {
-                    if (error) {
-                        g_warning("加载先行卡图片失败: %s", error->message);
-                        g_error_free(error);
-                    }
-                }
-            }
-            g_free(local_path);
-        } else {
-            // 非先行卡，从缓存或在线加载
-            // 若缓存中有该卡的缩略图，先立即显示以消除延迟
-            if (img_id > 0) {
-                GdkPixbuf *cached = get_thumb_from_cache(img_id);
-                if (cached) {
-                    slot_set_pixbuf(place_w, cached);
-                }
-            }
-            // 异步加载图片到目标槽位
-            char url[128];
-            g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", img_id);
-            ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
-            ctx->stack = NULL;
-            ctx->target = GTK_WIDGET(place_w);
-            ctx->scale_to_thumb = TRUE;
-            ctx->cache_id = 0;
-            ctx->add_to_thumb_cache = FALSE;
-            ctx->url = g_strdup(url);
-            load_image_async(ui->session, url, ctx);
+        // 统一走异步加载路径：先行卡本地文件后台线程读取（此前为同步 IO），
+        // 普通卡先查内存/磁盘缓存（此前拖放绕过磁盘缓存），未命中才发起网络
+        // 下载，且下载结果会写入磁盘缓存（此前 cache_id=0 不入缓存）
+        if (img_id > 0) {
+            load_card_image(place_w, img_id, ui->session);
         }
         if (*to_count < place_index + 1) *to_count = place_index + 1;
         update_count_label(to_label, *to_count);

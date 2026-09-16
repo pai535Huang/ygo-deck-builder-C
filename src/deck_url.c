@@ -2,8 +2,13 @@
 #include <string.h>
 #include <stdlib.h>
 
+// 协议字段限制（见 docs/deck encoding and decoding.md）：
+// 卡片 ID 为 27 位二进制，单卡数量为 2 位（1-3）
+#define DECK_URL_MAX_CARD_ID 134217727  /* 2^27 - 1 */
+#define DECK_URL_MAX_COPIES  3
+
 // Base64Url字符表（使用 - 和 _ 替换标准Base64的 + 和 /）
-static const char base64url_chars[] = 
+static const char base64url_chars[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 // 用于解码的反向映射表
@@ -37,7 +42,14 @@ static CardInfo* count_unique_cards(const int *cards, int count, int *unique_cou
     
     for (int i = 0; i < count; i++) {
         int card_id = cards[i];
-        
+
+        // 超出 27 位范围的 ID（负数或 9 位先行卡码等）写入时会回绕为无关卡片，
+        // 跳过并警告，避免导出静默损坏的卡组
+        if (card_id < 0 || card_id > DECK_URL_MAX_CARD_ID) {
+            g_warning("卡片 ID %d 超出 URL 协议 27 位范围，已跳过", card_id);
+            continue;
+        }
+
         // 查找这个卡片是否已经记录过
         int found = -1;
         for (int j = 0; j < uniq; j++) {
@@ -100,6 +112,15 @@ static void int_to_bits(int value, bool *bits, int start_pos, int bit_count) {
     }
 }
 
+// 单卡数量字段为 2 位，超出按协议上限 3 编码（非法卡组导出时避免回绕）
+static int deck_url_clamp_count(int count) {
+    if (count > DECK_URL_MAX_COPIES) {
+        g_warning("单卡数量 %d 超出协议上限 %d，按 %d 编码", count, DECK_URL_MAX_COPIES, DECK_URL_MAX_COPIES);
+        return DECK_URL_MAX_COPIES;
+    }
+    return count;
+}
+
 char* deck_encode_to_url(
     const int *main_cards, int main_count,
     const int *extra_cards, int extra_count,
@@ -135,21 +156,21 @@ char* deck_encode_to_url(
     
     // 写入主卡组卡片信息
     for (int i = 0; i < main_unique; i++) {
-        int_to_bits(main_infos[i].count, bits, bit_pos, 2);
+        int_to_bits(deck_url_clamp_count(main_infos[i].count), bits, bit_pos, 2);
         int_to_bits(main_infos[i].card_id, bits, bit_pos + 2, 27);
         bit_pos += 29;
     }
-    
+
     // 写入额外卡组卡片信息
     for (int i = 0; i < extra_unique; i++) {
-        int_to_bits(extra_infos[i].count, bits, bit_pos, 2);
+        int_to_bits(deck_url_clamp_count(extra_infos[i].count), bits, bit_pos, 2);
         int_to_bits(extra_infos[i].card_id, bits, bit_pos + 2, 27);
         bit_pos += 29;
     }
-    
+
     // 写入副卡组卡片信息
     for (int i = 0; i < side_unique; i++) {
-        int_to_bits(side_infos[i].count, bits, bit_pos, 2);
+        int_to_bits(deck_url_clamp_count(side_infos[i].count), bits, bit_pos, 2);
         int_to_bits(side_infos[i].card_id, bits, bit_pos + 2, 27);
         bit_pos += 29;
     }
@@ -228,8 +249,9 @@ bool deck_decode_from_url(
         return false;
     }
     
-    // 提取d参数的值
-    const char *d_param = strstr(url, "d=");
+    // 提取d参数的值（匹配 "?d=" 或 "&d="，避免误匹配其他以 d 结尾的参数名）
+    const char *d_param = strstr(url, "?d=");
+    if (!d_param) d_param = strstr(url, "&d=");
     if (!d_param) {
         // 空卡组也是有效的
         *main_cards = g_new(int, 1);
@@ -237,8 +259,8 @@ bool deck_decode_from_url(
         *side_cards = g_new(int, 1);
         return true;
     }
-    
-    d_param += 2; // 跳过 "d="
+
+    d_param += 3; // 跳过 "d="（含前置分隔符）
     
     // 提取d参数值（到&或字符串结尾）
     const char *param_end = strchr(d_param, '&');

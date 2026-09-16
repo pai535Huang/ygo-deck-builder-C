@@ -80,6 +80,8 @@ typedef struct {
     // 中间卡组区正在拖拽时跳过 hover 预览加载
     guint deck_drag_depth;
     int hovered_slot_img_id;
+    // 悬停代次计数器：每次新的槽位悬停请求递增，过期回调据此丢弃
+    guint64 hover_generation;
     // 窗口引用（用于显示对话框）
     AdwApplicationWindow *window;
     // Toast overlay（用于显示通知）

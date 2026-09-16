@@ -200,22 +200,23 @@ static CardSortData* fetch_card_data_fast(int img_id, int card_id, GdkPixbuf *pi
     return data;
 }
 
-// 对指定区域的卡片进行排序
-void sort_deck_region(GPtrArray *pics, int *count, GtkLabel *count_label) {
+// 收集 -> 排序 -> 回写槽位的公共流程；deck/extra 仅比较函数不同
+static void sort_region_with_compare(GPtrArray *pics, int *count, GtkLabel *count_label,
+                                     GCompareFunc compare_func) {
     if (!pics || !count || *count <= 0) return;
-    
+
     // 收集所有非空槽位的卡片数据
     GPtrArray *cards = g_ptr_array_new_with_free_func((GDestroyNotify)free_card_sort_data);
-    
+
     for (int i = 0; i < *count && i < (int)pics->len; i++) {
         GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(pics, i));
         int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "img_id"));
         int card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "card_id"));
-        
+
         if (img_id > 0) {
             GdkPixbuf *pixbuf = slot_get_pixbuf(pic);
             gboolean is_extra = slot_get_is_extra(pic);
-            
+
             // 获取卡片完整信息
             CardSortData *card_data = fetch_card_data_fast(img_id, card_id, pixbuf, is_extra);
             if (card_data) {
@@ -224,10 +225,10 @@ void sort_deck_region(GPtrArray *pics, int *count, GtkLabel *count_label) {
             }
         }
     }
-    
+
     // 排序
-    g_ptr_array_sort(cards, compare_cards);
-    
+    g_ptr_array_sort(cards, compare_func);
+
     // 清空原槽位
     for (int i = 0; i < (int)pics->len; i++) {
         GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(pics, i));
@@ -237,12 +238,12 @@ void sort_deck_region(GPtrArray *pics, int *count, GtkLabel *count_label) {
         g_object_set_data(G_OBJECT(pic), "img_id", GINT_TO_POINTER(0));
         slot_set_en_name(pic, NULL);
     }
-    
+
     // 按排序后的顺序重新放置卡片
     for (guint i = 0; i < cards->len && i < pics->len; i++) {
         CardSortData *card = g_ptr_array_index(cards, i);
         GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(pics, i));
-        
+
         if (card->pixbuf) {
             slot_set_pixbuf(pic, card->pixbuf);
         }
@@ -251,67 +252,19 @@ void sort_deck_region(GPtrArray *pics, int *count, GtkLabel *count_label) {
         g_object_set_data(G_OBJECT(pic), "img_id", GINT_TO_POINTER(card->img_id));
         slot_set_en_name(pic, card->en_name);
     }
-    
+
     *count = cards->len;
     update_count_label(count_label, *count);
-    
+
     g_ptr_array_free(cards, TRUE);
+}
+
+// 对指定区域的卡片进行排序
+void sort_deck_region(GPtrArray *pics, int *count, GtkLabel *count_label) {
+    sort_region_with_compare(pics, count, count_label, compare_cards);
 }
 
 // 对Extra区域的卡片进行排序（使用Extra专用排序规则）
 void sort_extra_region(GPtrArray *pics, int *count, GtkLabel *count_label) {
-    if (!pics || !count || *count <= 0) return;
-    
-    // 收集所有非空槽位的卡片数据
-    GPtrArray *cards = g_ptr_array_new_with_free_func((GDestroyNotify)free_card_sort_data);
-    
-    for (int i = 0; i < *count && i < (int)pics->len; i++) {
-        GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(pics, i));
-        int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "img_id"));
-        int card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "card_id"));
-        
-        if (img_id > 0) {
-            GdkPixbuf *pixbuf = slot_get_pixbuf(pic);
-            gboolean is_extra = slot_get_is_extra(pic);
-            
-            // 获取卡片完整信息
-            CardSortData *card_data = fetch_card_data_fast(img_id, card_id, pixbuf, is_extra);
-            if (card_data) {
-                card_data->en_name = g_strdup(slot_get_en_name(pic));
-                g_ptr_array_add(cards, card_data);
-            }
-        }
-    }
-    
-    // 使用Extra专用排序函数排序
-    g_ptr_array_sort(cards, compare_extra_cards);
-    
-    // 清空原槽位
-    for (int i = 0; i < (int)pics->len; i++) {
-        GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(pics, i));
-        slot_set_pixbuf(pic, NULL);
-        slot_set_is_extra(pic, FALSE);
-        g_object_set_data(G_OBJECT(pic), "card_id", GINT_TO_POINTER(0));
-        g_object_set_data(G_OBJECT(pic), "img_id", GINT_TO_POINTER(0));
-        slot_set_en_name(pic, NULL);
-    }
-    
-    // 按排序后的顺序重新放置卡片
-    for (guint i = 0; i < cards->len && i < pics->len; i++) {
-        CardSortData *card = g_ptr_array_index(cards, i);
-        GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(pics, i));
-        
-        if (card->pixbuf) {
-            slot_set_pixbuf(pic, card->pixbuf);
-        }
-        slot_set_is_extra(pic, card->is_extra);
-        g_object_set_data(G_OBJECT(pic), "card_id", GINT_TO_POINTER(card->card_id));
-        g_object_set_data(G_OBJECT(pic), "img_id", GINT_TO_POINTER(card->img_id));
-        slot_set_en_name(pic, card->en_name);
-    }
-    
-    *count = cards->len;
-    update_count_label(count_label, *count);
-    
-    g_ptr_array_free(cards, TRUE);
+    sort_region_with_compare(pics, count, count_label, compare_extra_cards);
 }

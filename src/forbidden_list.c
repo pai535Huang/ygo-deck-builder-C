@@ -40,23 +40,6 @@ GHashTable* load_forbidden_list(const char *filename) {
     return table;
 }
 
-// 获取卡片在指定禁限卡表中的最大数量限制
-int get_card_limit_from_table(GHashTable *forbidden_table, int card_id) {
-    if (!forbidden_table) return 3; // 无限制
-    
-    char key[32];
-    g_snprintf(key, sizeof(key), "%d", card_id);
-    
-    const char *status = (const char*)g_hash_table_lookup(forbidden_table, key);
-    if (!status) return 3; // 不在表中，无限制
-    
-    if (g_strcmp0(status, "forbidden") == 0) return 0; // 禁止
-    if (g_strcmp0(status, "limited") == 0) return 1;   // 限制1
-    if (g_strcmp0(status, "semi_limited") == 0) return 2; // 限制2
-    
-    return 3; // 默认无限制
-}
-
 // 加载禁限卡表变更信息JSON文件
 GHashTable* load_forbidden_changes(const char *filename) {
     GHashTable *table = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);

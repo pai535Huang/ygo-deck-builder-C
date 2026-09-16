@@ -2,6 +2,8 @@
 #include "app_path.h"
 #include "pixbuf_utils.h"
 #include <gdk-pixbuf/gdk-pixbuf.h>
+#include <glib/gstdio.h>
+#include <unistd.h>
 
 // 全局缓存变量
 static GHashTable *thumb_cache = NULL;       // 缩略图缓存
@@ -15,6 +17,10 @@ static GMutex cache_mutex;                   // 缓存互斥锁
 #define FULLSIZE_CACHE_MAX_ENTRIES 80
 static GQueue *thumb_cache_order = NULL;     // key(dup) FIFO，用于淘汰
 static GQueue *fullsize_cache_order = NULL;  // key(dup) FIFO，用于淘汰
+
+// 磁盘缓存文件数上限：全尺寸 PNG 每卡一张（数百 KB），
+// 万级卡片长期使用可累积至数 GB，启动时按 mtime 从旧到新清理
+#define DISK_CACHE_MAX_FILES 6000
 
 // 是否启用内存缓存：默认关闭（只用磁盘缓存），避免内存持续上涨。
 // 如需启用，设置环境变量：YGO_ENABLE_MEM_CACHE=1
@@ -61,6 +67,108 @@ static void evict_cache_if_needed(GHashTable *cache, GQueue *order, guint max_en
     }
 }
 
+// 淘汰队列入队（带去重）：g_hash_table_replace 覆盖同 key 旧值后，
+// 队列里会残留旧 key，同一 key 占两席会导致提前误淘汰
+static void cache_order_push(GQueue *order, const char *key) {
+    if (!order || !key) return;
+    GList *node = g_queue_find_custom(order, key, (GCompareFunc)strcmp);
+    if (node) {
+        g_free(node->data);
+        g_queue_delete_link(order, node);
+    }
+    g_queue_push_tail(order, g_strdup(key));
+}
+
+// 启动时的磁盘缓存清理（后台线程执行）：统计 <card_id>.png 文件数，
+// 超过上限时按 mtime 从旧到新删除；同时清理崩溃残留的临时写盘文件
+typedef struct {
+    char *name;
+    gint64 mtime;
+} DiskCacheEntry;
+
+static int disk_cache_entry_cmp(gconstpointer a, gconstpointer b) {
+    const DiskCacheEntry *ea = (const DiskCacheEntry*)a;
+    const DiskCacheEntry *eb = (const DiskCacheEntry*)b;
+    return (ea->mtime < eb->mtime) ? -1 : (ea->mtime > eb->mtime) ? 1 : 0;
+}
+
+static void disk_cache_cleanup_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object;
+    (void)cancellable;
+    const char *dir = (const char*)task_data;
+    if (!dir) {
+        g_task_return_boolean(task, FALSE);
+        return;
+    }
+
+    GDir *gdir = g_dir_open(dir, 0, NULL);
+    if (!gdir) {
+        g_task_return_boolean(task, FALSE);
+        return;
+    }
+
+    GArray *entries = g_array_new(FALSE, FALSE, sizeof(DiskCacheEntry));
+    const char *name;
+    while ((name = g_dir_read_name(gdir)) != NULL) {
+        // 崩溃残留的临时写盘文件（<id>.png.tmp.<pid>）直接删除
+        if (strstr(name, ".png.tmp.") != NULL) {
+            gchar *full = g_build_filename(dir, name, NULL);
+            g_unlink(full);
+            g_free(full);
+            continue;
+        }
+
+        // 只统计本缓存生成的 <card_id>.png
+        size_t len = strlen(name);
+        if (len <= 4 || !g_str_has_suffix(name, ".png")) continue;
+        gboolean digits_only = TRUE;
+        for (size_t i = 0; i + 4 < len; i++) {
+            if (!g_ascii_isdigit(name[i])) {
+                digits_only = FALSE;
+                break;
+            }
+        }
+        if (!digits_only) continue;
+
+        gchar *full = g_build_filename(dir, name, NULL);
+        GStatBuf st;
+        if (g_stat(full, &st) == 0 && S_ISREG(st.st_mode)) {
+            DiskCacheEntry e = { g_strdup(name), (gint64)st.st_mtime };
+            g_array_append_val(entries, e);
+        }
+        g_free(full);
+    }
+    g_dir_close(gdir);
+
+    if (entries->len > DISK_CACHE_MAX_FILES) {
+        g_array_sort(entries, disk_cache_entry_cmp);
+        guint to_delete = entries->len - DISK_CACHE_MAX_FILES;
+        for (guint i = 0; i < to_delete; i++) {
+            DiskCacheEntry *e = &g_array_index(entries, DiskCacheEntry, i);
+            gchar *full = g_build_filename(dir, e->name, NULL);
+            g_unlink(full);
+            g_free(full);
+        }
+        g_message("Disk cache cleanup: removed %u oldest image files (limit %d)",
+                  to_delete, DISK_CACHE_MAX_FILES);
+    }
+
+    for (guint i = 0; i < entries->len; i++) {
+        g_free(g_array_index(entries, DiskCacheEntry, i).name);
+    }
+    g_array_unref(entries);
+
+    g_task_return_boolean(task, TRUE);
+}
+
+static void disk_cache_cleanup_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
+    (void)source;
+    (void)user_data;
+    GError *err = NULL;
+    g_task_propagate_boolean(G_TASK(res), &err);
+    if (err) g_error_free(err);
+}
+
 // 全局取消标志（使用计数器而不是GCancellable列表）
 // 每次开始新搜索时递增，回调检查这个值来判断是否应该继续
 static guint64 global_cancel_generation = 0;
@@ -98,19 +206,20 @@ static void free_image_load_ctx(ImageLoadCtx *ctx) {
     g_free(ctx);
 }
 
+// 从 pending_downloads 中整体取走指定 URL 的等待队列，容器和元素的所有权转移给调用者。
+// 元素不在此处释放，由容器自身的元素析构函数（见 load_image_async）统一释放。
 static GPtrArray* detach_waiting_contexts(const char *url) {
     if (!url) return NULL;
 
     GPtrArray *result = NULL;
     g_mutex_lock(&cache_mutex);
     if (pending_downloads) {
-        GPtrArray *waiting = (GPtrArray*)g_hash_table_lookup(pending_downloads, url);
-        if (waiting) {
-            result = g_ptr_array_sized_new(waiting->len);
-            for (guint i = 0; i < waiting->len; i++) {
-                g_ptr_array_add(result, g_ptr_array_index(waiting, i));
-            }
-            g_hash_table_remove(pending_downloads, url);
+        gpointer orig_key = NULL, value = NULL;
+        if (g_hash_table_lookup_extended(pending_downloads, url, &orig_key, &value)) {
+            result = (GPtrArray*)value;
+            // steal 不触发 key/value 析构函数，key 需在此手动释放
+            g_hash_table_steal(pending_downloads, url);
+            g_free(orig_key);
         }
     }
     g_mutex_unlock(&cache_mutex);
@@ -119,10 +228,7 @@ static GPtrArray* detach_waiting_contexts(const char *url) {
 
 static void free_waiting_contexts(GPtrArray *waiting) {
     if (!waiting) return;
-    for (guint i = 0; i < waiting->len; i++) {
-        ImageLoadCtx *waiting_ctx = (ImageLoadCtx*)g_ptr_array_index(waiting, i);
-        free_image_load_ctx(waiting_ctx);
-    }
+    // 元素由容器的元素析构函数逐个释放（含弱指针 detach）
     g_ptr_array_unref(waiting);
 }
 
@@ -151,6 +257,15 @@ void init_image_cache(void) {
         cache_dir = g_build_filename(cache_home, "ygo-deck-builder", "images", NULL);
     }
     g_mkdir_with_parents(cache_dir, 0755);
+
+    // 启动时在后台线程执行磁盘缓存清理，不阻塞界面初始化
+    {
+        gchar *dir_copy = g_strdup(cache_dir);
+        GTask *cleanup_task = g_task_new(NULL, NULL, disk_cache_cleanup_finished, NULL);
+        g_task_set_task_data(cleanup_task, dir_copy, g_free);
+        g_task_run_in_thread(cleanup_task, disk_cache_cleanup_thread);
+        g_object_unref(cleanup_task);
+    }
 }
 
 void cleanup_image_cache(void) {
@@ -222,11 +337,16 @@ GdkPixbuf* load_from_disk_cache(int card_id) {
 void save_to_disk_cache(int card_id, GdkPixbuf *pixbuf) {
     if (!cache_dir || !pixbuf) return;
     char *filename = g_strdup_printf("%s/%d.png", cache_dir, card_id);
+    // 先写临时文件再 rename：写盘可能来自工作线程，避免并发写同一文件产生半截 PNG
+    char *tmpfile = g_strdup_printf("%s.tmp.%d", filename, (int)getpid());
     GError *err = NULL;
-    gdk_pixbuf_save(pixbuf, filename, "png", &err, NULL);
-    if (err) {
-        g_error_free(err);
+    if (gdk_pixbuf_save(pixbuf, tmpfile, "png", &err, NULL)) {
+        g_rename(tmpfile, filename);
+    } else {
+        if (err) g_error_free(err);
+        g_unlink(tmpfile);
     }
+    g_free(tmpfile);
     g_free(filename);
 }
 
@@ -292,6 +412,10 @@ void cancel_all_pending(void) {
             ImageLoadCtx *ctx = (ImageLoadCtx*)item;
 
             if (pending_downloads && ctx->url) {
+                // 移除条目时，value 析构函数 unref 等待队列，
+                // 队列的元素析构函数会逐个 detach 弱指针并释放等待中的 ctx。
+                // 若缺了这一步，等待中的 ctx 会随队列一起泄漏且弱指针悬空，
+                // 控件销毁时 GObject 会向已释放内存写 NULL（use-after-free）。
                 g_hash_table_remove(pending_downloads, ctx->url);
             }
 
@@ -356,6 +480,12 @@ static void decode_task_thread(GTask *task, gpointer source_object, gpointer tas
         }
     }
     
+    // 在工作线程完成 PNG 编码写盘：libpng 压缩单张可达数十毫秒，
+    // 留在主线程回调中会让每张新图的落地都阻塞一次 UI
+    if (pixbuf && data->ctx && data->ctx->cache_id > 0 && !is_cancelled(data->cancel_generation)) {
+        save_to_disk_cache(data->ctx->cache_id, pixbuf);
+    }
+
     if (pixbuf) {
         g_task_return_pointer(task, pixbuf, (GDestroyNotify)g_object_unref);
     } else {
@@ -425,30 +555,27 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
                 char *key = g_strdup_printf("%d", ctx->cache_id);
                 g_hash_table_replace(thumb_cache, key, g_object_ref(thumb_pixbuf ? thumb_pixbuf : pixbuf));
                 if (thumb_cache_order) {
-                    g_queue_push_tail(thumb_cache_order, g_strdup(key));
+                    cache_order_push(thumb_cache_order, key);
                     evict_cache_if_needed(thumb_cache, thumb_cache_order, THUMB_CACHE_MAX_ENTRIES);
                 }
                 g_mutex_unlock(&cache_mutex);
             }
             
-            // 保存到磁盘缓存；全尺寸内存缓存仅在启用内存缓存时写入
-            if (ctx->cache_id > 0) {
-                if (is_mem_cache_enabled()) {
-                    g_mutex_lock(&cache_mutex);
-                    char *key = g_strdup_printf("%d", ctx->cache_id);
-                    if (!fullsize_cache) {
-                        fullsize_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 
-                                                              (GDestroyNotify)g_object_unref);
-                    }
-                    g_hash_table_replace(fullsize_cache, g_strdup(key), g_object_ref(pixbuf));
-                    if (fullsize_cache_order) {
-                        g_queue_push_tail(fullsize_cache_order, g_strdup(key));
-                        evict_cache_if_needed(fullsize_cache, fullsize_cache_order, FULLSIZE_CACHE_MAX_ENTRIES);
-                    }
-                    g_mutex_unlock(&cache_mutex);
-                    g_free(key);
+            // 全尺寸内存缓存仅在启用内存缓存时写入；磁盘写盘已移至解码工作线程
+            if (ctx->cache_id > 0 && is_mem_cache_enabled()) {
+                g_mutex_lock(&cache_mutex);
+                char *key = g_strdup_printf("%d", ctx->cache_id);
+                if (!fullsize_cache) {
+                    fullsize_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                                                           (GDestroyNotify)g_object_unref);
                 }
-                save_to_disk_cache(ctx->cache_id, pixbuf);
+                g_hash_table_replace(fullsize_cache, g_strdup(key), g_object_ref(pixbuf));
+                if (fullsize_cache_order) {
+                    cache_order_push(fullsize_cache_order, key);
+                    evict_cache_if_needed(fullsize_cache, fullsize_cache_order, FULLSIZE_CACHE_MAX_ENTRIES);
+                }
+                g_mutex_unlock(&cache_mutex);
+                g_free(key);
             }
         } else if (GTK_IS_PICTURE(ctx->target)) {
             // 目标是GtkPicture（左侧预览）
@@ -506,8 +633,7 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
                 }
             }
 
-            // 无论是否取消都要清理等待上下文
-            free_image_load_ctx(waiting_ctx);
+            // 等待上下文不在此处释放，统一交给下方 unref 时容器的元素析构函数
         }
         g_ptr_array_unref(waiting);
     }
@@ -619,6 +745,8 @@ static void start_download(SoupSession *session, ImageLoadCtx *ctx) {
     SoupMessage *msg = soup_message_new("GET", ctx->url);
     if (!msg) {
         g_warning("无效的URL，无法创建soup消息: %s", ctx->url);
+        // 下载不会开始，同 URL 的等待请求永远不会被回调处理，一并释放
+        free_waiting_contexts(detach_waiting_contexts(ctx->url));
         // 清理上下文
         free_image_load_ctx(ctx);
         
@@ -693,7 +821,10 @@ void load_image_async(SoupSession *session, const char *url, ImageLoadCtx *ctx) 
     }
     
     // 创建新的等待队列
-    waiting = g_ptr_array_new();
+    // 队列拥有其中所有 ctx：数组在任何路径下被释放时（如 cancel_all_pending
+    // 移除条目、cleanup_image_cache 销毁表），元素析构函数会逐个 detach 弱指针
+    // 并释放 ctx，避免悬空弱指针在控件销毁时写已释放内存
+    waiting = g_ptr_array_new_with_free_func((GDestroyNotify)free_image_load_ctx);
     g_hash_table_insert(pending_downloads, g_strdup(url), waiting);
     g_mutex_unlock(&cache_mutex);
     

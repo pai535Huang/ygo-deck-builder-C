@@ -11,6 +11,9 @@
 
 #define CONFIG_FILE "settings.conf"
 
+// main.c：为槽位异步加载卡图（含先行卡本地异步读、内存/磁盘缓存、网络回退）
+extern void load_card_image(GtkWidget *slot, int img_id, SoupSession *session);
+
 // 导出卡组为YDK文件
 void export_deck_to_ydk(
     GPtrArray *main_pics, int main_count,
@@ -183,64 +186,10 @@ gboolean import_deck_from_ydk(
             g_object_set_data(G_OBJECT(target_pic), "card_id", GINT_TO_POINTER(img_id));
         }
         
-        // 加载卡片图片
+        // 加载卡片图片：统一走 main.c 的完全异步路径。
+        // 此前这里在主线程同步读先行卡本地文件和磁盘缓存，大型卡组导入会卡顿。
         if (img_id > 0 && session) {
-            // 检查是否是先行卡
-            JsonObject *prerelease_card = find_prerelease_card_by_id(img_id);
-            gboolean is_prerelease = (prerelease_card != NULL);
-            if (prerelease_card) {
-                json_object_unref(prerelease_card);
-            }
-            
-            if (is_prerelease) {
-                // 先行卡：从本地加载
-                gchar *local_path = get_prerelease_card_image_path(img_id);
-                if (local_path && g_file_test(local_path, G_FILE_TEST_EXISTS)) {
-                    GError *error = NULL;
-                    GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(local_path, &error);
-                    if (pixbuf) {
-                        slot_set_pixbuf(target_pic, pixbuf);
-                        g_object_unref(pixbuf);
-                    } else {
-                        if (error) {
-                            g_warning("加载先行卡图片失败: %s", error->message);
-                            g_error_free(error);
-                        }
-                    }
-                }
-                g_free(local_path);
-            } else {
-                // 普通卡：从缓存或在线加载（离线模式不影响此逻辑）
-                // 先尝试从缓存加载
-                gboolean from_mem_cache = FALSE;
-                GdkPixbuf *cached = get_thumb_from_cache(img_id);
-                if (cached) {
-                    from_mem_cache = TRUE; // 借用引用，不需要 unref
-                } else {
-                    cached = load_from_disk_cache(img_id); // 新引用，需要 unref
-                }
-                
-                if (cached) {
-                    // 缓存命中，直接设置
-                    slot_set_pixbuf(target_pic, cached);
-                    if (!from_mem_cache) {
-                        // 从磁盘缓存加载返回新引用，需要 unref
-                        g_object_unref(cached);
-                    }
-                } else {
-                    // 缓存未命中，异步加载
-                    char url[128];
-                    g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", img_id);
-                    ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
-                    ctx->stack = NULL;
-                    ctx->target = GTK_WIDGET(target_pic);
-                    ctx->scale_to_thumb = TRUE;
-                    ctx->cache_id = img_id;
-                    ctx->add_to_thumb_cache = TRUE;
-                    ctx->url = g_strdup(url);
-                    load_image_async(session, url, ctx);
-                }
-            }
+            load_card_image(target_pic, img_id, session);
         }
         
         (*target_idx)++;

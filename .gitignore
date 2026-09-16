@@ -28,3 +28,7 @@ meson-logs/
 
 # Release note
 release_notes.md
+
+# Local scratch output and agent working files
+outputs/
+.workbuddy-ai/

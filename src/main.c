@@ -261,6 +261,72 @@ static void draw_badge_if_set(GtkDrawingArea *area, cairo_t *cr,
     draw_overlay_badge(cr, width, height, *num_ptr, type);
 }
 
+// 绘制回调所需原图的后台加载任务：
+// 尺寸/HiDPI 变化时需要从磁盘缓存读原图重新生成渲染缓存，
+// 同步读盘发生在渲染路径内会直接掉帧，因此改为 GTask 后台加载。
+typedef struct {
+    GtkWidget *area;   // 弱引用
+    int img_id;
+} FullPixbufTask;
+
+static void full_pixbuf_load_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object;
+    (void)cancellable;
+    FullPixbufTask *d = (FullPixbufTask*)task_data;
+    GdkPixbuf *pixbuf = d ? load_from_disk_cache(d->img_id) : NULL;
+    if (pixbuf) {
+        g_task_return_pointer(task, pixbuf, (GDestroyNotify)g_object_unref);
+    } else {
+        g_task_return_pointer(task, NULL, NULL);
+    }
+}
+
+static void full_pixbuf_load_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
+    (void)source;
+    (void)user_data;
+    GTask *task = G_TASK(res);
+    FullPixbufTask *d = (FullPixbufTask*)g_task_get_task_data(task);
+    GError *err = NULL;
+    GdkPixbuf *pixbuf = (GdkPixbuf*)g_task_propagate_pointer(task, &err);
+    if (err) g_error_free(err);
+
+    // 槽位仍有效且 img_id 未变时才挂到控件上，待下一次绘制消费
+    if (pixbuf && d->area && GTK_IS_WIDGET(d->area) &&
+        GPOINTER_TO_INT(g_object_get_data(G_OBJECT(d->area), "img_id")) == d->img_id) {
+        g_object_set_data_full(G_OBJECT(d->area), "full_pixbuf", pixbuf, (GDestroyNotify)g_object_unref);
+        g_object_set_data(G_OBJECT(d->area), "full_pixbuf_id", GINT_TO_POINTER(d->img_id));
+        // 现有渲染缓存是按低分辨率源图生成的，尺寸未变时会让下一次绘制直接命中缓存，
+        // 原图永远不会被消费；先作废缓存，下一次绘制才会用原图重新生成
+        g_object_set_data_full(G_OBJECT(d->area), "cached_render", NULL, NULL);
+        g_object_set_data(G_OBJECT(d->area), "cached_render_w", NULL);
+        g_object_set_data(G_OBJECT(d->area), "cached_render_h", NULL);
+        g_object_set_data(G_OBJECT(d->area), "cached_render_scale", NULL);
+        gtk_widget_queue_draw(d->area);
+        pixbuf = NULL;
+    }
+    if (pixbuf) g_object_unref(pixbuf);
+    if (d->area && G_IS_OBJECT(d->area)) {
+        g_object_remove_weak_pointer(G_OBJECT(d->area), (gpointer*)&d->area);
+        g_object_set_data(G_OBJECT(d->area), "full_pixbuf_loading", GINT_TO_POINTER(0));
+    }
+    g_free(d);
+}
+
+static void start_full_pixbuf_load(GtkWidget *area, int img_id) {
+    if (!area || img_id <= 0) return;
+    // 同一控件同一张图只允许一个在途加载
+    if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(area), "full_pixbuf_loading"))) return;
+    FullPixbufTask *d = g_new0(FullPixbufTask, 1);
+    d->area = area;
+    d->img_id = img_id;
+    g_object_add_weak_pointer(G_OBJECT(area), (gpointer*)&d->area);
+    g_object_set_data(G_OBJECT(area), "full_pixbuf_loading", GINT_TO_POINTER(1));
+    GTask *task = g_task_new(NULL, NULL, full_pixbuf_load_finished, NULL);
+    g_task_set_task_data(task, d, NULL);
+    g_task_run_in_thread(task, full_pixbuf_load_thread);
+    g_object_unref(task);
+}
+
 void draw_pixbuf_scaled(GtkDrawingArea *area, cairo_t *cr, int width, int height, gpointer user_data) {
     (void)user_data;
     GdkPixbuf *pb = (GdkPixbuf*)g_object_get_data(G_OBJECT(area), "pixbuf");
@@ -307,15 +373,23 @@ void draw_pixbuf_scaled(GtkDrawingArea *area, cairo_t *cr, int width, int height
 
     // 重新生成缓存：按比例 contain 填充到 target_w x target_h
     // 若当前 pixbuf 分辨率低于目标 device-pixel 尺寸（常见于 widget 未 realize 时取到 scale=1 的预缩放），
-    // 尝试从磁盘缓存读取原图用于本次渲染，以恢复清晰度。
+    // 需要从磁盘缓存读取原图恢复清晰度；该读取已异步化，绘制路径内不允许同步磁盘 IO。
     GdkPixbuf *src_pb = pb;
     GdkPixbuf *disk_pb = NULL;
     if (gdk_pixbuf_get_width(pb) < target_w || gdk_pixbuf_get_height(pb) < target_h) {
         int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(area), "img_id"));
         if (img_id > 0) {
-            disk_pb = load_from_disk_cache(img_id);
-            if (disk_pb) {
+            // 优先消费后台线程已加载好的原图（一次性，用后释放）
+            GdkPixbuf *full = (GdkPixbuf*)g_object_get_data(G_OBJECT(area), "full_pixbuf");
+            int full_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(area), "full_pixbuf_id"));
+            if (full && full_id == img_id) {
+                disk_pb = g_object_ref(full);
                 src_pb = disk_pb;
+                g_object_set_data_full(G_OBJECT(area), "full_pixbuf", NULL, NULL);
+            } else {
+                // 原图尚未加载：后台加载，本次先用现有 pixbuf 渲染，
+                // 加载完成后 queue_draw 会触发一次清晰重绘
+                start_full_pixbuf_load(GTK_WIDGET(area), img_id);
             }
         }
     }
@@ -343,6 +417,7 @@ void draw_pixbuf_scaled(GtkDrawingArea *area, cairo_t *cr, int width, int height
     if (ty + rh > target_h) rh = target_h - ty;
     if (rw <= 0 || rh <= 0) {
         g_object_unref(pb);
+        if (disk_pb) g_object_unref(disk_pb);
         return;
     }
 
@@ -1768,8 +1843,141 @@ static void prerelease_load_finished(GObject *source, GAsyncResult *res, gpointe
     g_free(data);
 }
 
-// 辅助函数：为槽位加载卡片图片（优化：完全异步加载）
-static void load_card_image(GtkWidget *slot, int img_id, SoupSession *session) {
+// 磁盘缓存异步加载任务：悬停预览/点击加卡路径禁止在主线程做磁盘 IO。
+// 加载在工作线程进行，命中后在主线程设置图片；未命中时按原语义回退到网络加载。
+typedef struct {
+    GtkWidget *target;   // 弱引用：GtkDrawingArea（槽位）或 GtkPicture（预览）
+    GtkStack *stack;     // 弱引用：可空，命中后切到 picture 页
+    SoupSession *session;
+    int card_id;
+    gboolean scale_to_thumb;    // 网络回退 ImageLoadCtx 参数
+    gboolean add_to_thumb_cache;
+    void (*on_miss)(gpointer user_data);  // 未命中、发起网络回退前的准备（主线程调用）
+    gpointer user_data;
+} DiskCacheLoadTask;
+
+static void disk_cache_load_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object;
+    (void)cancellable;
+    DiskCacheLoadTask *d = (DiskCacheLoadTask*)task_data;
+    GdkPixbuf *pixbuf = d ? load_from_disk_cache(d->card_id) : NULL;
+    if (pixbuf) {
+        g_task_return_pointer(task, pixbuf, (GDestroyNotify)g_object_unref);
+    } else {
+        g_task_return_pointer(task, NULL, NULL);
+    }
+}
+
+static void disk_cache_load_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
+    (void)source;
+    (void)user_data;
+    GTask *task = G_TASK(res);
+    DiskCacheLoadTask *d = (DiskCacheLoadTask*)g_task_get_task_data(task);
+    GError *err = NULL;
+    GdkPixbuf *pixbuf = (GdkPixbuf*)g_task_propagate_pointer(task, &err);
+    if (err) g_error_free(err);
+
+    GtkWidget *target = d->target;
+    GtkStack *stack = d->stack;
+
+    // 目标身份校验：槽位当前 img_id 仍是请求的卡，避免槽位内容变化后旧图错写
+    gboolean still_valid = target && GTK_IS_WIDGET(target) &&
+        GPOINTER_TO_INT(g_object_get_data(G_OBJECT(target), "img_id")) == d->card_id;
+
+    if (pixbuf && still_valid) {
+        if (GTK_IS_DRAWING_AREA(target)) {
+            slot_set_pixbuf(target, pixbuf);
+            if (stack && GTK_IS_STACK(stack)) {
+                gtk_stack_set_visible_child_name(stack, "picture");
+            }
+        } else if (GTK_IS_PICTURE(target)) {
+            GdkTexture *tex = pixbuf_utils_texture_from_pixbuf(pixbuf);
+            if (tex) {
+                gtk_picture_set_paintable(GTK_PICTURE(target), GDK_PAINTABLE(tex));
+                g_object_unref(tex);
+            }
+            if (stack && GTK_IS_STACK(stack)) {
+                gtk_stack_set_visible_child_name(stack, "picture");
+            }
+        }
+    }
+
+    // 先 detach 弱指针再释放任务数据，避免悬空弱指针
+    if (d->target && G_IS_OBJECT(d->target)) {
+        g_object_remove_weak_pointer(G_OBJECT(d->target), (gpointer*)&d->target);
+    }
+    if (d->stack && G_IS_OBJECT(d->stack)) {
+        g_object_remove_weak_pointer(G_OBJECT(d->stack), (gpointer*)&d->stack);
+    }
+    SoupSession *session = d->session;
+    int card_id = d->card_id;
+    gboolean scale_to_thumb = d->scale_to_thumb;
+    gboolean add_to_thumb_cache = d->add_to_thumb_cache;
+    void (*on_miss)(gpointer) = d->on_miss;
+    gpointer miss_user_data = d->user_data;
+    g_free(d);
+
+    // 缓存未命中且目标仍需要这张卡（身份校验通过）：与原同步路径一致，回退到网络加载
+    if (!pixbuf && still_valid && session) {
+        if (on_miss) on_miss(miss_user_data);
+        char url[128];
+        g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", card_id);
+        ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
+        ctx->stack = (stack && GTK_IS_STACK(stack)) ? stack : NULL;
+        ctx->target = target;
+        g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
+        if (ctx->stack) {
+            g_object_add_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
+        }
+        ctx->scale_to_thumb = scale_to_thumb;
+        ctx->cache_id = card_id;
+        ctx->add_to_thumb_cache = add_to_thumb_cache;
+        ctx->url = g_strdup(url);
+        ctx->cancel_generation = get_cancel_generation();
+        load_image_async(session, url, ctx);
+    }
+
+    if (pixbuf) g_object_unref(pixbuf);
+}
+
+// 发起磁盘缓存异步加载；target/stack 由弱引用保护，session 不转移所有权
+static void start_disk_cache_load(GtkWidget *target, GtkStack *stack, SoupSession *session,
+                                  int card_id, gboolean scale_to_thumb, gboolean add_to_thumb_cache,
+                                  void (*on_miss)(gpointer), gpointer user_data) {
+    if (!target || !session || card_id <= 0) return;
+    DiskCacheLoadTask *t = g_new0(DiskCacheLoadTask, 1);
+    t->target = target;
+    t->stack = stack;
+    t->session = session;
+    t->card_id = card_id;
+    t->scale_to_thumb = scale_to_thumb;
+    t->add_to_thumb_cache = add_to_thumb_cache;
+    t->on_miss = on_miss;
+    t->user_data = user_data;
+    g_object_add_weak_pointer(G_OBJECT(t->target), (gpointer*)&t->target);
+    if (t->stack) {
+        g_object_add_weak_pointer(G_OBJECT(t->stack), (gpointer*)&t->stack);
+    }
+    GTask *task = g_task_new(NULL, NULL, disk_cache_load_finished, NULL);
+    g_task_set_task_data(task, t, NULL);
+    g_task_run_in_thread(task, disk_cache_load_thread);
+    g_object_unref(task);
+}
+
+// 预览图磁盘缓存未命中时的准备：切到占位页并启动 spinner
+static void preview_prepare_placeholder(gpointer user_data) {
+    SearchUI *ui = (SearchUI*)user_data;
+    if (!ui) return;
+    gtk_stack_set_visible_child_name(ui->left_stack, "placeholder");
+    if (ui->left_spinner) {
+        gtk_widget_set_visible(GTK_WIDGET(ui->left_spinner), TRUE);
+        gtk_spinner_start(ui->left_spinner);
+    }
+}
+
+// 辅助函数：为槽位加载卡片图片（完全异步加载）。
+// dnd_manager.c 的拖放入卡路径也复用此函数。
+void load_card_image(GtkWidget *slot, int img_id, SoupSession *session) {
     if (img_id <= 0 || !session || !slot) return;
     
     // 检查是否是先行卡（优先通过ID位数判断，9位数=先行卡）
@@ -1812,28 +2020,9 @@ static void load_card_image(GtkWidget *slot, int img_id, SoupSession *session) {
             return;
         }
         
-        // 内存缓存未命中，检查磁盘缓存
-        // 注意：load_from_disk_cache返回新引用，调用者需要unref
-        GdkPixbuf *disk_cached = load_from_disk_cache(img_id);
-        if (disk_cached) {
-            slot_set_pixbuf(slot, disk_cached);
-            g_object_unref(disk_cached);  // 重要：释放引用
-            return;
-        }
-        
-        // 缓存都未命中，异步从网络加载
-        char url[128];
-        g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", img_id);
-        ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
-        ctx->stack = NULL;
-        ctx->target = slot;
-        g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
-        ctx->scale_to_thumb = TRUE;
-        ctx->cache_id = img_id;
-        ctx->add_to_thumb_cache = TRUE;
-        ctx->url = g_strdup(url);
-        ctx->cancel_generation = get_cancel_generation();
-        load_image_async(session, url, ctx);
+        // 内存缓存未命中：异步检查磁盘缓存（避免主线程 IO），
+        // 未命中时由加载回调按原语义回退到网络加载
+        start_disk_cache_load(slot, NULL, session, img_id, TRUE, TRUE, NULL, NULL);
     }
 }
 
@@ -2637,34 +2826,11 @@ static void show_card_preview(SearchUI *ui, const CardPreview *pv) {
                 g_free(local_path);
             }
         } else {
-            // 普通卡：先尝试从磁盘缓存加载
-            GdkPixbuf *cached_pixbuf = load_from_disk_cache(pv->id);
-            if (cached_pixbuf) {
-                // 从缓存加载成功
-                GdkTexture *tex = pixbuf_utils_texture_from_pixbuf(cached_pixbuf);
-                if (tex) {
-                    gtk_picture_set_paintable(ui->left_picture, GDK_PAINTABLE(tex));
-                    g_object_unref(tex);
-                }
-                g_object_unref(cached_pixbuf);  // 重要：释放引用
-                gtk_stack_set_visible_child_name(ui->left_stack, "picture");
-            } else {
-                // 缓存不存在，从在线URL加载
-                char url[128];
-                g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", pv->id);
-                gtk_stack_set_visible_child_name(ui->left_stack, "placeholder");
-                if (ui->left_spinner) {
-                    gtk_widget_set_visible(GTK_WIDGET(ui->left_spinner), TRUE);
-                    gtk_spinner_start(ui->left_spinner);
-                }
-                ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
-                ctx->stack = ui->left_stack;
-                ctx->target = GTK_WIDGET(ui->left_picture);
-                ctx->scale_to_thumb = FALSE;
-                ctx->cache_id = pv->id;  // 设置cache_id以便下载后保存到缓存
-                ctx->url = g_strdup(url);
-                load_image_async(ui->session, url, ctx);
-            }
+            // 普通卡：异步从磁盘缓存加载（悬停路径，避免主线程 IO）；
+            // 记录当前预览的卡 ID，加载回调据此丢弃过期结果
+            g_object_set_data(G_OBJECT(ui->left_picture), "img_id", GINT_TO_POINTER(pv->id));
+            start_disk_cache_load(GTK_WIDGET(ui->left_picture), ui->left_stack, ui->session,
+                                  pv->id, FALSE, FALSE, preview_prepare_placeholder, ui);
         }
     }
 }
@@ -2870,25 +3036,9 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
                 slot_set_pixbuf(target_pic, cached);
                 // 注意：get_thumb_from_cache返回缓存持有的引用，不需要unref
             } else {
-                // 尝试从磁盘缓存加载
-                GdkPixbuf *disk_cached = load_from_disk_cache(pv->id);
-                if (disk_cached) {
-                    slot_set_pixbuf(target_pic, disk_cached);
-                    g_object_unref(disk_cached);  // 重要：释放引用
-                } else {
-                    // 缓存都未命中，从在线加载
-                    char url[128];
-                    g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", pv->id);
-                    ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
-                    ctx->stack = NULL;
-                    ctx->target = GTK_WIDGET(target_pic);
-                    ctx->scale_to_thumb = TRUE;
-                    ctx->cache_id = pv->id;  // 启用缓存检查和保存
-                    ctx->add_to_thumb_cache = TRUE;  // 下载后保存到缩略图缓存
-                    ctx->url = g_strdup(url);
-                    ctx->cancel_generation = get_cancel_generation();
-                    load_image_async(ui->session, url, ctx);
-                }
+                // 异步检查磁盘缓存（点击路径，避免主线程 IO），
+                // 未命中时由加载回调按原语义回退到网络加载
+                start_disk_cache_load(target_pic, NULL, ui->session, pv->id, TRUE, TRUE, NULL, NULL);
             }
         }
     }
@@ -2922,11 +3072,14 @@ void on_result_row_enter(GtkEventControllerMotion *controller, double x, double 
     if (pv) show_card_preview(ui, pv);
 }
 
-// 异步读取数据的任务结构
+// 槽位悬停在线信息请求上下文：携带派发时的悬停代次与卡片 ID，
+// 响应回调与读取完成回调只在仍然匹配时才更新预览，
+// 避免快速切换悬停后旧响应覆盖新内容（P1-4）
 typedef struct {
     SearchUI *ui;
-    GByteArray *data;
-} CardInfoReadTask;
+    int img_id;
+    guint64 generation;
+} HoverInfoCtx;
 
 // 异步读取响应数据的工作线程
 static void card_info_read_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
@@ -2949,19 +3102,22 @@ static void card_info_read_thread(GTask *task, gpointer source_object, gpointer 
 // 数据读取完成后的处理回调
 static void card_info_read_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
     (void)source;
-    SearchUI *ui = (SearchUI*)user_data;
-    
+    HoverInfoCtx *ctx = (HoverInfoCtx*)user_data;
+    SearchUI *ui = ctx ? ctx->ui : NULL;
+
     GTask *task = G_TASK(res);
     GError *err = NULL;
     GByteArray *ba = (GByteArray*)g_task_propagate_pointer(task, &err);
-    
+
     if (err) {
         g_error_free(err);
+        g_free(ctx);
         return;
     }
-    
+
     if (!ba || ba->len == 0) {
         if (ba) g_byte_array_unref(ba);
+        g_free(ctx);
         return;
     }
     
@@ -3009,9 +3165,12 @@ static void card_info_read_finished(GObject *source, GAsyncResult *res, gpointer
                 }
             }
             
-            // 显示卡片预览
-            show_card_preview(ui, &pv);
-            
+            // 代次与卡片校验：悬停已切换到其他卡则丢弃过期结果
+            if (ui && ctx->generation == ui->hover_generation &&
+                ui->hovered_slot_img_id == ctx->img_id) {
+                show_card_preview(ui, &pv);
+            }
+
             // 释放临时字符串
             g_free(pv.cn_name);
             g_free(pv.types);
@@ -3022,21 +3181,37 @@ static void card_info_read_finished(GObject *source, GAsyncResult *res, gpointer
     if (jerr) g_error_free(jerr);
     g_object_unref(parser);  // 重要：释放JSON解析器
     g_byte_array_unref(ba);  // 重要：释放字节数组
+    g_free(ctx);
 }
 
 // 中栏卡图悬浮事件：异步回调（优化版：使用异步读取）
 static void on_slot_card_info_received(GObject *source, GAsyncResult *res, gpointer user_data) {
     SoupSession *session = SOUP_SESSION(source);
-    SearchUI *ui = (SearchUI*)user_data;
+    HoverInfoCtx *ctx = (HoverInfoCtx*)user_data;
+    SearchUI *ui = ctx ? ctx->ui : NULL;
     GError *err = NULL;
     GBytes *body = soup_session_send_and_read_finish(session, res, &err);
-    if (!body) {
-        if (err) g_error_free(err); 
-        return; 
+
+    // 非 2xx（错误页/限流页）不当作有效数据解析
+    SoupMessage *msg = soup_session_get_async_result_message(session, res);
+    if (body && msg && !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(msg))) {
+        g_bytes_unref(body);
+        body = NULL;
     }
-    
-    // 使用GTask异步读取数据，避免阻塞主线程
-    GTask *task = g_task_new(NULL, NULL, card_info_read_finished, ui);
+
+    // 悬停已切换（代次变化或当前悬停的不是请求的卡）：丢弃过期响应
+    if (!ui || !body ||
+        ctx->generation != ui->hover_generation ||
+        ui->hovered_slot_img_id != ctx->img_id) {
+        if (body) g_bytes_unref(body);
+        if (err) g_error_free(err);
+        g_free(ctx);
+        return;
+    }
+    if (err) g_error_free(err);
+
+    // 使用GTask异步读取数据，避免阻塞主线程；ctx 所有权转移给读取完成回调
+    GTask *task = g_task_new(NULL, NULL, card_info_read_finished, ctx);
     g_task_set_task_data(task, body, (GDestroyNotify)g_bytes_unref);
     g_task_run_in_thread(task, card_info_read_thread);
     g_object_unref(task);
@@ -3046,7 +3221,8 @@ static void on_slot_card_info_received(GObject *source, GAsyncResult *res, gpoin
 static void on_slot_enter(GtkEventControllerMotion *controller, double x, double y, gpointer user_data) {
     (void)x; (void)y;
     SearchUI *ui = (SearchUI*)user_data;
-    if (ui && ui->deck_drag_depth > 0) return;
+    if (!ui) return;
+    if (ui->deck_drag_depth > 0) return;
 
     GtkWidget *pic = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(controller));
     
@@ -3102,12 +3278,16 @@ static void on_slot_enter(GtkEventControllerMotion *controller, double x, double
     // 构造 API URL
     char url[256];
     g_snprintf(url, sizeof url, "https://ygocdb.com/api/v0/card/%d", img_id);
-    
-    // 发起异步请求
+
+    // 发起异步请求（携带悬停代次与卡片 ID，回调据此丢弃过期响应）
     SoupMessage *msg = soup_message_new("GET", url);
     if (!msg) return;
-    
-    soup_session_send_and_read_async(ui->session, msg, G_PRIORITY_DEFAULT, NULL, on_slot_card_info_received, ui);
+
+    HoverInfoCtx *ctx = g_new0(HoverInfoCtx, 1);
+    ctx->ui = ui;
+    ctx->img_id = img_id;
+    ctx->generation = ++ui->hover_generation;
+    soup_session_send_and_read_async(ui->session, msg, G_PRIORITY_DEFAULT, NULL, on_slot_card_info_received, ctx);
     g_object_unref(msg);
 }
 
@@ -3390,10 +3570,11 @@ static void on_show_forbidden_changes_action(GSimpleAction *action, GVariant *pa
     guint len = json_array_get_length(all_cards);
     guint shown = 0;
     for (guint i = 0; i < len; i++) {
-        JsonObject *card = json_array_get_object_element(all_cards, i);
-        if (!card) {
+        JsonNode *card_node = json_array_get_element(all_cards, i);
+        if (!card_node || !JSON_NODE_HOLDS_OBJECT(card_node)) {
             continue;
         }
+        JsonObject *card = json_node_get_object(card_node);
 
         int cid = 0;
         if (json_object_has_member(card, "cid")) {
@@ -3417,10 +3598,13 @@ static void on_show_forbidden_changes_action(GSimpleAction *action, GVariant *pa
             continue;
         }
 
-        JsonObject *marked_item = json_object_ref(card);
+        // 卡片对象来自共享离线缓存，不能直接修改（会污染缓存），
+        // 仅对命中的卡片深拷贝后追加变更标记
+        JsonNode *marked_node = json_node_copy(card_node);
+        JsonObject *marked_item = json_node_get_object(marked_node);
         json_object_set_string_member(marked_item, "forbidden_change", change_str);
         queue_result_for_render(ui, marked_item);
-        json_object_unref(marked_item);
+        json_node_free(marked_node);  // 渲染队列持有自己的引用
         shown++;
     }
 
@@ -3458,6 +3642,38 @@ static GtkWidget* make_section_header(const char *title_text) {
     gtk_box_append(GTK_BOX(box), sep);
     gtk_box_append(GTK_BOX(box), row);
     return box;
+}
+
+// 为单个卡组区域的全部槽位接线控制器：
+// 右键点击删除、拖拽源、放置目标、悬停预览（main/extra/side 三段重复代码合并）
+static void wire_slot_controllers(GPtrArray *pics, SearchUI *sui) {
+    if (!pics) return;
+    for (guint i = 0; i < pics->len; ++i) {
+        GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(pics, i));
+        // 右键点击手势：记录按下位置，released 结合位移判断删除
+        GtkGesture *slot_click = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(slot_click), 3);
+        g_signal_connect(slot_click, "pressed", G_CALLBACK(on_slot_pressed), sui);
+        g_signal_connect(slot_click, "released", G_CALLBACK(on_slot_clicked), sui);
+        gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(slot_click));
+        // 拖拽源
+        GtkDragSource *ds = gtk_drag_source_new();
+        gtk_drag_source_set_actions(ds, GDK_ACTION_MOVE);
+        g_signal_connect(ds, "prepare", G_CALLBACK(on_drag_prepare), NULL);
+        g_signal_connect(ds, "drag-begin", G_CALLBACK(on_deck_drag_begin), sui);
+        g_signal_connect(ds, "drag-end", G_CALLBACK(on_deck_drag_end), sui);
+        g_signal_connect(ds, "drag-cancel", G_CALLBACK(on_deck_drag_cancel), sui);
+        gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(ds));
+        // 放置目标
+        GtkDropTarget *dt = gtk_drop_target_new(G_TYPE_STRING, GDK_ACTION_COPY | GDK_ACTION_MOVE);
+        g_signal_connect(dt, "accept", G_CALLBACK(on_drop_accept), NULL);
+        g_signal_connect(dt, "drop", G_CALLBACK(on_drop), sui);
+        gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(dt));
+        // 悬停预览
+        GtkEventController *motion = GTK_EVENT_CONTROLLER(gtk_event_controller_motion_new());
+        g_signal_connect(motion, "enter", G_CALLBACK(on_slot_enter), sui);
+        gtk_widget_add_controller(pic, motion);
+    }
 }
 
 static void
@@ -4055,86 +4271,10 @@ on_activate(GApplication *app, gpointer user_data)
     sui->extra_count = GTK_LABEL(g_object_get_data(G_OBJECT(extra_header), "count_label"));
     sui->side_count  = GTK_LABEL(g_object_get_data(G_OBJECT(side_header), "count_label"));
 
-    // 为槽位点击事件设置 user_data 指向 SearchUI
-    if (sui->main_pics) {
-        for (guint i = 0; i < sui->main_pics->len; ++i) {
-            GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(sui->main_pics, i));
-            GtkGesture *slot_click = gtk_gesture_click_new();
-            gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(slot_click), 3);
-            // 记录右键按下位置
-            g_signal_connect(slot_click, "pressed", G_CALLBACK(on_slot_pressed), sui);
-            // 使用 released，结合位移判断触发右键删除
-            g_signal_connect(slot_click, "released", G_CALLBACK(on_slot_clicked), sui);
-            gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(slot_click));
-            // Drag source
-            GtkDragSource *ds = gtk_drag_source_new();
-            gtk_drag_source_set_actions(ds, GDK_ACTION_MOVE);
-            g_signal_connect(ds, "prepare", G_CALLBACK(on_drag_prepare), NULL);
-            g_signal_connect(ds, "drag-begin", G_CALLBACK(on_deck_drag_begin), sui);
-            g_signal_connect(ds, "drag-end", G_CALLBACK(on_deck_drag_end), sui);
-            g_signal_connect(ds, "drag-cancel", G_CALLBACK(on_deck_drag_cancel), sui);
-            gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(ds));
-            // Drop target
-            GtkDropTarget *dt = gtk_drop_target_new(G_TYPE_STRING, GDK_ACTION_COPY | GDK_ACTION_MOVE);
-            g_signal_connect(dt, "accept", G_CALLBACK(on_drop_accept), NULL);
-            g_signal_connect(dt, "drop", G_CALLBACK(on_drop), sui);
-            gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(dt));
-            // Motion controller for hover preview
-            GtkEventController *motion = GTK_EVENT_CONTROLLER(gtk_event_controller_motion_new());
-            g_signal_connect(motion, "enter", G_CALLBACK(on_slot_enter), sui);
-            gtk_widget_add_controller(pic, motion);
-        }
-    }
-    if (sui->extra_pics) {
-        for (guint i = 0; i < sui->extra_pics->len; ++i) {
-            GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(sui->extra_pics, i));
-            GtkGesture *slot_click = gtk_gesture_click_new();
-            gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(slot_click), 3);
-            g_signal_connect(slot_click, "pressed", G_CALLBACK(on_slot_pressed), sui);
-            g_signal_connect(slot_click, "released", G_CALLBACK(on_slot_clicked), sui);
-            gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(slot_click));
-            GtkDragSource *ds = gtk_drag_source_new();
-            gtk_drag_source_set_actions(ds, GDK_ACTION_MOVE);
-            g_signal_connect(ds, "prepare", G_CALLBACK(on_drag_prepare), NULL);
-            g_signal_connect(ds, "drag-begin", G_CALLBACK(on_deck_drag_begin), sui);
-            g_signal_connect(ds, "drag-end", G_CALLBACK(on_deck_drag_end), sui);
-            g_signal_connect(ds, "drag-cancel", G_CALLBACK(on_deck_drag_cancel), sui);
-            gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(ds));
-            GtkDropTarget *dt = gtk_drop_target_new(G_TYPE_STRING, GDK_ACTION_COPY | GDK_ACTION_MOVE);
-            g_signal_connect(dt, "accept", G_CALLBACK(on_drop_accept), NULL);
-            g_signal_connect(dt, "drop", G_CALLBACK(on_drop), sui);
-            gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(dt));
-            // Motion controller for hover preview
-            GtkEventController *motion = GTK_EVENT_CONTROLLER(gtk_event_controller_motion_new());
-            g_signal_connect(motion, "enter", G_CALLBACK(on_slot_enter), sui);
-            gtk_widget_add_controller(pic, motion);
-        }
-    }
-    if (sui->side_pics) {
-        for (guint i = 0; i < sui->side_pics->len; ++i) {
-            GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(sui->side_pics, i));
-            GtkGesture *slot_click = gtk_gesture_click_new();
-            gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(slot_click), 3);
-            g_signal_connect(slot_click, "pressed", G_CALLBACK(on_slot_pressed), sui);
-            g_signal_connect(slot_click, "released", G_CALLBACK(on_slot_clicked), sui);
-            gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(slot_click));
-            GtkDragSource *ds = gtk_drag_source_new();
-            gtk_drag_source_set_actions(ds, GDK_ACTION_MOVE);
-            g_signal_connect(ds, "prepare", G_CALLBACK(on_drag_prepare), NULL);
-            g_signal_connect(ds, "drag-begin", G_CALLBACK(on_deck_drag_begin), sui);
-            g_signal_connect(ds, "drag-end", G_CALLBACK(on_deck_drag_end), sui);
-            g_signal_connect(ds, "drag-cancel", G_CALLBACK(on_deck_drag_cancel), sui);
-            gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(ds));
-            GtkDropTarget *dt = gtk_drop_target_new(G_TYPE_STRING, GDK_ACTION_COPY | GDK_ACTION_MOVE);
-            g_signal_connect(dt, "accept", G_CALLBACK(on_drop_accept), NULL);
-            g_signal_connect(dt, "drop", G_CALLBACK(on_drop), sui);
-            gtk_widget_add_controller(pic, GTK_EVENT_CONTROLLER(dt));
-            // Motion controller for hover preview
-            GtkEventController *motion = GTK_EVENT_CONTROLLER(gtk_event_controller_motion_new());
-            g_signal_connect(motion, "enter", G_CALLBACK(on_slot_enter), sui);
-            gtk_widget_add_controller(pic, motion);
-        }
-    }
+    // 为三个卡组区域的槽位接线控制器
+    wire_slot_controllers(sui->main_pics, sui);
+    wire_slot_controllers(sui->extra_pics, sui);
+    wire_slot_controllers(sui->side_pics, sui);
 
     adw_toolbar_view_set_content(toolbar_view, GTK_WIDGET(outer));
     
@@ -4208,5 +4348,10 @@ main(int argc, char *argv[])
     personal_konami_id = load_personal_konami_id();
 
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
-    return g_application_run(G_APPLICATION(app), argc, argv);
+    int result = g_application_run(G_APPLICATION(app), argc, argv);
+
+    // 退出时清理图片加载器的挂起请求、等待队列与缓存（P2-2）：
+    // 挂起 ctx 的弱指针在此统一 detach，避免退出阶段控件销毁时悬空访问
+    cleanup_image_cache();
+    return result;
 }

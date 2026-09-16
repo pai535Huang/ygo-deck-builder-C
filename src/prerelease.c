@@ -2,6 +2,7 @@
 #include "app_path.h"
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
+#include <glib/gstdio.h>
 #include <sqlite3.h>
 #include <archive.h>
 #include <archive_entry.h>
@@ -13,6 +14,77 @@
 
 #define PRERELEASE_URL "https://cdntx.moecube.com/ygopro-super-pre/archive/ygopro-super-pre.ypk"
 #define PRERELEASE_JSON_FILENAME "pre-release.json"
+
+// 先行卡 JSON 解析共享缓存：
+// find_prerelease_card_by_id 会被逐卡调用（如排序 60 张卡会调用 60 次），
+// 每次都重新解析整个 JSON 文件的开销极大；参照 offline_data.c 的模式缓存解析结果，
+// 以文件 mtime 判断是否需要重载（先行卡下载更新后自动失效）。
+static GMutex prerelease_cache_mutex;
+static JsonParser *prerelease_parser = NULL;
+static JsonArray *prerelease_root_array = NULL; // owned by parser->root
+static gchar *prerelease_json_path = NULL;
+static gint64 prerelease_json_mtime = 0;
+
+static gchar *get_prerelease_json_path(void);
+
+static gint64 prerelease_stat_mtime(const char *path) {
+    if (!path) return 0;
+    GStatBuf st;
+    if (g_stat(path, &st) != 0) return 0;
+    return (gint64)st.st_mtime * 1000000;
+}
+
+// 必须持有 prerelease_cache_mutex 调用
+static gboolean prerelease_cache_ensure_loaded_locked(void) {
+    gchar *json_path = get_prerelease_json_path();
+    if (!json_path || !g_file_test(json_path, G_FILE_TEST_EXISTS)) {
+        g_free(json_path);
+        return FALSE;
+    }
+
+    gint64 mtime = prerelease_stat_mtime(json_path);
+    gboolean need_reload = (prerelease_parser == NULL) ||
+                           (prerelease_root_array == NULL) ||
+                           (prerelease_json_path == NULL) ||
+                           (g_strcmp0(prerelease_json_path, json_path) != 0) ||
+                           (prerelease_json_mtime != mtime);
+    if (!need_reload) {
+        g_free(json_path);
+        return TRUE;
+    }
+
+    if (prerelease_parser) {
+        g_object_unref(prerelease_parser);
+        prerelease_parser = NULL;
+    }
+    prerelease_root_array = NULL;
+    g_clear_pointer(&prerelease_json_path, g_free);
+    prerelease_json_mtime = 0;
+
+    JsonParser *parser = json_parser_new();
+    GError *error = NULL;
+    if (!json_parser_load_from_file(parser, json_path, &error)) {
+        g_warning("Failed to load pre-release JSON: %s", error ? error->message : "unknown error");
+        if (error) g_error_free(error);
+        g_object_unref(parser);
+        g_free(json_path);
+        return FALSE;
+    }
+
+    JsonNode *root = json_parser_get_root(parser);
+    if (!root || !JSON_NODE_HOLDS_ARRAY(root)) {
+        g_warning("Invalid JSON structure in pre-release JSON");
+        g_object_unref(parser);
+        g_free(json_path);
+        return FALSE;
+    }
+
+    prerelease_parser = parser;
+    prerelease_root_array = json_node_get_array(root);
+    prerelease_json_path = json_path; // take ownership
+    prerelease_json_mtime = mtime;
+    return TRUE;
+}
 
 /**
  * 获取先行卡数据目录的绝对路径
@@ -504,63 +576,44 @@ JsonArray* search_prerelease_cards(const char *search_query) {
     if (!search_query || *search_query == '\0') {
         return NULL;
     }
-    
-    gchar *json_path = get_prerelease_json_path();
-    if (!json_path || !g_file_test(json_path, G_FILE_TEST_EXISTS)) {
-        g_free(json_path);
-        return NULL;
-    }
-    
-    JsonParser *parser = json_parser_new();
-    GError *error = NULL;
-    
-    if (!json_parser_load_from_file(parser, json_path, &error)) {
-        g_warning("Failed to load pre-release JSON: %s", error->message);
-        g_error_free(error);
-        g_object_unref(parser);
-        g_free(json_path);
-        return NULL;
-    }
-    
-    g_free(json_path);
-    
-    JsonNode *root = json_parser_get_root(parser);
-    if (!root || !JSON_NODE_HOLDS_ARRAY(root)) {
-        g_object_unref(parser);
-        return NULL;
-    }
-    
-    JsonArray *all_cards = json_node_get_array(root);
+
     JsonArray *results = json_array_new();
-    
+
+    g_mutex_lock(&prerelease_cache_mutex);
+    if (!prerelease_cache_ensure_loaded_locked() || !prerelease_root_array) {
+        g_mutex_unlock(&prerelease_cache_mutex);
+        json_array_unref(results);
+        return NULL;
+    }
+
     // 转换搜索词为小写以进行不区分大小写的搜索
     gchar *query_lower = g_utf8_strdown(search_query, -1);
-    
-    guint len = json_array_get_length(all_cards);
+
+    guint len = json_array_get_length(prerelease_root_array);
     for (guint i = 0; i < len; i++) {
-        JsonObject *card = json_array_get_object_element(all_cards, i);
+        JsonObject *card = json_array_get_object_element(prerelease_root_array, i);
         if (!card) continue;
-        
+
         gboolean match = FALSE;
-        
+
         // 检查ID匹配
         if (g_str_has_prefix(query_lower, "id:") || g_ascii_isdigit(search_query[0])) {
             const char *id_str = strchr(search_query, ':');
             if (id_str) id_str++; // 跳过冒号
             else id_str = search_query;
-            
+
             int query_id = atoi(id_str);
             int card_id = json_object_get_int_member(card, "id");
-            
+
             if (card_id == query_id) {
                 match = TRUE;
             }
         }
-        
+
         // 检查名称和描述匹配
         if (!match && json_object_has_member(card, "text")) {
             JsonObject *text = json_object_get_object_member(card, "text");
-            
+
             if (json_object_has_member(text, "name")) {
                 const char *name = json_object_get_string_member(text, "name");
                 gchar *name_lower = g_utf8_strdown(name, -1);
@@ -569,7 +622,7 @@ JsonArray* search_prerelease_cards(const char *search_query) {
                 }
                 g_free(name_lower);
             }
-            
+
             if (!match && json_object_has_member(text, "desc")) {
                 const char *desc = json_object_get_string_member(text, "desc");
                 gchar *desc_lower = g_utf8_strdown(desc, -1);
@@ -579,106 +632,62 @@ JsonArray* search_prerelease_cards(const char *search_query) {
                 g_free(desc_lower);
             }
         }
-        
+
         if (match) {
             json_array_add_object_element(results, json_object_ref(card));
         }
     }
-    
+
     g_free(query_lower);
-    g_object_unref(parser);
-    
+    g_mutex_unlock(&prerelease_cache_mutex);
+
     return results;
 }
 
 JsonArray* get_all_prerelease_cards(void) {
-    gchar *json_path = get_prerelease_json_path();
-    if (!json_path || !g_file_test(json_path, G_FILE_TEST_EXISTS)) {
-        g_free(json_path);
-        return NULL;
-    }
-    
-    JsonParser *parser = json_parser_new();
-    GError *error = NULL;
-    
-    if (!json_parser_load_from_file(parser, json_path, &error)) {
-        g_warning("Failed to load pre-release JSON: %s", error->message);
-        g_error_free(error);
-        g_object_unref(parser);
-        g_free(json_path);
-        return NULL;
-    }
-    
-    g_free(json_path);
-    
-    JsonNode *root = json_parser_get_root(parser);
-    if (!root || !JSON_NODE_HOLDS_ARRAY(root)) {
-        g_object_unref(parser);
-        return NULL;
-    }
-    
-    JsonArray *all_cards = json_node_get_array(root);
     JsonArray *results = json_array_new();
-    
-    // 复制所有卡片到结果数组
-    guint len = json_array_get_length(all_cards);
+
+    g_mutex_lock(&prerelease_cache_mutex);
+    if (!prerelease_cache_ensure_loaded_locked() || !prerelease_root_array) {
+        g_mutex_unlock(&prerelease_cache_mutex);
+        json_array_unref(results);
+        return NULL;
+    }
+
+    guint len = json_array_get_length(prerelease_root_array);
     for (guint i = 0; i < len; i++) {
-        JsonObject *card = json_array_get_object_element(all_cards, i);
+        JsonObject *card = json_array_get_object_element(prerelease_root_array, i);
         if (card) {
             json_array_add_object_element(results, json_object_ref(card));
         }
     }
-    
-    g_object_unref(parser);
-    
+
+    g_mutex_unlock(&prerelease_cache_mutex);
+
     return results;
 }
 
 JsonObject* find_prerelease_card_by_id(int card_id) {
-    gchar *json_path = get_prerelease_json_path();
-    if (!json_path || !g_file_test(json_path, G_FILE_TEST_EXISTS)) {
-        g_free(json_path);
-        return NULL;
-    }
-    
-    JsonParser *parser = json_parser_new();
-    GError *error = NULL;
-    
-    if (!json_parser_load_from_file(parser, json_path, &error)) {
-        g_warning("Failed to load pre-release JSON: %s", error->message);
-        g_error_free(error);
-        g_object_unref(parser);
-        g_free(json_path);
-        return NULL;
-    }
-    
-    g_free(json_path);
-    
-    JsonNode *root = json_parser_get_root(parser);
-    if (!root || !JSON_NODE_HOLDS_ARRAY(root)) {
-        g_object_unref(parser);
-        return NULL;
-    }
-    
-    JsonArray *all_cards = json_node_get_array(root);
     JsonObject *found_card = NULL;
-    
-    guint len = json_array_get_length(all_cards);
-    for (guint i = 0; i < len; i++) {
-        JsonObject *card = json_array_get_object_element(all_cards, i);
-        if (!card) continue;
-        
-        if (json_object_has_member(card, "id")) {
-            int id = json_object_get_int_member(card, "id");
-            if (id == card_id) {
-                found_card = json_object_ref(card);
-                break;
+
+    g_mutex_lock(&prerelease_cache_mutex);
+    if (prerelease_cache_ensure_loaded_locked() && prerelease_root_array) {
+        guint len = json_array_get_length(prerelease_root_array);
+        for (guint i = 0; i < len; i++) {
+            JsonObject *card = json_array_get_object_element(prerelease_root_array, i);
+            if (!card) continue;
+
+            if (json_object_has_member(card, "id")) {
+                int id = json_object_get_int_member(card, "id");
+                if (id == card_id) {
+                    found_card = json_object_ref(card);
+                    break;
+                }
             }
         }
     }
-    
-    g_object_unref(parser);
-    
+    g_mutex_unlock(&prerelease_cache_mutex);
+
     return found_card;
 }
 
@@ -687,8 +696,10 @@ gchar* get_prerelease_card_image_path(int card_id) {
     if (!data_dir) {
         return NULL;
     }
-    
-    gchar *image_path = g_build_filename(data_dir, "pics", g_strdup_printf("%d.jpg", card_id), NULL);
+
+    gchar *filename = g_strdup_printf("%d.jpg", card_id);
+    gchar *image_path = g_build_filename(data_dir, "pics", filename, NULL);
+    g_free(filename);
     g_free(data_dir);
     
     // 检查文件是否存在

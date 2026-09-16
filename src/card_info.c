@@ -83,8 +83,9 @@
 
 // 返回类别字符串，多个类别用逗号分隔
 void get_card_types(uint32_t type, char* out, size_t out_size) {
+    if (!out || out_size == 0) return;
     out[0] = '\0';
-    int first = 1;
+    GString *s = g_string_new(NULL);
     struct {
         uint32_t value;
         const char* name;
@@ -118,11 +119,12 @@ void get_card_types(uint32_t type, char* out, size_t out_size) {
     size_t n_types = sizeof(type_map) / sizeof(type_map[0]);
     for (size_t i = 0; i < n_types; ++i) {
         if (type & type_map[i].value) {
-            if (!first) strncat(out, ",", out_size - strlen(out) - 1);
-            strncat(out, type_map[i].name, out_size - strlen(out) - 1);
-            first = 0;
+            if (s->len > 0) g_string_append_c(s, ',');
+            g_string_append(s, type_map[i].name);
         }
     }
+    g_strlcpy(out, s->str, out_size);
+    g_string_free(s, TRUE);
 }
 
 // 返回属性字符串
@@ -213,8 +215,9 @@ void parse_level_and_scales(uint32_t level, int* out_level, int* left_scale, int
 // 从连接怪兽的 def 字段解析连接箭头
 // 返回箭头描述字符串，多个箭头用逗号分隔
 void get_link_markers(uint32_t def_value, char* out, size_t out_size) {
+    if (!out || out_size == 0) return;
     out[0] = '\0';
-    int first = 1;
+    GString *s = g_string_new(NULL);
     struct {
         uint32_t value;
         const char* name;
@@ -231,11 +234,12 @@ void get_link_markers(uint32_t def_value, char* out, size_t out_size) {
     size_t n_markers = sizeof(marker_map) / sizeof(marker_map[0]);
     for (size_t i = 0; i < n_markers; ++i) {
         if (def_value & marker_map[i].value) {
-            if (!first) strncat(out, ",", out_size - strlen(out) - 1);
-            strncat(out, marker_map[i].name, out_size - strlen(out) - 1);
-            first = 0;
+            if (s->len > 0) g_string_append_c(s, ',');
+            g_string_append(s, marker_map[i].name);
         }
     }
+    g_strlcpy(out, s->str, out_size);
+    g_string_free(s, TRUE);
 }
 
 // 从魔法类别字符串获取对应的type值
