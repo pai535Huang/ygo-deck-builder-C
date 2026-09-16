@@ -60,9 +60,15 @@
 4. 	```bash
 	meson compile -C build
 	```
-5. 	```bash
+5. （可选）运行单元测试：
+	```bash
+	meson test -C build
+	```
+6. 	```bash
 	./build/src/ygo-deck-builder
 	```
+
+`tests/` 下的单元测试覆盖卡组 URL 编解码、压缩包条目名安全性（Zip Slip）、JsonNode 深拷贝独立性与 `strings.conf` 字段解析。
 
 安装方法（包括系统级安装和便携模式）参见 [INSTALL.md](INSTALL.md)。
 

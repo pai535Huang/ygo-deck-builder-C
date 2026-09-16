@@ -140,13 +140,15 @@ if (deck_decode_from_url(url,
 
 ## 测试验证
 
-已通过以下测试：
-- ✅ 简单卡组编码/解码
-- ✅ 空卡组处理
-- ✅ 复杂卡组（多种类卡片）
-- ✅ 真实YGO-DA协议URL解码
+自动化测试见 `tests/test_deck_url.c`，随 `meson test -C build` 一起运行，覆盖：
 
-测试示例URL：
+- ✅ 编码→解码往返（文档示例卡组、多种类卡片合并）
+- ✅ 空卡组处理
+- ✅ 协议边界：27 位卡片 ID 上限（超范围卡片被跳过）、单卡数量上限（按 3 张编码）
+- ✅ 非法输入：缺少 `ygotype=deck`、Base64Url 非法字符、数据长度不足
+
+以下真实卡组 URL 为手工验证：
+
 ```
 http://deck.ourygo.top?ygotype=deck&v=1&d=FNhefVLXC2RMpY_w-43iOvy2SnXARcGDa4Gf-WWVKlHxmGQN9gbi5Y-FDdvkNIpufUXGkPmlV3n70HzV3OV58le_LRnThgSJlIImmKZAMuPJSqBUEax8yF1rIQy7GidRET65azdhGIVy2w4rI9b5cwTxrZ5JsWGN-uRnxrXZ0jdujdvkOJ9zVDCtMtezkT-6CuKtQso-yA
 ```
@@ -161,8 +163,13 @@ http://deck.ourygo.top?ygotype=deck&v=1&d=FNhefVLXC2RMpY_w-43iOvy2SnXARcGDa4Gf-W
    - 额外卡组：最多15种（4位）
    - 副卡组：最多15种（4位）
 3. 卡片ID范围：0-134217727（27位二进制）
-4. 自动排序：编码时会自动将相同ID的卡片合并
-5. 内存管理：所有返回的字符串和数组都需要调用者使用`g_free()`释放
+4. 超出上限时的处理：编码侧不回绕，而是跳过或截断并打印警告——
+   卡片ID超出 27 位范围（负数、先行卡的 9 位编码等）的卡片会被跳过，
+   单卡数量超过 3 张时按 3 张编码。因此 `deck_encode_to_url()` 的结果可能与
+   输入不完全一致，调用方无需自行预检。
+5. 解码侧只匹配 `?d=` 或 `&d=` 形式的参数，避免误读其他以 `d` 结尾的参数名。
+6. 自动排序：编码时会自动将相同ID的卡片合并
+7. 内存管理：所有返回的字符串和数组都需要调用者使用`g_free()`释放
 
 ## 相关文件
 
