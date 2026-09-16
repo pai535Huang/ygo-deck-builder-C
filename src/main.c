@@ -46,6 +46,7 @@
 #include "dnd_manager.h"
 #include "search_filter.h"
 #include "deck_url.h"
+#include "json_utils.h"
 
 // 全局变量：程序所在目录
 static char *program_directory = NULL;
@@ -579,6 +580,12 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
     else if (g_strcmp0(to_region, "extra") == 0) { to_arr = ui->extra_pics; to_count = &ui->extra_idx; to_label = ui->extra_count; }
     else if (g_strcmp0(to_region, "side") == 0) { to_arr = ui->side_pics; to_count = &ui->side_idx; to_label = ui->side_count; }
 
+    // 区域名与下标来自拖放 payload（任意应用都可提供 G_TYPE_STRING），必须校验：
+    // 未识别的区域名会让数组为 NULL，越界的下标会读越界内存（g_ptr_array_index
+    // 不做边界检查），随后对野指针调用 g_object_get_data 会崩溃。
+    if (!from_arr || !from_count || !to_arr || !to_count) return;
+    if (from_index < 0 || from_index >= *from_count || from_index >= (int)from_arr->len) return;
+    if (to_index < 0 || to_index >= (int)to_arr->len) return;
 
     GtkWidget *from_widget = GTK_WIDGET(g_ptr_array_index(from_arr, from_index));
     GdkPixbuf *moving_pb = slot_get_pixbuf(from_widget);
@@ -737,26 +744,15 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
                     }
                 }
             }
-            if (place_index < *to_count) {
-                int end_to = *to_count - 1;
-                if (end_to >= 0) {
-                    array_shift_right(to_arr, place_index, end_to);
-                }
-                GtkWidget *place_w = GTK_WIDGET(g_ptr_array_index(to_arr, place_index));
-                slot_set_pixbuf(place_w, moving_pb_ref);
-                slot_set_is_extra(place_w, moving_is_extra);
-                g_object_set_data(G_OBJECT(place_w), "card_id", GINT_TO_POINTER(moving_card_id));
-                g_object_set_data(G_OBJECT(place_w), "img_id", GINT_TO_POINTER(moving_img_id));
-                slot_set_en_name(place_w, moving_en_name);
-            } else {
-                // place at first empty slot and increase count
-                GtkWidget *place_w = GTK_WIDGET(g_ptr_array_index(to_arr, place_index));
-                slot_set_pixbuf(place_w, moving_pb_ref);
-                slot_set_is_extra(place_w, moving_is_extra);
-                g_object_set_data(G_OBJECT(place_w), "card_id", GINT_TO_POINTER(moving_card_id));
-                g_object_set_data(G_OBJECT(place_w), "img_id", GINT_TO_POINTER(moving_img_id));
-                slot_set_en_name(place_w, moving_en_name);
-            }
+            // 此分支的 place_index 必然指向空槽位（目标槽为空，或扫描到的第一个空槽），
+            // 因此无需右移：此前的 array_shift_right(end = *to_count-1) 会覆盖末张卡、
+            // 使其静默丢失。计数只在扩展到新槽位时增加，填入空洞时不变。
+            GtkWidget *place_w = GTK_WIDGET(g_ptr_array_index(to_arr, place_index));
+            slot_set_pixbuf(place_w, moving_pb_ref);
+            slot_set_is_extra(place_w, moving_is_extra);
+            g_object_set_data(G_OBJECT(place_w), "card_id", GINT_TO_POINTER(moving_card_id));
+            g_object_set_data(G_OBJECT(place_w), "img_id", GINT_TO_POINTER(moving_img_id));
+            slot_set_en_name(place_w, moving_en_name);
             if (*to_count < place_index + 1) *to_count = place_index + 1;
         }
     }
@@ -1098,19 +1094,22 @@ static void on_import_clicked(GtkButton *btn, gpointer user_data) {
                         NULL,
                         on_import_file_open_finish,
                         data);
+    // GtkFileDialog 不是浮动引用，异步回调通过 data->dialog 持有自己的引用，
+    // 这里必须释放调用方的引用，否则每次打开对话框都会泄漏一个 GtkFileDialog
+    g_object_unref(dialog);
 }
 
 // 重置筛选状态为默认值
 static void reset_filter_state(void) {
     filter_state.card_type_selected = 0;
     
-    // 重置怪兽类别toggle
-    for (int i = 0; i < 14; i++) {
+    // 重置怪兽类别toggle（数组共 15 项，此前写成 14 会漏掉最后一项"特殊召唤"）
+    for (guint i = 0; i < G_N_ELEMENTS(filter_state.monster_type_toggles); i++) {
         filter_state.monster_type_toggles[i] = FALSE;
     }
     
     // 重置连接箭头toggle
-    for (int i = 0; i < 8; i++) {
+    for (guint i = 0; i < G_N_ELEMENTS(filter_state.link_marker_toggles); i++) {
         filter_state.link_marker_toggles[i] = FALSE;
     }
     
@@ -1419,6 +1418,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     gtk_string_list_append(type_list, "魔法");
     gtk_string_list_append(type_list, "陷阱");
     adw_combo_row_set_model(type_row, G_LIST_MODEL(type_list));
+    g_object_unref(type_list);  // set_model 是 transfer-none，需释放调用方引用
     adw_combo_row_set_selected(type_row, filter_state.card_type_selected);  // 恢复状态
     adw_preferences_group_add(type_group, GTK_WIDGET(type_row));
     
@@ -1491,6 +1491,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     gtk_string_list_append(spell_type_list, "装备");
     gtk_string_list_append(spell_type_list, "场地");
     adw_combo_row_set_model(spell_type_row, G_LIST_MODEL(spell_type_list));
+    g_object_unref(spell_type_list);
     adw_combo_row_set_selected(spell_type_row, filter_state.spell_type_selected);  // 恢复状态
     adw_preferences_group_add(spell_type_group, GTK_WIDGET(spell_type_row));
     
@@ -1514,6 +1515,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     gtk_string_list_append(trap_type_list, "永续");
     gtk_string_list_append(trap_type_list, "反击");
     adw_combo_row_set_model(trap_type_row, G_LIST_MODEL(trap_type_list));
+    g_object_unref(trap_type_list);
     adw_combo_row_set_selected(trap_type_row, filter_state.trap_type_selected);  // 恢复状态
     adw_preferences_group_add(trap_type_group, GTK_WIDGET(trap_type_row));
     
@@ -1541,6 +1543,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     gtk_string_list_append(attribute_list, "暗");
     gtk_string_list_append(attribute_list, "神");
     adw_combo_row_set_model(attribute_row, G_LIST_MODEL(attribute_list));
+    g_object_unref(attribute_list);
     adw_combo_row_set_selected(attribute_row, filter_state.attribute_selected);  // 恢复状态
     adw_preferences_group_add(monster_attrs_group, GTK_WIDGET(attribute_row));
     
@@ -1579,6 +1582,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     gtk_string_list_append(race_list, "电子界");
     gtk_string_list_append(race_list, "幻想魔");
     adw_combo_row_set_model(race_row, G_LIST_MODEL(race_list));
+    g_object_unref(race_list);
     adw_combo_row_set_selected(race_row, filter_state.race_selected);  // 恢复状态
     adw_preferences_group_add(monster_attrs_group, GTK_WIDGET(race_row));
     
@@ -1925,10 +1929,10 @@ static void disk_cache_load_finished(GObject *source, GAsyncResult *res, gpointe
         ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
         ctx->stack = (stack && GTK_IS_STACK(stack)) ? stack : NULL;
         ctx->target = target;
-        g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
-        if (ctx->stack) {
-            g_object_add_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
-        }
+        // 注意：不要在此外加弱指针。load_image_async 会为 ctx->target / ctx->stack
+        // 注册弱指针（每个位置一次），而 free_image_load_ctx 只移除一次；
+        // 若此处重复注册，剩余的弱指针条目会指向已释放的 ctx，控件销毁时
+        // GObject 会通过该条目向已释放内存写入 NULL（use-after-free）。
         ctx->scale_to_thumb = scale_to_thumb;
         ctx->cache_id = card_id;
         ctx->add_to_thumb_cache = add_to_thumb_cache;
@@ -2029,16 +2033,24 @@ void load_card_image(GtkWidget *slot, int img_id, SoupSession *session) {
 // 前向声明
 static void on_import_url_clicked(GtkButton *btn, gpointer user_data);
 
+// 剪贴板读取上下文：以弱引用持有输入框，避免对话框提前销毁后回调访问已释放控件
+typedef struct {
+    GtkWidget *entry;
+} ClipboardReadCtx;
+
 // 剪贴板读取完成回调：自动填充URL到输入框
 static void on_clipboard_text_ready(GObject *source, GAsyncResult *result, gpointer user_data) {
-    GtkWidget *entry = GTK_WIDGET(user_data);
+    // user_data 持有输入框的弱引用：对话框可能在异步读取完成前就被关闭销毁
+    // （剪贴板由其他进程占用时读取会很慢），此时 entry 自动变为 NULL
+    ClipboardReadCtx *ctx = (ClipboardReadCtx*)user_data;
+    GtkWidget *entry = ctx ? ctx->entry : NULL;
     GError *error = NULL;
     char *text = gdk_clipboard_read_text_finish(GDK_CLIPBOARD(source), result, &error);
     
     if (text && !error) {
         // 检查是否符合YGO-DA协议格式
         // 根据协议文档，判断文本中是否含有"ygotype=deck"参数
-        if (strstr(text, "ygotype=deck")) {
+        if (entry && strstr(text, "ygotype=deck")) {
             // 从该参数开始往文本前面查找，依次查找是否含有协议头
             const char *param_pos = strstr(text, "ygotype=deck");
             const char *search_start = text;
@@ -2069,6 +2081,14 @@ static void on_clipboard_text_ready(GObject *source, GAsyncResult *result, gpoin
         g_free(text);
     } else if (error) {
         g_error_free(error);
+    }
+
+    // 释放回调上下文并撤销弱引用（entry 可能已为 NULL）
+    if (ctx) {
+        if (ctx->entry) {
+            g_object_remove_weak_pointer(G_OBJECT(ctx->entry), (gpointer*)&ctx->entry);
+        }
+        g_free(ctx);
     }
 }
 
@@ -2137,7 +2157,10 @@ static void on_action_import_from_url(GSimpleAction *action, GVariant *parameter
 
     // 尝试从剪贴板读取URL
     GdkClipboard *clipboard = gdk_display_get_clipboard(gdk_display_get_default());
-    gdk_clipboard_read_text_async(clipboard, NULL, on_clipboard_text_ready, url_entry);
+    ClipboardReadCtx *read_ctx = g_new0(ClipboardReadCtx, 1);
+    read_ctx->entry = url_entry;
+    g_object_add_weak_pointer(G_OBJECT(url_entry), (gpointer*)&read_ctx->entry);
+    gdk_clipboard_read_text_async(clipboard, NULL, on_clipboard_text_ready, read_ctx);
 
     // 将内容设置为对话框的子控件
     adw_dialog_set_child(dialog, content_box);
@@ -2195,6 +2218,8 @@ static void on_action_generate_sheet(GSimpleAction *action, GVariant *parameter,
                         NULL,
                         on_sheet_save_finish,
                         data);
+    // 释放调用方引用（回调持有 data->dialog），避免每次生成卡表泄漏一个对话框
+    g_object_unref(dialog);
 }
 
 static void on_personal_info_save_clicked(GtkButton *btn, gpointer user_data) {
@@ -2714,6 +2739,8 @@ static void on_export_clicked(GtkButton *btn, gpointer user_data) {
                         NULL,
                         on_export_file_save_finish,
                         data);
+    // 释放调用方引用（回调持有 data->dialog），避免每次导出泄漏一个对话框
+    g_object_unref(dialog);
 }
 
 char* format_card_text(const CardPreview *pv) {
@@ -3442,7 +3469,10 @@ static void on_show_prerelease_action(GSimpleAction *action, GVariant *parameter
         return;
     }
     
-    // 清空当前搜索结果
+    // 清空当前搜索结果。
+    // 同时推进搜索代次：本动作不经过 on_search_clicked，若不推进，
+    // 仍在飞行中的离线搜索 GTask 回调会通过代次校验，把过期结果追加到新列表
+    ui->search_generation++;
     list_clear(GTK_LIST_BOX(ui->list));
     
     // 清理旧的图片加载队列和定时器
@@ -3473,11 +3503,15 @@ static void on_show_prerelease_action(GSimpleAction *action, GVariant *parameter
     for (guint i = 0; i < len; i++) {
         JsonObject *card = json_array_get_object_element(all_cards, i);
         if (card) {
-            // 添加先行卡标记
-            JsonObject *marked_item = json_object_ref(card);
-            json_object_set_boolean_member(marked_item, "is_prerelease", TRUE);
-            queue_result_for_render(ui, marked_item);
-            json_object_unref(marked_item);
+            // 添加先行卡标记。卡片对象来自共享解析缓存，json_object_ref 只是
+            // 引用计数递增（同一个对象），直接写成员会永久污染缓存，故先深拷贝。
+            JsonNode *marked_node = json_node_deep_copy(json_array_get_element(all_cards, i));
+            JsonObject *marked_item = marked_node ? json_node_get_object(marked_node) : NULL;
+            if (marked_item) {
+                json_object_set_boolean_member(marked_item, "is_prerelease", TRUE);
+                queue_result_for_render(ui, marked_item);
+            }
+            if (marked_node) json_node_free(marked_node);
         }
     }
     
@@ -3494,7 +3528,8 @@ static void on_show_forbidden_changes_action(GSimpleAction *action, GVariant *pa
 
     if (!ui || !ui->forbidden_dropdown) return;
 
-    // 先清空当前结果和图片加载队列
+    // 先清空当前结果和图片加载队列；同时推进搜索代次作废在飞行中的搜索
+    ui->search_generation++;
     list_clear(GTK_LIST_BOX(ui->list));
     if (ui->search_image_loader_id > 0) {
         g_source_remove(ui->search_image_loader_id);
@@ -3599,8 +3634,8 @@ static void on_show_forbidden_changes_action(GSimpleAction *action, GVariant *pa
         }
 
         // 卡片对象来自共享离线缓存，不能直接修改（会污染缓存），
-        // 仅对命中的卡片深拷贝后追加变更标记
-        JsonNode *marked_node = json_node_copy(card_node);
+        // 仅对命中的卡片深拷贝后追加变更标记（json_node_copy 只是浅拷贝，不可用）
+        JsonNode *marked_node = json_node_deep_copy(card_node);
         JsonObject *marked_item = json_node_get_object(marked_node);
         json_object_set_string_member(marked_item, "forbidden_change", change_str);
         queue_result_for_render(ui, marked_item);
@@ -3680,6 +3715,16 @@ static void
 on_activate(GApplication *app, gpointer user_data)
 {
     (void)user_data;
+    
+    // 单窗口保护：应用是单实例的，再次启动/点击桌面文件会向已运行实例再发一次
+    // "activate"。若不拦截，会再建一个窗口并重复执行 init_image_cache()——
+    // 后者会对已初始化的静态 GMutex 再次 g_mutex_init（未定义行为），
+    // 同时覆盖缓存指针造成泄漏并重复发起启动更新。
+    GtkWindow *existing = gtk_application_get_active_window(GTK_APPLICATION(app));
+    if (existing) {
+        gtk_window_present(existing);
+        return;
+    }
     
     // Initialize image cache system
     init_image_cache();

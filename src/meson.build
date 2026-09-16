@@ -27,7 +27,9 @@ executable(
     'image_loader.c',
     'dnd_manager.c',
     'search_filter.c',
-    'deck_url.c'
+    'deck_url.c',
+    'archive_path.c',
+    'json_utils.c'
   ],
   dependencies: deps,
   install: true,

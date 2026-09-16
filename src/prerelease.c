@@ -1,5 +1,6 @@
 #include "prerelease.h"
 #include "app_path.h"
+#include "archive_path.h"
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
 #include <glib/gstdio.h>
@@ -192,7 +193,10 @@ static gboolean extract_ypk_file(const char *ypk_path, const char *dest_dir) {
     a = archive_read_new();
     archive_read_support_format_zip(a);
     ext = archive_write_disk_new();
-    archive_write_disk_set_options(ext, ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM);
+    // 同上：拒绝 ".." 并阻止写穿符号链接
+    archive_write_disk_set_options(ext, ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM |
+                                        ARCHIVE_EXTRACT_SECURE_NODOTDOT |
+                                        ARCHIVE_EXTRACT_SECURE_SYMLINKS);
     
     if ((r = archive_read_open_filename(a, ypk_path, 10240))) {
         g_warning("Failed to open archive: %s", archive_error_string(a));
@@ -203,6 +207,13 @@ static gboolean extract_ypk_file(const char *ypk_path, const char *dest_dir) {
     
     while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
         const char *current_file = archive_entry_pathname(entry);
+
+        // Zip Slip 防护：YPK 来自网络下载，"pics/../../x" 之类的条目会写到目标目录之外
+        if (!archive_entry_path_is_safe(current_file)) {
+            g_warning("跳过不安全的压缩包条目: %s", current_file ? current_file : "(null)");
+            archive_read_data_skip(a);
+            continue;
+        }
         
         // 只处理pics目录下的文件和test-release.cdb
         gboolean should_extract = FALSE;
@@ -431,10 +442,17 @@ static gpointer download_prerelease_thread(gpointer data) {
     
     GError *error = NULL;
     GInputStream *input = soup_session_send(session, msg, NULL, &error);
+    // 非 2xx 的错误页不能当作 YPK 压缩包保存（否则会写出损坏的压缩包）
+    if (!error && !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(msg))) {
+        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "HTTP %u %s",
+                            soup_message_get_status(msg), soup_message_get_reason_phrase(msg));
+    }
+    g_object_unref(msg);  // 释放调用方引用
     
     if (error) {
         g_warning("Failed to download pre-release cards: %s", error->message);
         g_error_free(error);
+        if (input) g_object_unref(input);  // HTTP 失败时 send 仍会返回非空流
         g_object_unref(session);
         g_free(ypk_path);
         g_free(data_dir);

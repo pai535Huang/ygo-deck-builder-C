@@ -11,6 +11,7 @@ project('ygo-deck-builder', 'c',
 project_id = 'com.pai535.YGODeckBuilder'
 project_name = 'YGODBR'
 
+glib_dep = dependency('glib-2.0')
 gtk4_dep = dependency('gtk4', version: '>=4.8')
 adw_dep = dependency('libadwaita-1', version: '>=1.2')
 json_glib_dep = dependency('json-glib-1.0')
@@ -31,6 +32,34 @@ test_deck_url = executable('test_deck_url',
   dependencies: [json_glib_dep],
 )
 test('deck_url', test_deck_url)
+
+# 单元测试：压缩包条目名路径安全（Zip Slip / 路径穿越）
+test_archive_path = executable('test_archive_path',
+  'tests/test_archive_path.c',
+  'src/archive_path.c',
+  include_directories: ['src'],
+  dependencies: [glib_dep],
+)
+test('archive_path', test_archive_path)
+
+# 单元测试：JsonNode 深拷贝独立性（防止浅拷贝污染共享解析缓存）
+test_json_utils = executable('test_json_utils',
+  'tests/test_json_utils.c',
+  'src/json_utils.c',
+  include_directories: ['src'],
+  dependencies: [json_glib_dep],
+)
+test('json_utils', test_json_utils)
+
+# 单元测试：strings.conf 解析与缓存（字段筛选性能修复）
+test_card_info = executable('test_card_info',
+  'tests/test_card_info.c',
+  'tests/test_app_path_stub.c',
+  'src/card_info.c',
+  include_directories: ['src'],
+  dependencies: [glib_dep],
+)
+test('card_info', test_card_info)
 
 # 配置并安装 desktop 文件
 desktop_conf = configuration_data()

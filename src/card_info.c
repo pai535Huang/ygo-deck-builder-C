@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <glib.h>
+#include <glib/gstdio.h>  // g_stat / GStatBuf（strings.conf 缓存失效判断）
 
 // constant.lua TYPE 部分参考
 #define TYPE_MONSTER      0x1
@@ -394,44 +395,23 @@ static gchar* get_strings_conf_path(void) {
     return g_build_filename(data_home, "ygo-deck-builder", "cards", "strings.conf", NULL);
 }
 
-// 从字段名字符串获取对应的setcode值（十进制）
-uint64_t get_setcode_from_field_name(const char* field_name) {
-    if (!field_name || field_name[0] == '\0') {
+uint64_t strings_conf_parse_setcode(const char *content, const char *field_name) {
+    if (!content || !field_name || field_name[0] == '\0') {
         return 0;
     }
-    
-    gchar *strings_path = get_strings_conf_path();
-    if (!strings_path || !g_file_test(strings_path, G_FILE_TEST_EXISTS)) {
-        g_free(strings_path);
-        return 0;
-    }
-    
-    // 读取strings.conf文件
-    gchar *content = NULL;
-    GError *error = NULL;
-    if (!g_file_get_contents(strings_path, &content, NULL, &error)) {
-        if (error) {
-            g_warning("Failed to read strings.conf: %s", error->message);
-            g_error_free(error);
-        }
-        g_free(strings_path);
-        return 0;
-    }
-    g_free(strings_path);
-    
+
     // 逐行解析文件
     gchar **lines = g_strsplit(content, "\n", -1);
-    g_free(content);
-    
+
     uint64_t result = 0;
     for (int i = 0; lines[i] != NULL; i++) {
         gchar *line = g_strstrip(lines[i]);
-        
+
         // 跳过空行和注释
         if (line[0] == '\0' || line[0] == '#') {
             continue;
         }
-        
+
         // 查找以"!setname"开头的行
         if (g_str_has_prefix(line, "!setname")) {
             // 格式：!setname 0x十六进制 字段名
@@ -439,7 +419,7 @@ uint64_t get_setcode_from_field_name(const char* field_name) {
             if (g_strv_length(parts) >= 3) {
                 const gchar *hex_str = parts[1];
                 const gchar *name = parts[2];
-                
+
                 // 检查字段名是否匹配
                 if (name && strstr(name, field_name) != NULL) {
                     // 解析十六进制数（去掉"0x"前缀）
@@ -453,8 +433,111 @@ uint64_t get_setcode_from_field_name(const char* field_name) {
             g_strfreev(parts);
         }
     }
-    
+
     g_strfreev(lines);
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// strings.conf setcode 查询缓存
+//
+// strings.conf 约 47KB、三千余行。字段筛选时 match_setcode_with_field() 会对
+// 每张卡调用一次查询，此前每次都重新读盘 + g_strsplit 解析——13k 张卡约浪费
+// 3.7 秒 CPU（离线扫描因此明显变慢）。这里按 (path, mtime, size) 缓存文件版本，
+// 并按字段名记忆化结果：一次扫描里同一字段名只解析一次。
+// ---------------------------------------------------------------------------
+typedef struct {
+    uint64_t value;
+} SetcodeCacheEntry;
+
+static GMutex setcode_cache_mutex;
+static gsize setcode_cache_inited = 0;
+static gchar *setcode_cache_path = NULL;
+static gint64 setcode_cache_mtime = 0;
+static gint64 setcode_cache_size = -1;
+static GHashTable *setcode_cache_by_field = NULL;  // field_name -> SetcodeCacheEntry*
+
+static void ensure_setcode_cache_inited(void) {
+    if (g_once_init_enter(&setcode_cache_inited)) {
+        g_mutex_init(&setcode_cache_mutex);
+        g_once_init_leave(&setcode_cache_inited, 1);
+    }
+}
+
+uint64_t strings_conf_lookup_cached(const char *path, const char *field_name) {
+    if (!path || !field_name || field_name[0] == '\0') {
+        return 0;
+    }
+    ensure_setcode_cache_inited();
+
+    // 整个查询持锁完成：解析只在文件版本变化后发生一次，既避免与主线程竞争，
+    // 也不存在 stat 与读取之间的 TOCTOU（文件很小，持锁时间可忽略）
+    g_mutex_lock(&setcode_cache_mutex);
+
+    GStatBuf st;
+    gint64 mtime = 0;
+    gint64 size = -1;
+    gboolean exists = (g_stat(path, &st) == 0);
+    if (exists) {
+        mtime = (gint64)st.st_mtime;
+        size = (gint64)st.st_size;
+    }
+
+    if (!setcode_cache_by_field ||
+        g_strcmp0(setcode_cache_path, path) != 0 ||
+        setcode_cache_mtime != mtime ||
+        setcode_cache_size != size) {
+        // 路径或文件版本变化：整体失效
+        if (!setcode_cache_by_field) {
+            setcode_cache_by_field = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+        } else {
+            g_hash_table_remove_all(setcode_cache_by_field);
+        }
+        g_free(setcode_cache_path);
+        setcode_cache_path = g_strdup(path);
+        setcode_cache_mtime = mtime;
+        setcode_cache_size = size;
+    }
+
+    SetcodeCacheEntry *cached = g_hash_table_lookup(setcode_cache_by_field, field_name);
+    uint64_t value;
+    if (cached) {
+        value = cached->value;
+    } else {
+        value = 0;
+        if (exists) {
+            gchar *content = NULL;
+            GError *error = NULL;
+            if (g_file_get_contents(path, &content, NULL, &error)) {
+                value = strings_conf_parse_setcode(content, field_name);
+                g_free(content);
+            } else if (error) {
+                g_warning("Failed to read strings.conf: %s", error->message);
+                g_error_free(error);
+            }
+        }
+        SetcodeCacheEntry *entry = g_new0(SetcodeCacheEntry, 1);
+        entry->value = value;
+        g_hash_table_replace(setcode_cache_by_field, g_strdup(field_name), entry);
+    }
+
+    g_mutex_unlock(&setcode_cache_mutex);
+    return value;
+}
+
+// 从字段名字符串获取对应的setcode值（十进制）
+uint64_t get_setcode_from_field_name(const char* field_name) {
+    if (!field_name || field_name[0] == '\0') {
+        return 0;
+    }
+
+    gchar *strings_path = get_strings_conf_path();
+    if (!strings_path) {
+        return 0;
+    }
+
+    uint64_t result = strings_conf_lookup_cached(strings_path, field_name);
+    g_free(strings_path);
     return result;
 }
 

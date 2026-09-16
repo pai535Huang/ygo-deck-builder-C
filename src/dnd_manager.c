@@ -57,7 +57,10 @@ GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, double y, g
         char *payload = g_strdup_printf("search:%d:%d:%d:%d:%s",
             pv->cid, pv->id, is_extra_card ? 1 : 0, pv->is_prerelease ? 1 : 0,
             pv->en_name ? pv->en_name : "");
-        return gdk_content_provider_new_typed(G_TYPE_STRING, payload);
+        // gdk_content_provider_new_typed 通过 GValue 复制字符串，不接管所有权
+        GdkContentProvider *provider = gdk_content_provider_new_typed(G_TYPE_STRING, payload);
+        g_free(payload);
+        return provider;
     }
     // 中栏槽位拖拽：仅当槽位已有图像时才允许拖拽
     GdkPixbuf *pb = slot_get_pixbuf(pic);
@@ -65,7 +68,9 @@ GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, double y, g
     const char *region = (const char*)g_object_get_data(G_OBJECT(pic), "slot_region");
     int index = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "slot_index"));
     char *payload = g_strdup_printf("%s:%d", region ? region : "", index);
-    return gdk_content_provider_new_typed(G_TYPE_STRING, payload);
+    GdkContentProvider *provider = gdk_content_provider_new_typed(G_TYPE_STRING, payload);
+    g_free(payload);
+    return provider;
 }
 
 void on_drag_begin(GtkDragSource *source, GdkDrag *drag, gpointer user_data) {
@@ -350,12 +355,20 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
             int first_empty = array_find_first_empty(to_arr);
             if (first_empty >= 0) place_index = first_empty;
         }
-        // 若插入位置在已填范围内，右移并插入
-        if (place_index < *to_count) {
-            int end_to = *to_count - 1;
-            if (end_to >= 0) array_shift_right(to_arr, place_index, end_to);
-        }
+        // 若目标槽位已被占用，则是「插入到中间」：尾部整体右移一格
+        // （末张卡移到 *to_count 位置）并把计数 +1。
+        // 此前的 end_to = *to_count - 1 会直接覆盖末张卡且计数不变 —— 静默丢失一张卡。
         GtkWidget *place_w = GTK_WIDGET(g_ptr_array_index(to_arr, place_index));
+        if (place_index < *to_count && slot_get_pixbuf(place_w) != NULL) {
+            if (*to_count >= (int)to_arr->len) {
+                return;  // 区域已满，无处插入（保持卡组不变）
+            }
+            array_shift_right(to_arr, place_index, *to_count);
+            *to_count += 1;
+        } else if (*to_count < place_index + 1) {
+            // 填入空洞或扩展到新槽位
+            *to_count = place_index + 1;
+        }
         // 记录类型标记和卡片ID（用于统计禁限卡数量）
         slot_set_is_extra(place_w, is_extra ? TRUE : FALSE);
         g_object_set_data(G_OBJECT(place_w), "card_id", GINT_TO_POINTER(card_id));
@@ -371,7 +384,6 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
         if (img_id > 0) {
             load_card_image(place_w, img_id, ui->session);
         }
-        if (*to_count < place_index + 1) *to_count = place_index + 1;
         update_count_label(to_label, *to_count);
         update_genesys_score(ui);
         update_deck_overlays(ui);

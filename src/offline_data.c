@@ -1,5 +1,6 @@
 #include "offline_data.h"
 #include "app_path.h"
+#include "archive_path.h"
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
 #include <archive.h>
@@ -390,7 +391,11 @@ static gboolean extract_zip_file(const char *zip_path, const char *dest_dir) {
     a = archive_read_new();
     archive_read_support_format_zip(a);
     ext = archive_write_disk_new();
-    archive_write_disk_set_options(ext, ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM);
+    // SECURE_NODOTDOT 拒绝 ".."；SECURE_SYMLINKS 阻止「先写入指向外部的符号链接，
+    // 再通过该链接写入」的绕过——仅靠条目名检查无法防住这种写穿符号链接
+    archive_write_disk_set_options(ext, ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM |
+                                        ARCHIVE_EXTRACT_SECURE_NODOTDOT |
+                                        ARCHIVE_EXTRACT_SECURE_SYMLINKS);
     
     if ((r = archive_read_open_filename(a, zip_path, 10240))) {
         g_warning("Failed to open archive: %s", archive_error_string(a));
@@ -401,6 +406,14 @@ static gboolean extract_zip_file(const char *zip_path, const char *dest_dir) {
     
     while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
         const char *current_file = archive_entry_pathname(entry);
+        
+        // Zip Slip 防护：cards.zip 来自网络下载，条目名可能是 "../x" 或绝对路径，
+        // 直接拼接会写到目标目录之外
+        if (!archive_entry_path_is_safe(current_file)) {
+            g_warning("跳过不安全的压缩包条目: %s", current_file ? current_file : "(null)");
+            archive_read_data_skip(a);
+            continue;
+        }
         
         // 构建输出路径
         gchar *output_path = g_build_filename(dest_dir, current_file, NULL);
@@ -497,10 +510,17 @@ static gpointer download_offline_data_thread(gpointer data) {
     GError *error = NULL;
     
     GInputStream *input = soup_session_send(session, msg, NULL, &error);
+    // 非 2xx（404/500/限流页）的错误页不能当作 cards.zip 保存，转成 GError 走既有失败分支
+    if (!error && !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(msg))) {
+        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "HTTP %u %s",
+                            soup_message_get_status(msg), soup_message_get_reason_phrase(msg));
+    }
+    g_object_unref(msg);  // soup_session_send 内部另持引用，这里释放调用方引用
     
     if (error) {
         g_warning("Failed to download offline data: %s", error->message);
         g_error_free(error);
+        if (input) g_object_unref(input);  // HTTP 失败时 send 仍会返回非空流
         g_object_unref(session);
         g_free(zip_path);
         g_free(data_dir);
@@ -609,10 +629,17 @@ static gpointer download_offline_data_thread(gpointer data) {
     GError *md5_error = NULL;
     
     GInputStream *md5_input = soup_session_send(md5_session, md5_msg, NULL, &md5_error);
+    // 错误页不可当作 MD5 保存
+    if (!md5_error && !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(md5_msg))) {
+        md5_error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "HTTP %u %s",
+                                soup_message_get_status(md5_msg), soup_message_get_reason_phrase(md5_msg));
+    }
+    g_object_unref(md5_msg);  // 释放调用方引用
     
     if (md5_error) {
         g_warning("Failed to download MD5 file: %s", md5_error->message);
         g_error_free(md5_error);
+        if (md5_input) g_object_unref(md5_input);  // HTTP 失败时 send 仍会返回非空流
         g_object_unref(md5_session);
         // MD5 下载失败不影响主流程，继续执行
     } else {
@@ -661,10 +688,17 @@ static gpointer download_offline_data_thread(gpointer data) {
     GError *strings_error = NULL;
     
     GInputStream *strings_input = soup_session_send(strings_session, strings_msg, NULL, &strings_error);
+    // 错误页不可当作 strings.conf 保存
+    if (!strings_error && !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(strings_msg))) {
+        strings_error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "HTTP %u %s",
+                                    soup_message_get_status(strings_msg), soup_message_get_reason_phrase(strings_msg));
+    }
+    g_object_unref(strings_msg);  // 释放调用方引用
     
     if (strings_error) {
         g_warning("Failed to download strings.conf: %s", strings_error->message);
         g_error_free(strings_error);
+        if (strings_input) g_object_unref(strings_input);  // HTTP 失败时 send 仍会返回非空流
         g_object_unref(strings_session);
         // strings.conf 下载失败不影响主流程，继续执行
     } else {
@@ -833,10 +867,17 @@ static gchar *download_remote_md5(void) {
     GError *error = NULL;
     
     GInputStream *input = soup_session_send(session, msg, NULL, &error);
+    // 错误页不可当作远程 MD5 内容使用
+    if (!error && !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(msg))) {
+        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "HTTP %u %s",
+                            soup_message_get_status(msg), soup_message_get_reason_phrase(msg));
+    }
+    g_object_unref(msg);  // 释放调用方引用
     
     if (error) {
         g_warning("Failed to download remote MD5: %s", error->message);
         g_error_free(error);
+        if (input) g_object_unref(input);  // HTTP 失败时 send 仍会返回非空流
         g_object_unref(session);
         return NULL;
     }

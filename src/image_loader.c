@@ -292,8 +292,12 @@ void cleanup_image_cache(void) {
         fullsize_cache_order = NULL;
     }
 
-    g_free(cache_dir);
-    cache_dir = NULL;
+    // 注意：此处刻意不 g_free(cache_dir)、也不 g_mutex_clear 三个互斥锁。
+    // cleanup_image_cache 在 g_application_run 返回后调用，此时后台 GTask 工作线程
+    // （解码/写盘）可能仍在运行：decode_task_thread 会读取全局 cache_dir
+    // （save_to_disk_cache）并通过 is_cancelled 锁定 cancel_generation_mutex。
+    // 在进程即将退出时释放它们只会造成 use-after-free 与锁定已销毁互斥锁的
+    // 未定义行为；这些内存随进程结束由操作系统回收。
     g_mutex_unlock(&cache_mutex);
     
     g_mutex_lock(&download_queue_mutex);
@@ -315,10 +319,7 @@ void cleanup_image_cache(void) {
         download_queue = NULL;
     }
     g_mutex_unlock(&download_queue_mutex);
-    
-    g_mutex_clear(&cache_mutex);
-    g_mutex_clear(&cancel_generation_mutex);
-    g_mutex_clear(&download_queue_mutex);
+    // 同上：互斥锁保持有效，避免仍在退出的工作线程锁定已销毁的锁
 }
 
 GdkPixbuf* load_from_disk_cache(int card_id) {
@@ -769,6 +770,10 @@ static void start_download(SoupSession *session, ImageLoadCtx *ctx) {
 static void process_download_queue(SoupSession *session) {
     if (!session) return;
     
+    // 被丢弃的排队请求的 URL：其等待队列必须一并清理，否则 pending_downloads
+    // 会残留一个永远不会被下载的条目，之后同一 URL 的请求只会入队而永不完成
+    GPtrArray *orphaned_urls = NULL;
+    
     g_mutex_lock(&download_queue_mutex);
     
     // 启动尽可能多的下载（不超过最大并发数）
@@ -780,6 +785,12 @@ static void process_download_queue(SoupSession *session) {
         if (!ctx->target) {
             // 目标已销毁（弱指针自动设为NULL），清理上下文
             // 注意：不要调用 g_object_remove_weak_pointer，因为对象已不存在
+            if (ctx->url) {
+                if (!orphaned_urls) {
+                    orphaned_urls = g_ptr_array_new_with_free_func(g_free);
+                }
+                g_ptr_array_add(orphaned_urls, g_strdup(ctx->url));
+            }
             free_image_load_ctx(ctx);
             continue;
         }
@@ -794,6 +805,15 @@ static void process_download_queue(SoupSession *session) {
     }
     
     g_mutex_unlock(&download_queue_mutex);
+    
+    // 在锁外清理：锁顺序必须保持 cache_mutex -> download_queue_mutex（见 cancel_all_pending），
+    // 因此不能在持有 download_queue_mutex 时去拿 cache_mutex
+    if (orphaned_urls) {
+        for (guint i = 0; i < orphaned_urls->len; i++) {
+            free_waiting_contexts(detach_waiting_contexts((const char*)g_ptr_array_index(orphaned_urls, i)));
+        }
+        g_ptr_array_unref(orphaned_urls);
+    }
 }
 
 void load_image_async(SoupSession *session, const char *url, ImageLoadCtx *ctx) {

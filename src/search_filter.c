@@ -7,6 +7,7 @@
 #include "deck_slot.h"
 #include "card_info.h"
 #include "forbidden_list.h"
+#include "json_utils.h"
 #include <string.h>
 
 // 搜索结果上限：保护右侧列表和图片队列，避免一次返回过多卡片拖慢 UI。
@@ -138,6 +139,91 @@ static void preload_thread(GTask *task, gpointer source_object, gpointer task_da
     }
 }
 
+// 搜索结果磁盘缓存异步加载
+//
+// 此前在主线程同步调用 load_from_disk_cache()：读盘 + 全尺寸 PNG 解码。
+// 实测（900KB 缓存 PNG）单张主线程耗时约 10ms，每批 8 张会让 UI 停顿约 80ms；
+// 这是在"IO 全部异步化"之后仍然留在主线程的最后一条图片 IO 路径。
+// 这里把读盘与解码移到 GTask 工作线程（与同文件 preload_thread 相同的模式），
+// 命中后在主线程设置缩略图（仅剩约 1ms 的缩放），未命中再由回调回退到网络加载。
+typedef struct {
+    GtkWidget *target;  // 弱引用：GtkDrawingArea
+    GtkStack *stack;    // 弱引用
+    SearchUI *ui;
+    int img_id;
+} SearchDiskLoadData;
+
+static void search_disk_load_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
+    (void)source_object;
+    (void)cancellable;
+    SearchDiskLoadData *d = (SearchDiskLoadData*)task_data;
+    GdkPixbuf *pb = d ? load_from_disk_cache(d->img_id) : NULL;
+    if (pb) {
+        g_task_return_pointer(task, pb, (GDestroyNotify)g_object_unref);
+    } else {
+        g_task_return_pointer(task, NULL, NULL);
+    }
+}
+
+static void search_disk_load_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
+    (void)source;
+    SearchDiskLoadData *d = (SearchDiskLoadData*)user_data;
+    GError *err = NULL;
+    GdkPixbuf *pb = (GdkPixbuf*)g_task_propagate_pointer(G_TASK(res), &err);
+    if (err) g_error_free(err);
+
+    GtkWidget *target = d->target;
+    GtkStack *stack = d->stack;
+    SearchUI *ui = d->ui;
+    int img_id = d->img_id;
+
+    gboolean handled = FALSE;
+    if (pb) {
+        // 命中：与同步路径一致地设置缩略图（内部会切换 stack 到图片页）
+        handled = set_search_result_thumb(target, stack, img_id, pb);
+        g_object_unref(pb);
+    }
+    if (!handled && target && GTK_IS_DRAWING_AREA(target) && ui && ui->session) {
+        // 未命中（或设置失败）：回退到网络加载，与原同步路径的语义一致
+        char url[128];
+        g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", img_id);
+        ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
+        ctx->stack = (stack && GTK_IS_STACK(stack)) ? stack : NULL;
+        ctx->target = target;
+        ctx->scale_to_thumb = TRUE;
+        ctx->cache_id = img_id;
+        ctx->add_to_thumb_cache = TRUE;
+        ctx->url = g_strdup(url);
+        load_image_async(ui->session, url, ctx);
+    }
+
+    // 先移除弱指针再释放任务数据（对象可能已被销毁，此时指针已为 NULL）
+    if (d->target && G_IS_OBJECT(d->target)) {
+        g_object_remove_weak_pointer(G_OBJECT(d->target), (gpointer*)&d->target);
+    }
+    if (d->stack && G_IS_OBJECT(d->stack)) {
+        g_object_remove_weak_pointer(G_OBJECT(d->stack), (gpointer*)&d->stack);
+    }
+    g_free(d);
+}
+
+static void start_search_disk_load(SearchUI *ui, GtkWidget *target, GtkStack *stack, int img_id) {
+    SearchDiskLoadData *d = g_new0(SearchDiskLoadData, 1);
+    d->target = target;
+    d->stack = stack;
+    d->ui = ui;
+    d->img_id = img_id;
+    g_object_add_weak_pointer(G_OBJECT(target), (gpointer*)&d->target);
+    if (stack) {
+        g_object_add_weak_pointer(G_OBJECT(stack), (gpointer*)&d->stack);
+    }
+
+    GTask *task = g_task_new(NULL, NULL, search_disk_load_finished, d);
+    g_task_set_task_data(task, d, NULL);
+    g_task_run_in_thread(task, search_disk_load_thread);
+    g_object_unref(task);
+}
+
 // 逐个加载搜索结果图片，避免同时加载太多导致UI卡顿
 gboolean search_load_next_image(gpointer user_data) {
     SearchUI *ui = (SearchUI*)user_data;
@@ -201,27 +287,9 @@ gboolean search_load_next_image(gpointer user_data) {
                     continue;
                 }
 
-                GdkPixbuf *disk_cached = load_from_disk_cache(img_id);
-                if (disk_cached) {
-                    gboolean set = set_search_result_thumb(target, stack, img_id, disk_cached);
-                    g_object_unref(disk_cached);
-                    if (set) {
-                        loaded++;
-                        continue;
-                    }
-                }
-
-                // 磁盘缓存未命中时再从在线加载普通卡片图片
-                char url[128];
-                g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", img_id);
-                ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
-                ctx->stack = stack;
-                ctx->target = target;
-                ctx->scale_to_thumb = TRUE;
-                ctx->cache_id = img_id;
-                ctx->add_to_thumb_cache = TRUE;
-                ctx->url = g_strdup(url);
-                load_image_async(ui->session, url, ctx);
+                // 磁盘缓存：异步检查（读盘 + PNG 解码移出主线程），
+                // 未命中由回调回退到网络加载
+                start_search_disk_load(ui, target, stack, img_id);
             }
             loaded++;
         }
@@ -936,7 +1004,9 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
                     if (apply_filter(item, filter)) {
                         // 添加一个标记表示这是先行卡。卡片对象来自共享解析缓存，
                         // 直接写入会永久污染缓存，故先深拷贝再标记。
-                        JsonNode *marked_node = json_node_copy(json_array_get_element(prerelease_results, i));
+                        // 注意必须用 json_node_deep_copy：json_node_copy 只是浅拷贝
+                        // （对 object 仅增加引用计数），仍会写进共享缓存。
+                        JsonNode *marked_node = json_node_deep_copy(json_array_get_element(prerelease_results, i));
                         JsonObject *marked_item = marked_node ? json_node_get_object(marked_node) : NULL;
                         if (marked_item) {
                             json_object_set_boolean_member(marked_item, "is_prerelease", TRUE);
