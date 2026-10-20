@@ -4,6 +4,7 @@
 #include "image_loader.h"
 #include "prerelease.h"
 #include "offline_data.h"
+#include "alt_art.h"
 #include "app_path.h"
 #include <stdio.h>
 #include <string.h>
@@ -174,6 +175,13 @@ gboolean import_deck_from_ydk(
         /* YDK 存的是八位 Konami 码（img_id），要移拿到禁限卡表里需要的短 cid。
          * 从离线数据库做反向查找，同时获取英文卡名以支持 GENESYS 模式角标。 */
         int card_cid = offline_get_cid_by_img_id(img_id);
+        if (card_cid <= 0) {
+            // 异画在 ydk 里是独立的密码；映射回本体 cid 才能正确审核同名卡数量
+            int base_img_id = alt_art_get_base_id(img_id);
+            if (base_img_id > 0 && base_img_id != img_id) {
+                card_cid = offline_get_cid_by_img_id(base_img_id);
+            }
+        }
         if (card_cid > 0) {
             g_object_set_data(G_OBJECT(target_pic), "card_id", GINT_TO_POINTER(card_cid));
             gchar *en_name = offline_get_en_name_by_id(card_cid);

@@ -33,6 +33,7 @@
 #include "startup_update.h"
 #include "prerelease.h"
 #include "offline_data.h"
+#include "alt_art.h"
 #include "pixbuf_utils.h"
 #include "card_info.h"
 #include "card_sort.h"
@@ -2904,6 +2905,15 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
     if (!parent || !GTK_IS_LIST_BOX(parent)) {
         return;
     }
+
+    // 点击“异画”按钮/菜单项时不要顺带把卡加入卡组
+    GtkWidget *picked = gtk_widget_pick(row, x, y, GTK_PICK_DEFAULT);
+    for (GtkWidget *w = picked; w && w != row; w = gtk_widget_get_parent(w)) {
+        if (GTK_IS_BUTTON(w) || GTK_IS_MENU_BUTTON(w)) {
+            g_object_set_data_full(G_OBJECT(row), "press_xy", NULL, NULL);
+            return;
+        }
+    }
     
     double *press_xy = (double*)g_object_get_data(G_OBJECT(row), "press_xy");
     if (press_xy) {
@@ -3158,10 +3168,9 @@ static void card_info_read_finished(GObject *source, GAsyncResult *res, gpointer
             // 构造 CardPreview 数据
             CardPreview pv = {0};
             
-            // 获取 id (用于图片)
-            if (json_object_has_member(obj, "id")) {
-                pv.id = json_object_get_int_member(obj, "id");
-            }
+            // 悬停的是卡组槽位里实际选中的版本；ygocdb 返回的 id 是本体，
+            // 直接使用会丢失异画，故以槽位的 img_id 为准。
+            pv.id = ctx->img_id;
             
             // 获取 cid (用于禁限卡表)
             if (json_object_has_member(obj, "cid")) {
@@ -3728,6 +3737,8 @@ on_activate(GApplication *app, gpointer user_data)
     
     // Initialize image cache system
     init_image_cache();
+    // 加载异画缓存；缺失时在后台根据离线数据生成
+    alt_art_init();
 
     AdwApplicationWindow *win = ADW_APPLICATION_WINDOW(
         adw_application_window_new(GTK_APPLICATION(app)));
@@ -3740,6 +3751,18 @@ on_activate(GApplication *app, gpointer user_data)
         "}\n"
         ".deck-card {\n"
         "  min-width: 50px; min-height: 73px;\n"
+        "}\n"
+        ".art-choice {\n"
+        "  padding: 2px;\n"
+        "  border: 2px solid transparent;\n"
+        "  border-radius: 8px;\n"
+        "}\n"
+        ".art-choice-selected {\n"
+        "  border-color: @accent_color;\n"
+        "}\n"
+        ".art-menu-button {\n"
+        "  min-height: 0;\n"
+        "  padding: 1px 8px;\n"
         "}\n"
         ;
     gtk_css_provider_load_from_string(provider, css);
@@ -4298,6 +4321,8 @@ on_activate(GApplication *app, gpointer user_data)
     sui->list = gtk_list_box_new();
     gtk_list_box_set_selection_mode(GTK_LIST_BOX(sui->list), GTK_SELECTION_NONE);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), sui->list);
+    // 异画缓存可能在首次搜索之后才生成；就绪后自动刷新结果
+    search_ui_watch_alt_art(sui);
 
     gtk_box_append(GTK_BOX(col_end), search_bar);
     gtk_box_append(GTK_BOX(col_end), scroller);

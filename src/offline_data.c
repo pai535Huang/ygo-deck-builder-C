@@ -1,4 +1,5 @@
 #include "offline_data.h"
+#include "alt_art.h"
 #include "app_path.h"
 #include "archive_path.h"
 #include <libsoup/soup.h>
@@ -337,6 +338,10 @@ static gchar *get_cards_dir(void) {
         const char *data_home = g_get_user_data_dir();
         return g_build_filename(data_home, "ygo-deck-builder", CARDS_DIR_NAME, NULL);
     }
+}
+
+gchar *offline_get_cards_dir_copy(void) {
+    return get_cards_dir();
 }
 
 /**
@@ -741,6 +746,8 @@ static gpointer download_offline_data_thread(gpointer data) {
 
     // 离线数据更新后，清理解析缓存，避免读取旧文件。
     offline_data_clear_cache();
+    // 卡片数据变了，异画映射也可能变化：后台重建缓存。
+    alt_art_rebuild_cache_async();
     
     ctx->success = TRUE;
     if (ctx->callback) {

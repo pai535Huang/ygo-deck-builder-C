@@ -17,6 +17,7 @@ typedef struct {
     char *url;                 // 正在加载的URL（网络）或file_path（本地）
     gboolean is_local_file;    // TRUE表示从本地文件加载，FALSE表示从网络加载
     guint64 cancel_generation; // 创建时的取消代次，用于检测是否应该取消
+    int expected_img_id;       // >0 时只在该图片仍是目标当前选中的版本时才更新 UI
 } ImageLoadCtx;
 
 /**

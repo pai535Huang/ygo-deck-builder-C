@@ -21,6 +21,9 @@ void on_trap_filter_toggled(GtkCheckButton *btn, gpointer user_data);
 
 // 搜索结果处理
 void add_result_row(SearchUI *ui, JsonObject *obj);
+
+// 异画缓存就绪后自动刷新当前搜索结果（避免启动后立刻搜索时看不到“异画”按钮）
+void search_ui_watch_alt_art(SearchUI *ui);
 void search_response_cb(GObject *source, GAsyncResult *res, gpointer user_data);
 
 // 图片加载队列管理

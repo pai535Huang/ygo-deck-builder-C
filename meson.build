@@ -51,6 +51,28 @@ test_json_utils = executable('test_json_utils',
 )
 test('json_utils', test_json_utils)
 
+# 单元测试：异画索引与用户选择 JSON（搜索结果异画切换）
+test_alt_art_index = executable('test_alt_art_index',
+  'tests/test_alt_art_index.c',
+  'src/alt_art_index.c',
+  include_directories: ['src'],
+  dependencies: [glib_dep, json_glib_dep],
+)
+test('alt_art_index', test_alt_art_index)
+
+# 单元测试：异画映射加载与“默认异画”选择持久化
+test_alt_art = executable('test_alt_art',
+  'tests/test_alt_art.c',
+  'tests/test_app_path_stub.c',
+  'src/alt_art.c',
+  'src/alt_art_index.c',
+  'src/offline_data.c',
+  'src/archive_path.c',
+  include_directories: ['src'],
+  dependencies: [glib_dep, json_glib_dep, libsoup_dep, libarchive_dep],
+)
+test('alt_art', test_alt_art)
+
 # 单元测试：strings.conf 解析与缓存（字段筛选性能修复）
 test_card_info = executable('test_card_info',
   'tests/test_card_info.c',

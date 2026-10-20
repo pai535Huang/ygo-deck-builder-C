@@ -2,6 +2,7 @@
 #include "image_loader.h"
 #include "prerelease.h"
 #include "offline_data.h"
+#include "alt_art.h"
 #include "deck_io.h"
 #include "dnd_manager.h"
 #include "deck_slot.h"
@@ -53,8 +54,16 @@ static void free_search_image_to_load(gpointer data) {
     g_free(item);
 }
 
+static gboolean search_thumb_matches_expected(GtkWidget *picture, int img_id) {
+    if (!picture || !GTK_IS_DRAWING_AREA(picture)) return FALSE;
+    int expected = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(picture), "art_expected_id"));
+    return expected <= 0 || expected == img_id;
+}
+
 static gboolean set_search_result_thumb(GtkWidget *picture, GtkStack *stack, int img_id, GdkPixbuf *pixbuf) {
     if (!picture || !GTK_IS_DRAWING_AREA(picture) || !pixbuf) return FALSE;
+    // 快速切换异画时，旧的磁盘/网络回调不得覆盖当前选中的版本
+    if (!search_thumb_matches_expected(picture, img_id)) return FALSE;
 
     int sf = gtk_widget_get_scale_factor(picture);
     if (sf < 1) sf = 1;
@@ -183,7 +192,8 @@ static void search_disk_load_finished(GObject *source, GAsyncResult *res, gpoint
         handled = set_search_result_thumb(target, stack, img_id, pb);
         g_object_unref(pb);
     }
-    if (!handled && target && GTK_IS_DRAWING_AREA(target) && ui && ui->session) {
+    if (!handled && target && GTK_IS_DRAWING_AREA(target) &&
+        search_thumb_matches_expected(target, img_id) && ui && ui->session) {
         // 未命中（或设置失败）：回退到网络加载，与原同步路径的语义一致
         char url[128];
         g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", img_id);
@@ -192,6 +202,7 @@ static void search_disk_load_finished(GObject *source, GAsyncResult *res, gpoint
         ctx->target = target;
         ctx->scale_to_thumb = TRUE;
         ctx->cache_id = img_id;
+        ctx->expected_img_id = img_id;
         ctx->add_to_thumb_cache = TRUE;
         ctx->url = g_strdup(url);
         load_image_async(ui->session, url, ctx);
@@ -222,6 +233,221 @@ static void start_search_disk_load(SearchUI *ui, GtkWidget *target, GtkStack *st
     g_task_set_task_data(task, d, NULL);
     g_task_run_in_thread(task, search_disk_load_thread);
     g_object_unref(task);
+}
+
+static gboolean art_variants_contains(GArray *variants, int art_id) {
+    if (!variants) return FALSE;
+    for (guint i = 0; i < variants->len; i++) {
+        if (g_array_index(variants, int, i) == art_id) return TRUE;
+    }
+    return FALSE;
+}
+
+// 找到搜索结果行里的缩略图栈与绘图区
+static gboolean get_search_row_picture(GtkWidget *row_box, GtkStack **out_stack, GtkWidget **out_picture) {
+    if (!row_box || !out_stack || !out_picture) return FALSE;
+    GtkWidget *list_row = gtk_widget_get_ancestor(row_box, GTK_TYPE_LIST_BOX_ROW);
+    if (!list_row) return FALSE;
+    GtkWidget *child = gtk_list_box_row_get_child(GTK_LIST_BOX_ROW(list_row));
+    if (!child) return FALSE;
+    GtkWidget *stack = gtk_widget_get_first_child(child);
+    if (!stack || !GTK_IS_STACK(stack)) return FALSE;
+    GtkWidget *picture = gtk_stack_get_child_by_name(GTK_STACK(stack), "picture");
+    if (!picture || !GTK_IS_DRAWING_AREA(picture)) return FALSE;
+    *out_stack = GTK_STACK(stack);
+    *out_picture = picture;
+    return TRUE;
+}
+
+static void update_art_buttons_recursive(GtkWidget *widget, GArray *variants, int selected_art) {
+    if (!widget || !variants) return;
+    for (GtkWidget *child = gtk_widget_get_first_child(widget);
+         child; child = gtk_widget_get_next_sibling(child)) {
+        gpointer index_data = g_object_get_data(G_OBJECT(child), "art_index");
+        if (index_data) {
+            int index = GPOINTER_TO_INT(index_data) - 1;
+            int art_id = 0;
+            if (index >= 0 && index < (int)variants->len) {
+                art_id = g_array_index(variants, int, index);
+            }
+            if (art_id == selected_art) {
+                gtk_widget_add_css_class(child, "art-choice-selected");
+            } else {
+                gtk_widget_remove_css_class(child, "art-choice-selected");
+            }
+        }
+        update_art_buttons_recursive(child, variants, selected_art);
+    }
+}
+
+static void update_art_menu_highlight(GtkWidget *row_box, int selected_art) {
+    GtkWidget *menu_button = (GtkWidget *)g_object_get_data(G_OBJECT(row_box), "art_menu_button");
+    if (!menu_button || !GTK_IS_MENU_BUTTON(menu_button)) return;
+    GtkWidget *popover = GTK_WIDGET(gtk_menu_button_get_popover(GTK_MENU_BUTTON(menu_button)));
+    if (!popover) return;
+    GtkWidget *child = gtk_popover_get_child(GTK_POPOVER(popover));
+    if (!child) return;
+    GArray *variants = (GArray *)g_object_get_data(G_OBJECT(row_box), "art_variants");
+    update_art_buttons_recursive(child, variants, selected_art);
+}
+
+static void select_search_row_art(GtkWidget *row_box, int art_index) {
+    if (!row_box) return;
+    GArray *variants = (GArray *)g_object_get_data(G_OBJECT(row_box), "art_variants");
+    if (!variants || art_index < 0 || art_index >= (int)variants->len) return;
+
+    int base_id = g_array_index(variants, int, 0);
+    int art_id = g_array_index(variants, int, art_index);
+    if (base_id <= 0 || art_id <= 0) return;
+
+    GtkWidget *list_row = gtk_widget_get_ancestor(row_box, GTK_TYPE_LIST_BOX_ROW);
+    if (!list_row) return;
+    CardPreview *pv = (CardPreview *)g_object_get_data(G_OBJECT(list_row), "preview");
+    if (pv) pv->id = art_id;
+
+    alt_art_set_selected(base_id, art_id);
+    update_art_menu_highlight(row_box, art_id);
+
+    SearchUI *ui = (SearchUI *)g_object_get_data(G_OBJECT(row_box), "search_ui");
+    GtkStack *stack = NULL;
+    GtkWidget *picture = NULL;
+    if (!get_search_row_picture(row_box, &stack, &picture)) return;
+
+    g_object_set_data(G_OBJECT(picture), "art_expected_id", GINT_TO_POINTER(art_id));
+    g_object_set_data(G_OBJECT(picture), "pending_img_id", GINT_TO_POINTER(art_id));
+
+    GdkPixbuf *cached = get_thumb_from_cache(art_id);
+    if (cached && set_search_result_thumb(picture, stack, art_id, cached)) {
+        return;
+    }
+
+    // 没有内存缓存：先显示加载占位，再走磁盘缓存/网络
+    gtk_stack_set_visible_child_name(stack, "placeholder");
+    if (ui) {
+        start_search_disk_load(ui, picture, stack, art_id);
+    }
+}
+
+static void on_art_choice_clicked(GtkButton *button, gpointer user_data) {
+    (void)user_data;
+    GtkWidget *row_box = (GtkWidget *)g_object_get_data(G_OBJECT(button), "art_row");
+    int index = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(button), "art_index")) - 1;
+    select_search_row_art(row_box, index);
+
+    GtkWidget *popover = gtk_widget_get_ancestor(GTK_WIDGET(button), GTK_TYPE_POPOVER);
+    if (popover) gtk_popover_popdown(GTK_POPOVER(popover));
+}
+
+static void load_art_choice_thumb(SearchUI *ui, GtkWidget *picture, GtkStack *stack, int art_id) {
+    if (!picture || art_id <= 0) return;
+    g_object_set_data(G_OBJECT(picture), "art_expected_id", GINT_TO_POINTER(art_id));
+    GdkPixbuf *cached = get_thumb_from_cache(art_id);
+    if (cached && set_search_result_thumb(picture, stack, art_id, cached)) {
+        return;
+    }
+    if (ui) start_search_disk_load(ui, picture, stack, art_id);
+}
+
+static void on_art_choice_map(GtkWidget *stack, gpointer user_data) {
+    (void)user_data;
+    if (!stack || !GTK_IS_STACK(stack)) return;
+    if (GPOINTER_TO_INT(g_object_get_data(G_OBJECT(stack), "art_thumb_loaded"))) return;
+    g_object_set_data(G_OBJECT(stack), "art_thumb_loaded", GINT_TO_POINTER(1));
+
+    SearchUI *ui = (SearchUI *)g_object_get_data(G_OBJECT(stack), "art_choice_ui");
+    int art_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(stack), "art_choice_id"));
+    GtkWidget *picture = gtk_stack_get_child_by_name(GTK_STACK(stack), "picture");
+    if (picture && GTK_IS_DRAWING_AREA(picture)) {
+        load_art_choice_thumb(ui, picture, GTK_STACK(stack), art_id);
+    }
+}
+
+static GtkWidget *create_art_menu_button(GtkWidget *row_box, GArray *variants, int selected_art) {
+    if (!variants || variants->len <= 1) return NULL;
+
+    SearchUI *ui = (SearchUI *)g_object_get_data(G_OBJECT(row_box), "search_ui");
+
+    GtkWidget *button = gtk_menu_button_new();
+    gtk_menu_button_set_label(GTK_MENU_BUTTON(button), "异画");
+    gtk_menu_button_set_always_show_arrow(GTK_MENU_BUTTON(button), FALSE);
+    gtk_widget_set_tooltip_text(button, "切换异画");
+    gtk_widget_set_halign(button, GTK_ALIGN_START);
+    gtk_widget_set_valign(button, GTK_ALIGN_CENTER);
+    gtk_widget_add_css_class(button, "flat");
+    gtk_widget_add_css_class(button, "art-menu-button");
+
+    GtkWidget *popover = gtk_popover_new();
+    GtkWidget *scroller = gtk_scrolled_window_new();
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    int rows = (variants->len + 2) / 3;
+    int height = MIN(rows * 114 + 12, 420);
+    gtk_widget_set_size_request(scroller, 280, height);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 6);
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 6);
+    gtk_widget_set_margin_start(grid, 6);
+    gtk_widget_set_margin_end(grid, 6);
+    gtk_widget_set_margin_top(grid, 6);
+    gtk_widget_set_margin_bottom(grid, 6);
+
+    for (guint i = 0; i < variants->len; i++) {
+        int art_id = g_array_index(variants, int, i);
+
+        GtkWidget *item = gtk_button_new();
+        gtk_widget_add_css_class(item, "flat");
+        gtk_widget_add_css_class(item, "art-choice");
+        if (art_id == selected_art) {
+            gtk_widget_add_css_class(item, "art-choice-selected");
+        }
+        gchar *tip = (i == 0) ? g_strdup_printf("原画 (%d)", art_id)
+                              : g_strdup_printf("异画 %u (%d)", i, art_id);
+        gtk_widget_set_tooltip_text(item, tip);
+        g_free(tip);
+
+        GtkWidget *stack = gtk_stack_new();
+        gtk_stack_set_transition_type(GTK_STACK(stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
+        gtk_stack_set_transition_duration(GTK_STACK(stack), 120);
+        gtk_widget_set_size_request(stack, 68, 99);
+
+        GtkWidget *placeholder = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+        gtk_widget_set_size_request(placeholder, 68, 99);
+        gtk_widget_set_valign(placeholder, GTK_ALIGN_CENTER);
+        gtk_widget_set_halign(placeholder, GTK_ALIGN_CENTER);
+        GtkWidget *spinner = gtk_spinner_new();
+        gtk_spinner_start(GTK_SPINNER(spinner));
+        gtk_box_append(GTK_BOX(placeholder), spinner);
+        gtk_stack_add_named(GTK_STACK(stack), placeholder, "placeholder");
+
+        GtkWidget *picture = gtk_drawing_area_new();
+        gtk_widget_set_size_request(picture, 68, 99);
+        gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(picture), draw_pixbuf_scaled, NULL, NULL);
+        g_signal_connect(picture, "destroy", G_CALLBACK(on_drawing_area_destroy), NULL);
+        gtk_stack_add_named(GTK_STACK(stack), picture, "picture");
+        gtk_stack_set_visible_child_name(GTK_STACK(stack), "placeholder");
+        gtk_button_set_child(GTK_BUTTON(item), stack);
+
+        // 缩略图延迟到弹出菜单真正显示时再加载，避免搜索结果里每张异画卡都预下载一堆图。
+        // 注意挂在 stack 上：初始显示的是 placeholder 页，picture 页尚未 map，
+        // 若把 map 信号挂在 picture 上，缩略图永远不会开始加载。
+        g_object_set_data(G_OBJECT(stack), "art_choice_ui", ui);
+        g_object_set_data(G_OBJECT(stack), "art_choice_id", GINT_TO_POINTER(art_id));
+        g_signal_connect(stack, "map", G_CALLBACK(on_art_choice_map), NULL);
+
+        g_object_set_data(G_OBJECT(item), "art_row", row_box);
+        // +1 避免索引 0 被 g_object_set_data 当作 NULL 删除
+        g_object_set_data(G_OBJECT(item), "art_index", GINT_TO_POINTER((int)i + 1));
+        g_signal_connect(item, "clicked", G_CALLBACK(on_art_choice_clicked), NULL);
+
+        gtk_grid_attach(GTK_GRID(grid), item, (int)(i % 3), (int)(i / 3), 1, 1);
+    }
+
+    gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), grid);
+    gtk_popover_set_child(GTK_POPOVER(popover), scroller);
+    gtk_menu_button_set_popover(GTK_MENU_BUTTON(button), popover);
+    g_object_set_data(G_OBJECT(row_box), "art_menu_button", button);
+    return button;
 }
 
 // 逐个加载搜索结果图片，避免同时加载太多导致UI卡顿
@@ -258,7 +484,13 @@ gboolean search_load_next_image(gpointer user_data) {
         if (target && stack && GTK_IS_DRAWING_AREA(target) && GTK_IS_STACK(stack)) {
             // 清除标记，表示已处理
             g_object_set_data(G_OBJECT(target), "pending_img_id", GINT_TO_POINTER(0));
-            
+
+            // 用户已经切到别的异画：丢弃队列里的旧图
+            if (!search_thumb_matches_expected(target, img_id)) {
+                loaded++;
+                continue;
+            }
+
             if (is_prerelease) {
                 // 先行卡：直接在后台线程加载本地文件（不使用libsoup）
                 gchar *local_path = get_prerelease_card_image_path(img_id);
@@ -354,6 +586,26 @@ gboolean batch_render_results(gpointer user_data) {
     return G_SOURCE_CONTINUE;
 }
 
+static void on_alt_art_ready(gpointer user_data) {
+    SearchUI *ui = (SearchUI *)user_data;
+    if (!ui || !ui->list || !ui->entry || !ui->button) return;
+    // 用户还没有搜索结果时不打扰；有结果则原地刷新，补上异画按钮
+    if (!gtk_widget_get_first_child(ui->list)) return;
+    const char *q = gtk_editable_get_text(GTK_EDITABLE(ui->entry));
+    if ((!q || *q == '\0') && !has_active_filter()) return;
+    if (ui->toast_overlay) {
+        AdwToast *toast = adw_toast_new("异画数据已就绪，已刷新搜索结果");
+        adw_toast_set_timeout(toast, 3);
+        adw_toast_overlay_add_toast(ui->toast_overlay, toast);
+    }
+    on_search_clicked(GTK_BUTTON(ui->button), ui);
+}
+
+void search_ui_watch_alt_art(SearchUI *ui) {
+    if (!ui) return;
+    alt_art_set_ready_callback(on_alt_art_ready, ui);
+}
+
 // 将结果加入渲染队列（延迟渲染）
 void queue_result_for_render(SearchUI *ui, JsonObject *obj) {
     if (!ui) return;
@@ -400,6 +652,31 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
         cid = json_object_get_int_member(obj, "cid");
     }
 
+    // 异画：id 是本体密码，artid 是用户直接搜索异画密码时 ygocdb 返回的版本。
+    // 默认版本优先取用户上次选择，其次取 artid，最后回退本体。
+    int artid = 0;
+    if (json_object_has_member(obj, "artid")) {
+        artid = json_object_get_int_member(obj, "artid");
+    }
+    GArray *art_variants = NULL;
+    int selected_art = id;
+    if (id > 0) {
+        art_variants = alt_art_get_variants(id);
+        if (artid > 0) {
+            // 用户直接搜索异画密码：即使本地还没有异画列表，也按 artid 显示/加入
+            selected_art = artid;
+        } else if (art_variants && art_variants->len > 1) {
+            int remembered = alt_art_get_selected(id);
+            if (art_variants_contains(art_variants, remembered)) {
+                selected_art = remembered;
+            }
+        }
+        if (!art_variants || art_variants->len <= 1) {
+            if (art_variants) g_array_unref(art_variants);
+            art_variants = NULL;
+        }
+    }
+
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
     gtk_widget_set_margin_top(row, 6);
     gtk_widget_set_margin_bottom(row, 6);
@@ -440,6 +717,8 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
     gtk_stack_set_visible_child_name(GTK_STACK(thumb_stack), "placeholder");
     // 将 cid 和英文卡名存储到图片控件，以便设置禁限角标
     g_object_set_data(G_OBJECT(picture), "card_id", GINT_TO_POINTER(cid));
+    // 当前应显示的版本；异步图片回调据此丢弃旧异画
+    g_object_set_data(G_OBJECT(picture), "art_expected_id", GINT_TO_POINTER(selected_art));
     if (json_object_has_member(obj, "en_name")) {
         slot_set_en_name(picture, json_object_get_string_member(obj, "en_name"));
     }
@@ -459,8 +738,8 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
         gboolean loaded_from_cache = FALSE;
         
         if (!is_prerelease) {
-            GdkPixbuf *cached = get_thumb_from_cache(id);
-            if (cached && set_search_result_thumb(picture, GTK_STACK(thumb_stack), id, cached)) {
+            GdkPixbuf *cached = get_thumb_from_cache(selected_art);
+            if (cached && set_search_result_thumb(picture, GTK_STACK(thumb_stack), selected_art, cached)) {
                 loaded_from_cache = TRUE;
             }
         }
@@ -473,10 +752,10 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
             }
             
             // 在 picture 控件上存储待加载标记，用于后续查找
-            g_object_set_data(G_OBJECT(picture), "pending_img_id", GINT_TO_POINTER(id));
+            g_object_set_data(G_OBJECT(picture), "pending_img_id", GINT_TO_POINTER(selected_art));
             
             SearchImageToLoad *item = g_new0(SearchImageToLoad, 1);
-            item->img_id = id;
+            item->img_id = selected_art;
             item->is_prerelease = is_prerelease;
             item->target = picture;
             item->stack = GTK_STACK(thumb_stack);
@@ -514,6 +793,22 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
 
     gtk_box_append(GTK_BOX(vbox), title);
     gtk_box_append(GTK_BOX(vbox), subtitle);
+
+    // 禁限状态和“异画”按钮放同一排：禁限在左，异画在右。
+    // 没有异画时这一排只有禁限，保证所有卡片的禁限状态纵向对齐。
+    GtkWidget *status_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_halign(status_box, GTK_ALIGN_START);
+    gtk_widget_set_valign(status_box, GTK_ALIGN_CENTER);
+
+    // 有异画时创建菜单按钮，稍后与禁限状态一起加入 status_box
+    GtkWidget *art_button = NULL;
+    if (art_variants && art_variants->len > 1) {
+        g_object_set_data(G_OBJECT(row), "search_ui", ui);
+        g_object_set_data_full(G_OBJECT(row), "art_variants", art_variants,
+                               (GDestroyNotify)g_array_unref);
+        art_button = create_art_menu_button(row, art_variants, selected_art);
+        art_variants = NULL;
+    }
     
     // 显示禁限变更（如果有的话）
     if (json_object_has_member(obj, "forbidden_change")) {
@@ -521,6 +816,7 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
         if (change_str && *change_str != '\0') {
             GtkWidget *forbidden_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
             gtk_widget_set_halign(forbidden_box, GTK_ALIGN_START);
+            gtk_widget_set_valign(forbidden_box, GTK_ALIGN_CENTER);
 
             GtkWidget *forbidden_label = gtk_label_new(NULL);
             char *markup = g_strdup_printf("<b>[%s]</b>", change_str);
@@ -542,7 +838,7 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
             }
 
             gtk_box_append(GTK_BOX(forbidden_box), forbidden_label);
-            gtk_box_append(GTK_BOX(vbox), forbidden_box);
+            gtk_box_append(GTK_BOX(status_box), forbidden_box);
         }
         // 如果有禁限变更字段，跳过后续的禁限状态显示
         goto skip_forbidden_status;
@@ -598,6 +894,7 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
             if (display_status) {
                 GtkWidget *forbidden_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
                 gtk_widget_set_halign(forbidden_box, GTK_ALIGN_START);
+                gtk_widget_set_valign(forbidden_box, GTK_ALIGN_CENTER);
 
                 GtkWidget *forbidden_label = gtk_label_new(NULL);
                 char *markup = g_strdup_printf("<b>[%s]</b>", display_status);
@@ -610,7 +907,7 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
                 }
 
                 gtk_box_append(GTK_BOX(forbidden_box), forbidden_label);
-                gtk_box_append(GTK_BOX(vbox), forbidden_box);
+                gtk_box_append(GTK_BOX(status_box), forbidden_box);
             }
 
             g_free(points_buf);
@@ -637,6 +934,7 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
                 if (status) {
                     GtkWidget *forbidden_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
                     gtk_widget_set_halign(forbidden_box, GTK_ALIGN_START);
+                    gtk_widget_set_valign(forbidden_box, GTK_ALIGN_CENTER);
 
                     GtkWidget *forbidden_label = gtk_label_new(NULL);
                     char *markup = g_strdup_printf("<b>[%s]</b>", status);
@@ -653,13 +951,19 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
                     }
 
                     gtk_box_append(GTK_BOX(forbidden_box), forbidden_label);
-                    gtk_box_append(GTK_BOX(vbox), forbidden_box);
+                    gtk_box_append(GTK_BOX(status_box), forbidden_box);
                 }
             }
         }
     }
 
     skip_forbidden_status:
+    if (art_button) {
+        gtk_box_append(GTK_BOX(status_box), art_button);
+    }
+    gtk_widget_set_visible(status_box, gtk_widget_get_first_child(status_box) != NULL);
+    gtk_box_append(GTK_BOX(vbox), status_box);
+
     // 防止 row 扩展
     gtk_widget_set_hexpand(row, FALSE);
     gtk_widget_set_halign(row, GTK_ALIGN_START);
@@ -681,7 +985,7 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
     gtk_widget_add_controller(list_row, GTK_EVENT_CONTROLLER(click));
     // 存储预览数据
     CardPreview *pv = g_new0(CardPreview, 1);
-    pv->id = id;
+    pv->id = selected_art;
     pv->cid = cid;
     pv->cn_name = name ? g_strdup(name) : NULL;
     // 英文卡名（GENESYS 分值查找用）

@@ -36,6 +36,15 @@ static gboolean is_mem_cache_enabled(void) {
     return mem_cache_enabled;
 }
 
+// 搜索结果快速切换异画时，同一目标上可能同时存在多个网络/磁盘回调。
+// 只有仍对应当前 art_expected_id 的回调才允许更新 UI。
+static gboolean image_target_matches_expected(ImageLoadCtx *ctx) {
+    if (!ctx || ctx->expected_img_id <= 0) return TRUE;
+    if (!ctx->target || !GTK_IS_WIDGET(ctx->target)) return FALSE;
+    int expected = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(ctx->target), "art_expected_id"));
+    return expected <= 0 || expected == ctx->expected_img_id;
+}
+
 // 缩略图逻辑尺寸（与 UI 中 thumb-fixed 保持一致）
 #define THUMB_W 68
 #define THUMB_H 99
@@ -521,7 +530,8 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
     GdkPixbuf *thumb_pixbuf = NULL;
     
     // 使用代次检查代替 g_cancellable_is_cancelled
-    if (pixbuf && !is_cancelled(data->cancel_generation) && ctx->target) {
+    if (pixbuf && !is_cancelled(data->cancel_generation) && ctx->target &&
+        image_target_matches_expected(ctx)) {
         // 额外的类型检查以确保对象仍然有效
         if (GTK_IS_WIDGET(ctx->target) && GTK_IS_DRAWING_AREA(ctx->target)) {
             GdkPixbuf *ui_pixbuf = pixbuf;
@@ -601,7 +611,8 @@ static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer us
             if (!waiting_ctx) continue;
 
             // 只有在未取消且有有效pixbuf时才更新UI
-            if (!cancelled && pixbuf && waiting_ctx->target) {
+            if (!cancelled && pixbuf && waiting_ctx->target &&
+                image_target_matches_expected(waiting_ctx)) {
                 // 额外的类型检查以确保对象仍然有效
                 if (GTK_IS_WIDGET(waiting_ctx->target) && GTK_IS_DRAWING_AREA(waiting_ctx->target)) {
                     GdkPixbuf *ui_pixbuf = pixbuf;

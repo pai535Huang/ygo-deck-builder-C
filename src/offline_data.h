@@ -74,6 +74,12 @@ JsonObject* get_card_by_id_offline(int card_id);
 gchar* offline_get_en_name_by_id(int card_id);
 
 /**
+ * 获取离线数据 cards 目录路径（新分配，调用者 g_free）。
+ * 目录可能不存在；返回 NULL 表示无法确定路径。
+ */
+gchar *offline_get_cards_dir_copy(void);
+
+/**
  * 通过 Konami img_id（八位码）查找 ygocdb 短 cid
  * 使用构建好的反向索引，O(1) 常数时间
  * @return cid（短 ID），找不到返回 0
