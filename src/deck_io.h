@@ -73,6 +73,18 @@ gboolean load_offline_data_switch_state(void);
 void save_offline_data_switch_state(gboolean enabled);
 
 /**
+ * 加载“启用先行卡”状态
+ * @return TRUE 如果启用（每次启动自动检查更新），FALSE 如果关闭
+ */
+gboolean load_prerelease_enabled_state(void);
+
+/**
+ * 保存“启用先行卡”状态
+ * @param enabled TRUE 如果启用，FALSE 如果关闭
+ */
+void save_prerelease_enabled_state(gboolean enabled);
+
+/**
  * 加载个人信息中的 Konami ID。
  * @return 新分配的字符串，调用者需 g_free；若未设置返回 NULL
  */

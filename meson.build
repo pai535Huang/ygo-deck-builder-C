@@ -73,6 +73,27 @@ test_alt_art = executable('test_alt_art',
 )
 test('alt_art', test_alt_art)
 
+# 单元测试：取消“启用先行卡”后清空本地先行卡数据
+test_prerelease_clear = executable('test_prerelease_clear',
+  'tests/test_prerelease_clear.c',
+  'tests/test_app_path_stub.c',
+  'src/prerelease.c',
+  'src/archive_path.c',
+  include_directories: ['src'],
+  dependencies: [glib_dep, json_glib_dep, libsoup_dep, libarchive_dep, sqlite3_dep],
+)
+test('prerelease_clear', test_prerelease_clear)
+
+# 单元测试：settings.conf 布尔配置默认值与持久化
+test_prefs = executable('test_prefs',
+  'tests/test_prefs.c',
+  'tests/test_app_path_stub.c',
+  'src/prefs.c',
+  include_directories: ['src'],
+  dependencies: [glib_dep],
+)
+test('prefs', test_prefs)
+
 # 单元测试：strings.conf 解析与缓存（字段筛选性能修复）
 test_card_info = executable('test_card_info',
   'tests/test_card_info.c',

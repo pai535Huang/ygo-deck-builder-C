@@ -5,12 +5,36 @@
 #include <json-glib/json-glib.h>
 
 /**
- * 下载并处理先行卡数据
- * 此函数会在后台线程中执行，不会阻塞主线程
- * @param callback 完成后的回调函数，在主线程中调用
+ * 先行卡更新结果
+ */
+typedef enum {
+    PRERELEASE_UPDATE_UPDATED,    // 已下载并替换为新数据
+    PRERELEASE_UPDATE_UP_TO_DATE, // 上游 ETag 未变化，保留本地数据
+    PRERELEASE_UPDATE_FAILED      // 网络或处理失败，本地数据保持不变
+} PrereleaseUpdateResult;
+
+/**
+ * 先行卡更新完成回调（在主线程中调用）
+ * @param result 更新结果
  * @param user_data 传递给回调函数的用户数据
  */
-void download_prerelease_cards(GSourceFunc callback, gpointer user_data);
+typedef void (*PrereleaseUpdateCallback)(PrereleaseUpdateResult result, gpointer user_data);
+
+/**
+ * 检查并更新先行卡数据
+ * 先比较本地保存的 ETag 与上游；未变化时不做任何下载，失败时保留旧数据。
+ * 此函数会在后台线程中执行，不会阻塞主线程。
+ * @param callback 完成后的回调函数，在主线程中调用（可选）
+ * @param user_data 传递给回调函数的用户数据
+ */
+void update_prerelease_cards(PrereleaseUpdateCallback callback, gpointer user_data);
+
+/**
+ * 清空本地先行卡数据（图片、JSON、ETag）。
+ * 取消“启用先行卡”后调用。
+ * @return TRUE 如果删除成功或目录本就不存在，FALSE 删除失败
+ */
+gboolean clear_prerelease_data(void);
 
 /**
  * 从先行卡JSON文件中搜索卡片

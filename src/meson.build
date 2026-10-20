@@ -31,7 +31,8 @@ executable(
     'archive_path.c',
     'json_utils.c',
     'alt_art_index.c',
-    'alt_art.c'
+    'alt_art.c',
+    'prefs.c'
   ],
   dependencies: deps,
   install: true,

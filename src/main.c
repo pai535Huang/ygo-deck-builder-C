@@ -69,6 +69,9 @@ static char *personal_konami_id = NULL;
 // 全局变量：是否在搜索结果中显示先行卡（默认显示）
 gboolean show_prerelease_cards = TRUE;
 
+// 当前“启用先行卡”开关状态（与 settings.conf 同步）
+static gboolean prerelease_auto_update_enabled = FALSE;
+
 // 前向声明：GENESYS 总分更新
 void update_genesys_score(SearchUI *ui);
 // 前向声明：更新所有卡组槽位的限制角标
@@ -3334,52 +3337,100 @@ typedef struct {
     AdwToastOverlay *toast_overlay;
 } DownloadDialogData;
 
-// 下载先行卡完成后的回调
-static gboolean on_download_prerelease_complete(gpointer user_data) {
-    DownloadDialogData *data = (DownloadDialogData*)user_data;
+// 先行卡更新通知数据
+typedef struct {
+    AdwToastOverlay *toast_overlay;
+    gboolean user_initiated;
+} PrereleaseUpdateData;
+
+// 先行卡检查/更新完成后的回调（主线程）
+static void on_prerelease_update_complete(PrereleaseUpdateResult result, gpointer user_data) {
+    PrereleaseUpdateData *data = (PrereleaseUpdateData *)user_data;
     AdwToastOverlay *toast_overlay = data->toast_overlay;
-    
-    if (prerelease_data_exists()) {
-        if (toast_overlay) {
-            AdwToast *toast = adw_toast_new("先行卡下载完成");
-            adw_toast_set_timeout(toast, 2);
-            adw_toast_overlay_add_toast(toast_overlay, toast);
-        }
-        g_message("Pre-release cards downloaded and processed successfully");
-    } else {
-        if (toast_overlay) {
-            AdwToast *toast = adw_toast_new("先行卡下载失败");
-            adw_toast_set_timeout(toast, 3);
-            adw_toast_overlay_add_toast(toast_overlay, toast);
-        }
-        g_warning("Failed to download pre-release cards");
+    const char *message = NULL;
+    guint timeout = 2;
+
+    // 更新期间用户取消了“启用先行卡”：不要把刚下载的数据重新留下
+    if (!prerelease_auto_update_enabled) {
+        clear_prerelease_data();
+        g_free(data);
+        return;
     }
-    
-    // 释放数据结构
+
+    switch (result) {
+    case PRERELEASE_UPDATE_UPDATED:
+        message = "先行卡已更新";
+        break;
+    case PRERELEASE_UPDATE_UP_TO_DATE:
+        // 启动时的自动检查不打扰用户，只在手动勾选后提示
+        if (data->user_initiated) {
+            message = "先行卡已是最新";
+        }
+        break;
+    case PRERELEASE_UPDATE_FAILED:
+        if (data->user_initiated) {
+            message = "先行卡更新失败";
+            timeout = 3;
+        }
+        break;
+    default:
+        break;
+    }
+
+    if (message && toast_overlay) {
+        AdwToast *toast = adw_toast_new(message);
+        adw_toast_set_timeout(toast, timeout);
+        adw_toast_overlay_add_toast(toast_overlay, toast);
+    }
+
     g_free(data);
-    
-    return G_SOURCE_REMOVE;
 }
 
-// 下载先行卡 GAction 回调
-static void on_download_prerelease_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-    (void)action;
-    (void)parameter;
-    SearchUI *ui = (SearchUI*)user_data;
-    
-    g_message("Starting pre-release cards download...");
-    
-    if (ui && ui->toast_overlay) {
-        AdwToast *toast = adw_toast_new("正在下载先行卡");
+// 启动一次先行卡检查/更新（后台线程，ETag 未变化时不会重复下载）
+static void start_prerelease_update(SearchUI *ui, gboolean user_initiated) {
+    if (user_initiated && ui && ui->toast_overlay) {
+        AdwToast *toast = adw_toast_new("正在检查先行卡更新");
         adw_toast_set_timeout(toast, 2);
         adw_toast_overlay_add_toast(ui->toast_overlay, toast);
     }
-    
-    DownloadDialogData *data = g_new0(DownloadDialogData, 1);
+
+    PrereleaseUpdateData *data = g_new0(PrereleaseUpdateData, 1);
     data->toast_overlay = ui ? ui->toast_overlay : NULL;
-    
-    // 启动后台下载
-    download_prerelease_cards(on_download_prerelease_complete, data);
+    data->user_initiated = user_initiated;
+
+    update_prerelease_cards(on_prerelease_update_complete, data);
+}
+
+// “启用先行卡” GAction 回调（stateful boolean）：
+// 勾选后立即检查一次更新，并持久化开关供后续启动使用。
+static void on_enable_prerelease_action(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+    (void)parameter;
+    SearchUI *ui = (SearchUI *)user_data;
+
+    GVariant *state = g_action_get_state(G_ACTION(action));
+    gboolean enabled = !g_variant_get_boolean(state);
+    g_variant_unref(state);
+
+    g_simple_action_set_state(action, g_variant_new_boolean(enabled));
+    prerelease_auto_update_enabled = enabled;
+    save_prerelease_enabled_state(enabled);
+    g_message("Pre-release auto-update %s", enabled ? "enabled" : "disabled");
+
+    if (enabled) {
+        start_prerelease_update(ui, TRUE);
+    } else {
+        // 关闭后先行卡不可用：清空图片、JSON 与 ETag
+        gboolean cleared = clear_prerelease_data();
+        if (ui && ui->toast_overlay) {
+            AdwToast *toast = adw_toast_new(cleared ? "已清除本地先行卡数据"
+                                                   : "清除本地先行卡数据失败");
+            adw_toast_set_timeout(toast, cleared ? 2 : 3);
+            adw_toast_overlay_add_toast(ui->toast_overlay, toast);
+        }
+        if (!cleared) {
+            g_warning("Failed to clear pre-release data");
+        }
+    }
 }
 
 // 下载离线数据完成后的回调
@@ -3845,8 +3896,12 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(app_menu_button), "open-menu-symbolic");
     gtk_widget_set_tooltip_text(app_menu_button, "应用菜单");
     /* 创建应用菜单，包含先行卡相关菜单项 */
+    prerelease_auto_update_enabled = load_prerelease_enabled_state();
     GMenu *app_menu = g_menu_new();
-    g_menu_append(app_menu, "下载先行卡", "win.download-prerelease");
+    // 有状态动作用布尔 state 表示勾选状态，GTK 会自动显示为复选菜单项
+    GMenuItem *enable_prerelease_item = g_menu_item_new("启用先行卡", "win.enable-prerelease");
+    g_menu_append_item(app_menu, enable_prerelease_item);
+    g_object_unref(enable_prerelease_item);
     g_menu_append(app_menu, "显示先行卡", "win.show-prerelease");
     g_menu_append(app_menu, "显示禁限变更", "win.show-forbidden-changes");
     g_menu_append(app_menu, "个人信息", "win.edit-personal-info");
@@ -4356,10 +4411,12 @@ on_activate(GApplication *app, gpointer user_data)
     adw_application_window_set_content(win, GTK_WIDGET(toast_overlay));
 
     // 注册应用菜单动作
-    GSimpleAction *download_action = g_simple_action_new("download-prerelease", NULL);
-    g_signal_connect(download_action, "activate", G_CALLBACK(on_download_prerelease_action), sui);
-    g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(download_action));
-    g_object_unref(download_action);
+    GSimpleAction *enable_prerelease_action = g_simple_action_new_stateful(
+        "enable-prerelease", NULL, g_variant_new_boolean(prerelease_auto_update_enabled));
+    g_signal_connect(enable_prerelease_action, "activate",
+                     G_CALLBACK(on_enable_prerelease_action), sui);
+    g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(enable_prerelease_action));
+    g_object_unref(enable_prerelease_action);
     
     GSimpleAction *show_action = g_simple_action_new("show-prerelease", NULL);
     g_signal_connect(show_action, "activate", G_CALLBACK(on_show_prerelease_action), sui);
@@ -4377,6 +4434,12 @@ on_activate(GApplication *app, gpointer user_data)
     g_object_unref(edit_personal_info_action);
 
     gtk_window_present(GTK_WINDOW(win));
+
+    // 启用后每次启动自动检查先行卡更新（ETag 未变化时不会重复下载）
+    if (prerelease_auto_update_enabled) {
+        g_message("Pre-release auto-update is enabled, checking for updates...");
+        start_prerelease_update(sui, FALSE);
+    }
 }
 
 int

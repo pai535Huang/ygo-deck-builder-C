@@ -6,6 +6,7 @@
 #include "offline_data.h"
 #include "alt_art.h"
 #include "app_path.h"
+#include "prefs.h"
 #include <stdio.h>
 #include <string.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
@@ -308,69 +309,22 @@ void save_io_config(const char *last_export_dir, const char *last_import_dir, co
 
 // 加载离线数据开关状态
 gboolean load_offline_data_switch_state(void) {
-    char *config_path;
-    
-    if (is_portable_mode()) {
-        // 便携模式
-        const char *prog_dir = get_program_directory();
-        config_path = g_build_filename(prog_dir, CONFIG_FILE, NULL);
-    } else {
-        // 系统安装模式
-        const char *config_home = g_get_user_config_dir();
-        config_path = g_build_filename(config_home, "ygo-deck-builder", CONFIG_FILE, NULL);
-    }
-    
-    GKeyFile *keyfile = g_key_file_new();
-    GError *error = NULL;
-    gboolean enabled = FALSE;
-    
-    if (g_key_file_load_from_file(keyfile, config_path, G_KEY_FILE_NONE, &error)) {
-        enabled = g_key_file_get_boolean(keyfile, "Preferences", "OfflineDataEnabled", NULL);
-    } else if (error) {
-        g_error_free(error);
-    }
-    
-    g_key_file_free(keyfile);
-    g_free(config_path);
-    
-    return enabled;
+    return prefs_get_boolean("Preferences", "OfflineDataEnabled", FALSE);
 }
 
 // 保存离线数据开关状态
 void save_offline_data_switch_state(gboolean enabled) {
-    char *config_path;
-    
-    if (is_portable_mode()) {
-        // 便携模式
-        const char *prog_dir = get_program_directory();
-        config_path = g_build_filename(prog_dir, CONFIG_FILE, NULL);
-    } else {
-        // 系统安装模式
-        const char *config_home = g_get_user_config_dir();
-        config_path = g_build_filename(config_home, "ygo-deck-builder", CONFIG_FILE, NULL);
-        // 确保配置目录存在
-        char *config_dir = g_path_get_dirname(config_path);
-        g_mkdir_with_parents(config_dir, 0755);
-        g_free(config_dir);
-    }
-    
-    GKeyFile *keyfile = g_key_file_new();
-    
-    // 尝试加载现有配置
-    g_key_file_load_from_file(keyfile, config_path, G_KEY_FILE_NONE, NULL);
-    
-    // 设置新值
-    g_key_file_set_boolean(keyfile, "Preferences", "OfflineDataEnabled", enabled);
-    
-    // 保存到文件
-    GError *error = NULL;
-    if (!g_key_file_save_to_file(keyfile, config_path, &error)) {
-        g_warning("无法保存配置: %s", error->message);
-        g_error_free(error);
-    }
-    
-    g_key_file_free(keyfile);
-    g_free(config_path);
+    prefs_set_boolean("Preferences", "OfflineDataEnabled", enabled);
+}
+
+// 加载“启用先行卡”状态（开启后每次启动自动检查更新）
+gboolean load_prerelease_enabled_state(void) {
+    return prefs_get_boolean("Preferences", "PrereleaseEnabled", FALSE);
+}
+
+// 保存“启用先行卡”状态
+void save_prerelease_enabled_state(gboolean enabled) {
+    prefs_set_boolean("Preferences", "PrereleaseEnabled", enabled);
 }
 
 // 加载个人信息中的 Konami ID

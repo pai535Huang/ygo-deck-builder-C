@@ -15,6 +15,7 @@
 
 #define PRERELEASE_URL "https://cdntx.moecube.com/ygopro-super-pre/archive/ygopro-super-pre.ypk"
 #define PRERELEASE_JSON_FILENAME "pre-release.json"
+#define PRERELEASE_ETAG_FILENAME "pre-release.etag"
 
 // 先行卡 JSON 解析共享缓存：
 // find_prerelease_card_by_id 会被逐卡调用（如排序 60 张卡会调用 60 次），
@@ -164,21 +165,23 @@ static gboolean remove_directory_recursive(const char *path) {
 }
 
 /**
- * 清空先行卡目录
+ * 清空先行卡目录（图片、JSON、ETag）
  */
-static void clear_prerelease_directory(void) {
+gboolean clear_prerelease_data(void) {
     gchar *data_dir = get_prerelease_data_dir();
     if (!data_dir) {
-        return;
+        return FALSE;
     }
-    
-    // 如果目录存在，递归删除
+
+    gboolean success = TRUE;
+    // 如果目录存在，递归删除；目录本就不存在视为成功
     if (g_file_test(data_dir, G_FILE_TEST_IS_DIR)) {
         g_message("Clearing pre-release directory: %s", data_dir);
-        remove_directory_recursive(data_dir);
+        success = remove_directory_recursive(data_dir);
     }
-    
+
     g_free(data_dir);
+    return success;
 }
 
 /**
@@ -399,194 +402,285 @@ static JsonNode *parse_cdb_to_json(const char *cdb_path) {
 }
 
 /**
- * 后台线程执行的下载和处理函数
+ * 后台线程执行的更新和处理函数
  */
 typedef struct {
-    GSourceFunc callback;
+    PrereleaseUpdateCallback callback;
     gpointer user_data;
-    gboolean success;
-} DownloadContext;
+} UpdateContext;
 
-static gpointer download_prerelease_thread(gpointer data) {
-    DownloadContext *ctx = (DownloadContext *)data;
-    
-    // 首先清空先行卡目录，强制重新下载
-    clear_prerelease_directory();
-    
+typedef struct {
+    PrereleaseUpdateCallback callback;
+    gpointer user_data;
+    PrereleaseUpdateResult result;
+} UpdateDone;
+
+static gboolean update_done_idle(gpointer data) {
+    UpdateDone *done = (UpdateDone *)data;
+
+    if (done->callback) {
+        done->callback(done->result, done->user_data);
+    }
+
+    g_free(done);
+    return G_SOURCE_REMOVE;
+}
+
+static void update_finish(UpdateContext *ctx, PrereleaseUpdateResult result) {
+    if (ctx->callback) {
+        UpdateDone *done = g_new0(UpdateDone, 1);
+        done->callback = ctx->callback;
+        done->user_data = ctx->user_data;
+        done->result = result;
+        g_idle_add(update_done_idle, done);
+    }
+
+    g_free(ctx);
+}
+
+/**
+ * 记录上次成功更新时上游 YPK 的 ETag。
+ * 下次启动时带上它发条件请求：上游未变化则返回 304，无需下载。
+ */
+static gchar *get_prerelease_etag_path(void) {
     gchar *data_dir = get_prerelease_data_dir();
     if (!data_dir) {
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
         return NULL;
     }
-    
-    ensure_directory_exists(data_dir);
-    
-    // 下载YPK文件
-    gchar *ypk_path = g_build_filename(data_dir, "ygopro-super-pre.ypk", NULL);
-    
-    SoupSession *session = soup_session_new();
-    // 设置超时时间为300秒，YPK文件较大需要更长时间
+
+    gchar *path = g_build_filename(data_dir, PRERELEASE_ETAG_FILENAME, NULL);
+    g_free(data_dir);
+    return path;
+}
+
+static gchar *read_prerelease_etag(void) {
+    gchar *path = get_prerelease_etag_path();
+    if (!path) {
+        return NULL;
+    }
+
+    gchar *contents = NULL;
+    if (!g_file_get_contents(path, &contents, NULL, NULL)) {
+        g_free(path);
+        return NULL;
+    }
+
+    g_free(path);
+    g_strstrip(contents);
+    if (!*contents) {
+        g_free(contents);
+        return NULL;
+    }
+
+    return contents;
+}
+
+static void write_prerelease_etag(const char *etag) {
+    if (!etag || !*etag) {
+        return;
+    }
+
+    gchar *path = get_prerelease_etag_path();
+    if (!path) {
+        return;
+    }
+
+    GError *error = NULL;
+    if (!g_file_set_contents(path, etag, -1, &error)) {
+        g_warning("Failed to save pre-release ETag: %s", error->message);
+        g_error_free(error);
+    }
+
+    g_free(path);
+}
+
+static gpointer update_prerelease_thread(gpointer data) {
+    UpdateContext *ctx = (UpdateContext *)data;
+    PrereleaseUpdateResult result = PRERELEASE_UPDATE_FAILED;
+    gchar *data_dir = get_prerelease_data_dir();
+    gchar *local_etag = NULL;
+    gchar *etag_to_store = NULL;
+    gchar *ypk_path = NULL;
+    SoupSession *session = NULL;
+    SoupMessage *msg = NULL;
+    GInputStream *input = NULL;
+    GOutputStream *output = NULL;
+    GFile *file = NULL;
+    GError *error = NULL;
+
+    if (!data_dir) {
+        g_warning("Failed to resolve pre-release data directory");
+        goto out;
+    }
+
+    // 本地没有数据时不发条件请求，避免 304 后仍然没有可用数据
+    if (prerelease_data_exists()) {
+        local_etag = read_prerelease_etag();
+    }
+
+    session = soup_session_new();
+    // YPK 文件较大，沿用较长的超时时间
     g_object_set(session, "timeout", 300u, NULL);
-    SoupMessage *msg = soup_message_new("GET", PRERELEASE_URL);
-    
-    // 设置User-Agent避免被服务器拒绝或限速
+
+    msg = soup_message_new("GET", PRERELEASE_URL);
+    if (!msg) {
+        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "无效的先行卡下载地址");
+        goto out;
+    }
+
     SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
     soup_message_headers_append(headers, "User-Agent",
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-    
-    g_message("Downloading pre-release cards from %s", PRERELEASE_URL);
-    
-    GError *error = NULL;
-    GInputStream *input = soup_session_send(session, msg, NULL, &error);
+    if (local_etag) {
+        // 本地已有数据：带上上次的 ETag，上游未变化时返回 304 且无响应体
+        soup_message_headers_append(headers, "If-None-Match", local_etag);
+    }
+
+    g_message("Checking pre-release cards from %s (local ETag: %s)",
+              PRERELEASE_URL, local_etag ? local_etag : "none");
+
+    input = soup_session_send(session, msg, NULL, &error);
+    guint status = soup_message_get_status(msg);
+
+    if (!error && status == SOUP_STATUS_NOT_MODIFIED) {
+        g_message("Pre-release cards are up to date");
+        result = PRERELEASE_UPDATE_UP_TO_DATE;
+        goto out;
+    }
+
     // 非 2xx 的错误页不能当作 YPK 压缩包保存（否则会写出损坏的压缩包）
-    if (!error && !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(msg))) {
+    if (!error && !SOUP_STATUS_IS_SUCCESSFUL(status)) {
         error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "HTTP %u %s",
-                            soup_message_get_status(msg), soup_message_get_reason_phrase(msg));
+                            status, soup_message_get_reason_phrase(msg));
     }
-    g_object_unref(msg);  // 释放调用方引用
-    
+
     if (error) {
-        g_warning("Failed to download pre-release cards: %s", error->message);
-        g_error_free(error);
-        if (input) g_object_unref(input);  // HTTP 失败时 send 仍会返回非空流
-        g_object_unref(session);
-        g_free(ypk_path);
-        g_free(data_dir);
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
+        goto out;
     }
-    
-    // 保存到文件
-    GFile *file = g_file_new_for_path(ypk_path);
-    GOutputStream *output = (GOutputStream *)g_file_replace(file, NULL, FALSE, G_FILE_CREATE_NONE, NULL, &error);
-    
+
+    if (!input) {
+        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "下载响应为空");
+        goto out;
+    }
+
+    const char *remote_etag = soup_message_headers_get_one(
+        soup_message_get_response_headers(msg), "ETag");
+    if (remote_etag) {
+        etag_to_store = g_strdup(remote_etag);
+    }
+
+    // 下载到数据目录之外的临时文件，下载完成前不碰本地旧数据
+    gint fd = g_file_open_tmp("ygo-prerelease-XXXXXX.ypk", &ypk_path, &error);
+    if (fd < 0) {
+        goto out;
+    }
+    g_close(fd, NULL);
+
+    file = g_file_new_for_path(ypk_path);
+    output = (GOutputStream *)g_file_replace(file, NULL, FALSE,
+                                             G_FILE_CREATE_NONE, NULL, &error);
     if (error) {
-        g_warning("Failed to create output file: %s", error->message);
-        g_error_free(error);
-        g_object_unref(input);
-        g_object_unref(file);
-        g_object_unref(session);
-        g_free(ypk_path);
-        g_free(data_dir);
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
+        goto out;
     }
-    
-    // 复制数据
-    g_output_stream_splice(output, input, G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE | G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET, NULL, &error);
-    
-    if (error) {
-        g_warning("Failed to save file: %s", error->message);
-        g_error_free(error);
-        g_object_unref(input);
-        g_object_unref(output);
-        g_object_unref(file);
-        g_object_unref(session);
-        g_free(ypk_path);
-        g_free(data_dir);
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
+
+    gssize spliced = g_output_stream_splice(output, input,
+                                            G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE |
+                                            G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET,
+                                            NULL, &error);
+    if (spliced < 0 || error) {
+        goto out;
     }
-    
-    g_object_unref(input);
-    g_object_unref(output);
-    g_object_unref(file);
-    g_object_unref(session);
-    
-    g_message("Pre-release cards downloaded successfully");
-    
-    // 解压文件
+
+    // splice 已关闭流；清空指针避免重复释放
+    g_clear_object(&output);
+    g_clear_object(&input);
+    g_clear_object(&file);
+
+    g_message("Pre-release cards downloaded successfully, replacing local data");
+
+    // 完整下载成功后才清空旧数据；网络失败时旧数据保持不变
+    if (!clear_prerelease_data()) {
+        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "清空旧先行卡数据失败");
+        goto out;
+    }
+    ensure_directory_exists(data_dir);
+
     g_message("Extracting YPK archive...");
     if (!extract_ypk_file(ypk_path, data_dir)) {
-        g_warning("Failed to extract YPK file");
-        g_free(ypk_path);
-        g_free(data_dir);
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
+        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "解压先行卡压缩包失败");
+        goto out;
     }
-    
-    g_message("YPK archive extracted successfully");
-    
-    // 删除YPK文件
-    remove(ypk_path);
-    g_free(ypk_path);
-    
-    // 解析CDB文件
+
     gchar *cdb_path = g_build_filename(data_dir, "test-release.cdb", NULL);
     JsonNode *json_root = parse_cdb_to_json(cdb_path);
     g_free(cdb_path);
-    
+
     if (!json_root) {
-        g_warning("Failed to parse CDB file");
-        g_free(data_dir);
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
+        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "解析先行卡 CDB 失败");
+        goto out;
     }
-    
-    // 保存为JSON文件
+
+    gboolean saved = FALSE;
     gchar *json_path = get_prerelease_json_path();
     if (json_path) {
         JsonGenerator *gen = json_generator_new();
         json_generator_set_root(gen, json_root);
         json_generator_set_pretty(gen, TRUE);
-        
+
         GError *json_error = NULL;
         if (!json_generator_to_file(gen, json_path, &json_error)) {
             g_warning("Failed to save JSON file: %s", json_error->message);
             g_error_free(json_error);
-            ctx->success = FALSE;
         } else {
             g_message("Pre-release JSON saved to %s", json_path);
-            ctx->success = TRUE;
+            saved = TRUE;
         }
-        
+
         g_object_unref(gen);
         g_free(json_path);
     }
-    
+
     json_node_free(json_root);
-    g_free(data_dir);
-    
-    // 回调通知完成
-    if (ctx->callback) {
-        g_idle_add(ctx->callback, ctx->user_data);
+
+    if (!saved) {
+        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "保存先行卡 JSON 失败");
+        goto out;
     }
-    
-    g_free(ctx);
+
+    write_prerelease_etag(etag_to_store);
+    result = PRERELEASE_UPDATE_UPDATED;
+
+out:
+    if (error) {
+        g_warning("Failed to update pre-release cards: %s", error->message);
+        g_error_free(error);
+    }
+
+    g_clear_object(&output);
+    g_clear_object(&input);
+    g_clear_object(&file);
+    g_clear_object(&msg);
+    g_clear_object(&session);
+
+    if (ypk_path) {
+        g_remove(ypk_path);
+        g_free(ypk_path);
+    }
+
+    g_free(etag_to_store);
+    g_free(local_etag);
+    g_free(data_dir);
+
+    update_finish(ctx, result);
     return NULL;
 }
 
-void download_prerelease_cards(GSourceFunc callback, gpointer user_data) {
-    DownloadContext *ctx = g_new0(DownloadContext, 1);
+void update_prerelease_cards(PrereleaseUpdateCallback callback, gpointer user_data) {
+    UpdateContext *ctx = g_new0(UpdateContext, 1);
     ctx->callback = callback;
     ctx->user_data = user_data;
-    ctx->success = FALSE;
-    
-    GThread *thread = g_thread_new("prerelease-download", download_prerelease_thread, ctx);
+
+    GThread *thread = g_thread_new("prerelease-update", update_prerelease_thread, ctx);
     g_thread_unref(thread);
 }
 
