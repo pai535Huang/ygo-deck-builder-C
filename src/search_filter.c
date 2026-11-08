@@ -13,6 +13,7 @@
 
 // 搜索结果上限：保护右侧列表和图片队列，避免一次返回过多卡片拖慢 UI。
 #define SEARCH_MAX_RESULTS 500
+#define UNKNOWN_CARD_STAT (-2)
 
 // 全局变量：是否在搜索结果中显示先行卡（默认显示）
 extern gboolean show_prerelease_cards;
@@ -1226,13 +1227,64 @@ static void offline_search_finished(GObject *source, GAsyncResult *res, gpointer
     }
 }
 
+static gboolean parse_filter_number(const char *text, gboolean allow_unknown, gint64 *value) {
+    if (allow_unknown && g_str_equal(text, "?")) {
+        *value = UNKNOWN_CARD_STAT;
+        return TRUE;
+    }
+
+    return g_ascii_string_to_signed(text, 10, 0, G_MAXINT, value, NULL);
+}
+
+static gboolean matches_filter_number(const char *text, gint64 card_value, gboolean allow_unknown) {
+    gint64 required;
+    return !text || !*text ||
+           (parse_filter_number(text, allow_unknown, &required) && card_value == required);
+}
+
+static gboolean has_invalid_filter_number(const FilterState *filter) {
+    if (filter->card_type_selected != 1) {
+        return FALSE;
+    }
+
+    gboolean pendulum_selected = filter->monster_type_toggles[MONSTER_FILTER_PENDULUM];
+    const char *numbers[] = {
+        filter->atk_text, filter->def_text, filter->level_text,
+        pendulum_selected ? filter->left_scale_text : NULL,
+        pendulum_selected ? filter->right_scale_text : NULL,
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(numbers); i++) {
+        gint64 value;
+        if (numbers[i] && *numbers[i] && !parse_filter_number(numbers[i], i < 2, &value)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 void on_search_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     SearchUI *ui = (SearchUI*)user_data;
     const char *q = gtk_editable_get_text(GTK_EDITABLE(ui->entry));
     
-    // 如果搜索框为空且没有筛选条件，则不执行搜索
-    if ((!q || *q == '\0') && !has_active_filter()) {
+    const FilterState *filter = get_current_filter_state();
+    gboolean filter_active = has_active_filter();
+    gboolean has_query = q && *q;
+    if (!has_query && !filter_active) {
+        return;
+    }
+
+    gboolean offline_enabled = load_offline_data_switch_state() && offline_data_exists();
+    if (filter_active && !offline_enabled) {
+        if (ui->toast_overlay) {
+            adw_toast_overlay_add_toast(ui->toast_overlay, adw_toast_new("使用筛选前请启用并下载离线数据。"));
+        }
+        return;
+    }
+    if (has_invalid_filter_number(filter)) {
+        if (ui->toast_overlay) {
+            adw_toast_overlay_add_toast(ui->toast_overlay, adw_toast_new("数值筛选请输入非负整数。攻击力和守备力也支持 ?。"));
+        }
         return;
     }
 
@@ -1287,11 +1339,7 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
     // 最后清空UI列表（这会销毁widget并触发弱引用清理）
     list_clear(GTK_LIST_BOX(ui->list));
 
-    // 获取当前筛选状态（在搜索先行卡之前就获取）
-    const FilterState *filter = get_current_filter_state();
-    
-    // 判断是否需要搜索所有卡片（搜索框为空但有筛选条件）
-    gboolean search_all = (!q || *q == '\0') && has_active_filter();
+    gboolean search_all = !has_query;
     
     // 设置最大结果数限制，避免UI卡死
     guint result_count = 0;
@@ -1335,10 +1383,7 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
         }
     }
 
-    // 检查是否启用离线数据
-    gboolean offline_enabled = load_offline_data_switch_state();
-
-    if (offline_enabled && offline_data_exists() && result_count < SEARCH_MAX_RESULTS) {
+    if (offline_enabled && result_count < SEARCH_MAX_RESULTS) {
         // 离线数据搜索：全量扫描移入后台线程，完成后回主线程渲染（达到上限即停止）
         g_message("Searching in offline data...");
 
@@ -1372,12 +1417,16 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
         request->generation = search_generation;
         soup_session_send_and_read_async(ui->session, msg, G_PRIORITY_DEFAULT, NULL, search_response_cb, request);
         g_object_unref(msg);  // soup_session_send_and_read_async 会内部增加引用
-    } else {
-        // 搜索框为空但有筛选条件，且离线数据未启用
-        // 在这种情况下，只显示先行卡的筛选结果（如果有）
-        g_message("Search query is empty with active filters, but offline data is not enabled");
     }
 }
+static gint64 get_filter_card_int(JsonObject *stats, const char *field, gint64 fallback) {
+    JsonNode *node = stats ? json_object_get_member(stats, field) : NULL;
+    if (!node || !JSON_NODE_HOLDS_VALUE(node) || json_node_get_value_type(node) != G_TYPE_INT64) {
+        return fallback;
+    }
+    return json_node_get_int(node);
+}
+
 // 应用筛选条件到搜索结果
 // 返回值：TRUE 表示卡片通过筛选，FALSE 表示应该被过滤掉
 gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
@@ -1385,26 +1434,17 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
         return TRUE;
     }
     
-    // 判断卡片数据结构类型并缓存data对象（如果是离线数据）
-    gboolean is_prerelease = json_object_has_member(card, "type");
-    JsonObject *data = NULL;
-    
-    if (!is_prerelease) {
-        if (json_object_has_member(card, "data")) {
-            data = json_object_get_object_member(card, "data");
-        }
+    // 先行卡的数值在卡片对象上，离线卡的数值在data对象中。
+    JsonObject *stats = card;
+    if (!json_object_has_member(card, "type")) {
+        JsonNode *data = json_object_get_member(card, "data");
+        stats = data && JSON_NODE_HOLDS_OBJECT(data) ? json_node_get_object(data) : NULL;
     }
-    
-    // 定义辅助宏来获取卡片字段（先行卡或离线数据）
-    #define GET_CARD_INT_FIELD(field_name, default_value) \
-        (is_prerelease \
-            ? (json_object_has_member(card, field_name) ? json_object_get_int_member(card, field_name) : (default_value)) \
-            : (data && json_object_has_member(data, field_name) ? json_object_get_int_member(data, field_name) : (default_value)))
-    
+
     // 首先检查字段筛选（不依赖卡片类型选择）
     if (filter_state->field_text && filter_state->field_text[0] != '\0') {
         // 获取卡片的setcode字段
-        gint64 card_setcode = GET_CARD_INT_FIELD("setcode", 0);
+        gint64 card_setcode = get_filter_card_int(stats, "setcode", 0);
         
         // 使用card_info中的函数检查字段匹配
         if (!match_setcode_with_field(card_setcode, filter_state->field_text)) {
@@ -1417,19 +1457,11 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
         return TRUE;
     }
     
-    // 获取卡片的type字段
-    gint64 card_type = 0;
-    
-    if (is_prerelease) {
-        // 先行卡结构：直接有type字段
-        card_type = json_object_get_int_member(card, "type");
-    } else if (data && json_object_has_member(data, "type")) {
-        // 离线数据结构：type在data对象中
-        card_type = json_object_get_int_member(data, "type");
-    } else {
+    gint64 card_type = get_filter_card_int(stats, "type", 0);
+    if (!card_type) {
         return FALSE;
     }
-    
+
     // 怪兽卡筛选
     if (filter_state->card_type_selected == 1) {
         // 首先检查是否是怪兽卡
@@ -1437,6 +1469,8 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
             return FALSE;
         }
         
+        gboolean is_link_monster = (card_type & 0x4000000) != 0;  // TYPE_LINK
+
         // 检查是否有任何怪兽类别被选中
         gboolean any_toggle_active = FALSE;
         for (int i = 0; i < 15; i++) {
@@ -1497,7 +1531,7 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
         }
         
         // 如果有连接箭头被选中，且卡片是连接怪兽，则检查箭头匹配
-        if (any_link_marker_active && (card_type & 0x4000000)) {  // TYPE_LINK = 0x4000000
+        if (filter_state->monster_type_toggles[MONSTER_FILTER_LINK] && any_link_marker_active && is_link_monster) {
             // 连接箭头顺序：↖ ↑ ↗ ← → ↙ ↓ ↘
             const uint32_t link_marker_flags[8] = {
                 0x040,  // ↖ LINK_MARKER_TOP_LEFT
@@ -1519,48 +1553,13 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
             }
             
             // 获取卡片的def字段（连接怪兽的def存储连接箭头）
-            gint64 card_def = GET_CARD_INT_FIELD("def", 0);
+            gint64 card_def = get_filter_card_int(stats, "def", 0);
             
             // 检查连接箭头是否完全匹配
             // 注意：这里不能直接 return，否则会跳过后续其它筛选条件（属性/种族/攻防/等级等）
             gboolean link_match = ((card_def & required_markers) == required_markers);
             if (!link_match) {
                 return FALSE;
-            }
-        }
-        
-        // 检查灵摆刻度筛选（仅对灵摆怪兽有效）
-        if (card_type & 0x1000000) {  // TYPE_PENDULUM = 0x1000000
-            // 检查是否有左刻度或右刻度筛选条件
-            gboolean has_left_scale_filter = (filter_state->left_scale_text && 
-                                               filter_state->left_scale_text[0] != '\0');
-            gboolean has_right_scale_filter = (filter_state->right_scale_text && 
-                                                filter_state->right_scale_text[0] != '\0');
-            
-            if (has_left_scale_filter || has_right_scale_filter) {
-                // 获取卡片的level字段
-                gint64 card_level_field = GET_CARD_INT_FIELD("level", 0);
-                
-                // 解析灵摆刻度
-                // level字段格式：第0-7位为等级，第16-23位为右刻度，第24-31位为左刻度
-                int card_left_scale = (card_level_field >> 24) & 0xFF;
-                int card_right_scale = (card_level_field >> 16) & 0xFF;
-                
-                // 检查左刻度
-                if (has_left_scale_filter) {
-                    int required_left_scale = atoi(filter_state->left_scale_text);
-                    if (card_left_scale != required_left_scale) {
-                        return FALSE;
-                    }
-                }
-                
-                // 检查右刻度
-                if (has_right_scale_filter) {
-                    int required_right_scale = atoi(filter_state->right_scale_text);
-                    if (card_right_scale != required_right_scale) {
-                        return FALSE;
-                    }
-                }
             }
         }
         
@@ -1582,7 +1581,7 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
             
             if (required_attribute != 0) {
                 // 获取卡片的attribute字段
-                gint64 card_attribute = GET_CARD_INT_FIELD("attribute", 0);
+                gint64 card_attribute = get_filter_card_int(stats, "attribute", 0);
                 
                 // 检查属性是否匹配
                 if (card_attribute != required_attribute) {
@@ -1612,7 +1611,7 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
             
             if (required_race != 0) {
                 // 获取卡片的race字段
-                gint64 card_race = GET_CARD_INT_FIELD("race", 0);
+                gint64 card_race = get_filter_card_int(stats, "race", 0);
                 
                 // 检查种族是否匹配
                 if (card_race != required_race) {
@@ -1621,53 +1620,46 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
             }
         }
         
-        // 检查攻击力筛选
-        if (filter_state->atk_text && filter_state->atk_text[0] != '\0') {
-            int required_atk = atoi(filter_state->atk_text);
-            
-            // 获取卡片的atk字段
-            gint64 card_atk = GET_CARD_INT_FIELD("atk", -1);
-            
-            // 检查攻击力是否匹配
-            if (card_atk != required_atk) {
+        if (filter_state->atk_text && *filter_state->atk_text &&
+            !matches_filter_number(filter_state->atk_text, get_filter_card_int(stats, "atk", -1), TRUE)) {
+            return FALSE;
+        }
+
+        // 连接怪兽没有守备力，def字段存储的是连接箭头。
+        if (filter_state->def_text && *filter_state->def_text &&
+            (is_link_monster ||
+             !matches_filter_number(filter_state->def_text, get_filter_card_int(stats, "def", -1), TRUE))) {
+            return FALSE;
+        }
+
+        gboolean has_level_filter = filter_state->level_text && *filter_state->level_text;
+        gboolean has_scale_filter = filter_state->monster_type_toggles[MONSTER_FILTER_PENDULUM] &&
+            ((filter_state->left_scale_text && *filter_state->left_scale_text) ||
+             (filter_state->right_scale_text && *filter_state->right_scale_text));
+
+        if (has_level_filter || has_scale_filter) {
+            // level字段也用于存储连接值和超量阶级。
+            if (has_level_filter && (is_link_monster || (card_type & 0x800000))) {  // TYPE_XYZ
+                return FALSE;
+            }
+
+            gint64 packed_level = get_filter_card_int(stats, "level", G_MININT64);
+            if (packed_level == G_MININT64) {
+                return FALSE;
+            }
+
+            int level, left_scale, right_scale;
+            parse_level_and_scales((uint32_t)packed_level, &level, &left_scale, &right_scale);
+            if (!matches_filter_number(filter_state->level_text, level, FALSE)) {
+                return FALSE;
+            }
+            if (has_scale_filter &&
+                (!matches_filter_number(filter_state->left_scale_text, left_scale, FALSE) ||
+                 !matches_filter_number(filter_state->right_scale_text, right_scale, FALSE))) {
                 return FALSE;
             }
         }
-        
-        // 检查守备力筛选
-        // 注意：连接怪兽的def字段存储连接箭头，所以如果是连接怪兽则跳过守备力筛选
-        gboolean is_link_monster = (card_type & 0x4000000) != 0;  // TYPE_LINK = 0x4000000
-        
-        if (!is_link_monster && filter_state->def_text && filter_state->def_text[0] != '\0') {
-            int required_def = atoi(filter_state->def_text);
-            
-            // 获取卡片的def字段
-            gint64 card_def = GET_CARD_INT_FIELD("def", -1);
-            
-            // 检查守备力是否匹配
-            if (card_def != required_def) {
-                return FALSE;
-            }
-        }
-        
-        // 检查等级筛选
-        if (filter_state->level_text && filter_state->level_text[0] != '\0') {
-            int required_level = atoi(filter_state->level_text);
-            
-            // 获取卡片的level字段
-            gint64 card_level_field = GET_CARD_INT_FIELD("level", 0);
-            
-            // 从level字段中提取真正的等级（第0-7位）
-            // 灵摆怪兽的level字段包含灵摆刻度信息：
-            // 第0-7位为等级，第16-23位为右刻度，第24-31位为左刻度
-            int card_level = card_level_field & 0xFF;
-            
-            // 检查等级是否匹配
-            if (card_level != required_level) {
-                return FALSE;
-            }
-        }
-        
+
         return TRUE;
     }
     
@@ -1688,11 +1680,11 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
         // 获取目标type值
         guint32 target_type = get_spell_type_from_category(selected_category);
         
-        // 检查卡片type是否匹配
-        // 使用精确匹配：卡片的type必须包含所有目标type的位
-        gboolean match = ((card_type & target_type) == target_type);
-        
-        return match;
+        // “通常”要求没有任何额外的类别位。
+        if (filter_state->spell_type_selected == 1) {
+            return card_type == target_type;
+        }
+        return (card_type & target_type) == target_type;
     }
     
     // 陷阱卡筛选
@@ -1712,14 +1704,12 @@ gboolean apply_filter(JsonObject *card, const FilterState *filter_state) {
         // 获取目标type值
         guint32 target_type = get_trap_type_from_category(selected_category);
         
-        // 检查卡片type是否匹配
-        gboolean match = ((card_type & target_type) == target_type);
-        
-        return match;
+        // “通常”要求没有任何额外的类别位。
+        if (filter_state->trap_type_selected == 1) {
+            return card_type == target_type;
+        }
+        return (card_type & target_type) == target_type;
     }
-    
-    // 清理宏定义
-    #undef GET_CARD_INT_FIELD
     
     // 其他类型暂不实现
     return TRUE;

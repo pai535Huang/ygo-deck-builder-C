@@ -37,6 +37,11 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj);
 // 禁限卡表变化回调
 void on_forbidden_dropdown_changed(GtkDropDown *dropdown, GParamSpec *pspec, gpointer user_data);
 
+enum {
+    MONSTER_FILTER_PENDULUM = 6,
+    MONSTER_FILTER_LINK = 7,
+};
+
 // 筛选状态结构体（与main.c中的FilterState对应）
 typedef struct {
     guint card_type_selected;  // 卡片类型选择 (0=全部, 1=怪兽, 2=魔法, 3=陷阱)

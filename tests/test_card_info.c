@@ -1,6 +1,6 @@
 // card_info / strings.conf setcode 解析与缓存单元测试（meson test）
 // 覆盖：
-//  1) 纯解析：注释/空行/畸形行、子串匹配、首个匹配优先、大小写 0X 前缀；
+//  1) 纯解析：注释/空行/畸形行、完整名称优先于子串匹配、大小写 0X 前缀；
 //  2) 缓存：同一文件版本内不再重读磁盘；文件变化（大小/修改时间）后自动失效。
 // 第 2 点是本次性能修复的核心——此前每张卡都重新读取并解析 47KB 的 strings.conf。
 #include "card_info.h"
@@ -28,6 +28,8 @@ static const char *SAMPLE =
     "!setname 0x9ABC Alpha\n"        // 第二个 Alpha：首个匹配必须优先
     "!setname 0xDEF0 2Alpha2\n"      // 子串匹配目标
     "!setname 0XABCD Upper\n"        // 大写 0X 前缀
+    "!setname 0x2345 幻影英雄\tPhantom HERO\n"
+    "!setname 0x3456 幻影\tPhantom\n"
     "!setname\n"                     // 畸形：仅 1 段
     "!setname 0x1111\n"              // 畸形：仅 2 段
     "!other 0x2222 NotSetname\n";    // 非 setname 指令
@@ -36,6 +38,8 @@ static void test_parse_semantics(void) {
     CHECK_U64(strings_conf_parse_setcode(SAMPLE, "Alpha"), 0x1234, "first match wins");
     CHECK_U64(strings_conf_parse_setcode(SAMPLE, "Beta"), 0x5678, "simple match");
     CHECK_U64(strings_conf_parse_setcode(SAMPLE, "Upper"), 0xABCD, "uppercase 0X prefix");
+    CHECK_U64(strings_conf_parse_setcode(SAMPLE, "幻影"), 0x3456, "exact name beats earlier substring");
+    CHECK_U64(strings_conf_parse_setcode(SAMPLE, "Phantom"), 0x3456, "exact alias is accepted");
     CHECK_U64(strings_conf_parse_setcode(SAMPLE, "2Alpha"), 0xDEF0, "substring match");
     CHECK_U64(strings_conf_parse_setcode(SAMPLE, "NotSetname"), 0, "only !setname lines count");
     CHECK_U64(strings_conf_parse_setcode(SAMPLE, "Missing"), 0, "unknown field returns 0");

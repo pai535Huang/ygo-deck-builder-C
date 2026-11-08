@@ -16,6 +16,7 @@
 #define PRERELEASE_URL "https://cdntx.moecube.com/ygopro-super-pre/archive/ygopro-super-pre.ypk"
 #define PRERELEASE_JSON_FILENAME "pre-release.json"
 #define PRERELEASE_ETAG_FILENAME "pre-release.etag"
+#define PRERELEASE_CDB_FILENAME "test-release.cdb"
 
 // 先行卡 JSON 解析共享缓存：
 // find_prerelease_card_by_id 会被逐卡调用（如排序 60 张卡会调用 60 次），
@@ -34,6 +35,34 @@ static gint64 prerelease_stat_mtime(const char *path) {
     GStatBuf st;
     if (g_stat(path, &st) != 0) return 0;
     return (gint64)st.st_mtime * 1000000;
+}
+
+// 旧JSON缓存只保存了setcode的低32位。用同一份CDB恢复其余系列编号。
+static void restore_prerelease_setcodes(JsonArray *cards, const char *json_path) {
+    g_autofree gchar *directory = g_path_get_dirname(json_path);
+    g_autofree gchar *cdb_path = g_build_filename(directory, PRERELEASE_CDB_FILENAME, NULL);
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(cdb_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT id, setcode FROM datas WHERE setcode < 0 OR setcode > 2147483647";
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            gint64 id = sqlite3_column_int64(stmt, 0);
+            for (guint i = 0; i < json_array_get_length(cards); i++) {
+                JsonObject *card = json_array_get_object_element(cards, i);
+                if (card && json_object_get_int_member(card, "id") == id) {
+                    json_object_set_int_member(card, "setcode", sqlite3_column_int64(stmt, 1));
+                    break;
+                }
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
 }
 
 // 必须持有 prerelease_cache_mutex 调用
@@ -83,6 +112,7 @@ static gboolean prerelease_cache_ensure_loaded_locked(void) {
 
     prerelease_parser = parser;
     prerelease_root_array = json_node_get_array(root);
+    restore_prerelease_setcodes(prerelease_root_array, json_path);
     prerelease_json_path = json_path; // take ownership
     prerelease_json_mtime = mtime;
     return TRUE;
@@ -331,7 +361,7 @@ static JsonNode *parse_cdb_to_json(const char *cdb_path) {
         
         // setcode
         json_builder_set_member_name(builder, "setcode");
-        json_builder_add_int_value(builder, sqlite3_column_int(stmt, 3));
+        json_builder_add_int_value(builder, sqlite3_column_int64(stmt, 3));
         
         // type
         int type = sqlite3_column_int(stmt, 4);
@@ -611,7 +641,7 @@ static gpointer update_prerelease_thread(gpointer data) {
         goto out;
     }
 
-    gchar *cdb_path = g_build_filename(data_dir, "test-release.cdb", NULL);
+    gchar *cdb_path = g_build_filename(data_dir, PRERELEASE_CDB_FILENAME, NULL);
     JsonNode *json_root = parse_cdb_to_json(cdb_path);
     g_free(cdb_path);
 

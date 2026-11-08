@@ -54,11 +54,6 @@ static char *program_directory = NULL;
 // 全局变量：是否为便携模式（数据文件在程序目录下）
 static gboolean portable_mode = FALSE;
 
-static void free_user_data_closure_notify(gpointer data, GClosure *closure) {
-    (void)closure;
-    g_free(data);
-}
-
 // 全局变量：缓存最后导出和导入的目录
 static char *last_export_directory = NULL;
 static char *last_import_directory = NULL;
@@ -104,46 +99,9 @@ const FilterState* get_current_filter_state(void) {
 
 // 检查是否有活动的筛选条件
 gboolean has_active_filter(void) {
-    // 检查卡片类型选择
-    if (filter_state.card_type_selected != 0) {
-        return TRUE;
-    }
-    
-    // 检查怪兽类别toggles
-    for (int i = 0; i < 15; i++) {
-        if (filter_state.monster_type_toggles[i]) {
-            return TRUE;
-        }
-    }
-    
-    // 检查连接箭头toggles
-    for (int i = 0; i < 8; i++) {
-        if (filter_state.link_marker_toggles[i]) {
-            return TRUE;
-        }
-    }
-    
-    // 检查魔法/陷阱类别
-    if (filter_state.spell_type_selected != 0 || filter_state.trap_type_selected != 0) {
-        return TRUE;
-    }
-    
-    // 检查属性和种族
-    if (filter_state.attribute_selected != 0 || filter_state.race_selected != 0) {
-        return TRUE;
-    }
-    
-    // 检查文本筛选条件
-    if ((filter_state.atk_text && filter_state.atk_text[0] != '\0') ||
-        (filter_state.def_text && filter_state.def_text[0] != '\0') ||
-        (filter_state.level_text && filter_state.level_text[0] != '\0') ||
-        (filter_state.left_scale_text && filter_state.left_scale_text[0] != '\0') ||
-        (filter_state.right_scale_text && filter_state.right_scale_text[0] != '\0') ||
-        (filter_state.field_text && filter_state.field_text[0] != '\0')) {
-        return TRUE;
-    }
-    
-    return FALSE;
+    // 子条件仅在对应的卡片类型下生效。
+    return filter_state.card_type_selected != 0 ||
+           (filter_state.field_text && *filter_state.field_text);
 }
 
 // 配置文件路径
@@ -1240,47 +1198,33 @@ static void on_reset_filter_clicked(GtkButton *button, gpointer user_data) {
     }
 }
 
-// 卡片类型选择变化回调：控制怪兽和魔法相关筛选项的显示
-static void on_card_type_changed(AdwComboRow *combo_row, GParamSpec *pspec, gpointer user_data) {
-    (void)pspec;
-    GtkWidget **groups = (GtkWidget**)user_data;
-    GtkWidget *monster_type_group = groups[0];
-    GtkWidget *monster_attrs_group = groups[1];
-    GtkWidget *stats_group = groups[2];
-    GtkWidget *spell_type_group = groups[5];  // 魔法类别组
-    GtkWidget *trap_type_group = groups[6];   // 陷阱类别组
-    
-    guint selected = adw_combo_row_get_selected(combo_row);
-    
-    // 选中"怪兽"（索引1）时显示怪兽相关选项，否则隐藏
-    gboolean show_monster_options = (selected == 1);
-    
-    gtk_widget_set_visible(monster_type_group, show_monster_options);
-    gtk_widget_set_visible(monster_attrs_group, show_monster_options);
-    gtk_widget_set_visible(stats_group, show_monster_options);
-    // 注意：pendulum_group和link_markers_group的显示由各自的toggle控制，
-    // 但当不是怪兽类型时，它们也应该隐藏
-    if (!show_monster_options && groups[3]) {
-        gtk_widget_set_visible(groups[3], FALSE);  // pendulum_group
-    }
-    if (!show_monster_options && groups[4]) {
-        gtk_widget_set_visible(groups[4], FALSE);  // link_markers_group
-    }
-    
-    // 选中"魔法"（索引2）时显示魔法类别选项，否则隐藏
-    gboolean show_spell_options = (selected == 2);
-    gtk_widget_set_visible(spell_type_group, show_spell_options);
-    
-    // 选中"陷阱"（索引3）时显示陷阱类别选项，否则隐藏
-    gboolean show_trap_options = (selected == 3);
-    gtk_widget_set_visible(trap_type_group, show_trap_options);
-}
+typedef struct {
+    AdwComboRow *type;
+    GtkToggleButton *pendulum;
+    GtkToggleButton *link;
+    GtkWidget *monster_types;
+    GtkWidget *monster_attrs;
+    GtkWidget *stats;
+    GtkWidget *scales;
+    GtkWidget *arrows;
+    GtkWidget *spell_types;
+    GtkWidget *trap_types;
+} FilterVisibility;
 
-// 连接toggle状态变化回调：控制连接箭头组的显示
-static void on_link_toggle_changed(GtkToggleButton *toggle, gpointer user_data) {
-    GtkWidget *link_markers_group = GTK_WIDGET(user_data);
-    gboolean active = gtk_toggle_button_get_active(toggle);
-    gtk_widget_set_visible(link_markers_group, active);
+static void update_filter_visibility(AdwDialog *dialog) {
+    FilterVisibility *visibility = g_object_get_data(G_OBJECT(dialog), "filter_visibility");
+    guint type = adw_combo_row_get_selected(visibility->type);
+    gboolean show_monster_options = type == 1;
+
+    gtk_widget_set_visible(visibility->monster_types, show_monster_options);
+    gtk_widget_set_visible(visibility->monster_attrs, show_monster_options);
+    gtk_widget_set_visible(visibility->stats, show_monster_options);
+    gtk_widget_set_visible(visibility->scales,
+                           show_monster_options && gtk_toggle_button_get_active(visibility->pendulum));
+    gtk_widget_set_visible(visibility->arrows,
+                           show_monster_options && gtk_toggle_button_get_active(visibility->link));
+    gtk_widget_set_visible(visibility->spell_types, type == 2);
+    gtk_widget_set_visible(visibility->trap_types, type == 3);
 }
 
 // 保存当前筛选状态的回调（对话框关闭时）
@@ -1339,15 +1283,15 @@ static void on_filter_dialog_closed(AdwDialog *dialog, gpointer user_data) {
     g_free(filter_state.right_scale_text);
     g_free(filter_state.field_text);
     
-    filter_state.atk_text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(atk_row)));
-    filter_state.def_text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(def_row)));
-    filter_state.level_text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(level_row)));
-    filter_state.left_scale_text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(left_scale_entry)));
-    filter_state.right_scale_text = g_strdup(gtk_editable_get_text(GTK_EDITABLE(right_scale_entry)));
+    filter_state.atk_text = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(atk_row))));
+    filter_state.def_text = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(def_row))));
+    filter_state.level_text = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(level_row))));
+    filter_state.left_scale_text = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(left_scale_entry))));
+    filter_state.right_scale_text = g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(right_scale_entry))));
     
     // 保存卡片字段文本
     AdwEntryRow *field_row = g_object_get_data(G_OBJECT(dialog), "field_row");
-    filter_state.field_text = field_row ? g_strdup(gtk_editable_get_text(GTK_EDITABLE(field_row))) : NULL;
+    filter_state.field_text = field_row ? g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(field_row)))) : NULL;
 }
 
 // 筛选按钮回调：打开筛选选项对话框
@@ -1355,10 +1299,8 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     GtkWindow *parent_window = GTK_WINDOW(user_data);
     
-    // 检查离线数据是否存在
-    if (!offline_data_exists()) {
-        // 离线数据不存在，显示提示对话框
-        AdwDialog *alert_dialog = ADW_DIALOG(adw_alert_dialog_new("筛选功能", "仅在离线模式生效"));
+    if (!load_offline_data_switch_state() || !offline_data_exists()) {
+        AdwDialog *alert_dialog = ADW_DIALOG(adw_alert_dialog_new("筛选功能", "请先启用并下载离线数据。"));
         adw_alert_dialog_add_response(ADW_ALERT_DIALOG(alert_dialog), "ok", "确定");
         adw_alert_dialog_set_default_response(ADW_ALERT_DIALOG(alert_dialog), "ok");
         adw_dialog_present(alert_dialog, GTK_WIDGET(parent_window));
@@ -1460,10 +1402,17 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     };
     
     // 创建 toggle buttons
-    for (size_t i = 0; i < sizeof(monster_types) / sizeof(monster_types[0]); i++) {
+    GtkToggleButton *pendulum_toggle = NULL;
+    GtkToggleButton *link_toggle = NULL;
+    for (size_t i = 0; i < G_N_ELEMENTS(monster_types); i++) {
         GtkWidget *toggle = gtk_toggle_button_new_with_label(monster_types[i]);
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(toggle), filter_state.monster_type_toggles[i]);  // 恢复状态
         gtk_flow_box_insert(GTK_FLOW_BOX(flow_box), toggle, -1);
+        if (i == MONSTER_FILTER_PENDULUM) {
+            pendulum_toggle = GTK_TOGGLE_BUTTON(toggle);
+        } else if (i == MONSTER_FILTER_LINK) {
+            link_toggle = GTK_TOGGLE_BUTTON(toggle);
+        }
     }
     
     // 保存引用
@@ -1708,62 +1657,25 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     // 添加页面到对话框
     adw_preferences_dialog_add(ADW_PREFERENCES_DIALOG(dialog), page);
     
-    // 连接类型选择变化信号
-    GtkWidget **groups = g_new(GtkWidget*, 7);
-    groups[0] = GTK_WIDGET(monster_type_group);
-    groups[1] = GTK_WIDGET(monster_attrs_group);
-    groups[2] = GTK_WIDGET(stats_group);
-    groups[3] = GTK_WIDGET(pendulum_group);
-    groups[4] = GTK_WIDGET(link_markers_group);
-    groups[5] = GTK_WIDGET(spell_type_group);
-    groups[6] = GTK_WIDGET(trap_type_group);
-    g_signal_connect_data(type_row, "notify::selected", 
-                         G_CALLBACK(on_card_type_changed), 
-                         groups, 
-                         free_user_data_closure_notify, 
-                         0);
-    
-    // 触发一次类型变化以设置正确的可见性
-    on_card_type_changed(type_row, NULL, groups);
-    
-    // 监听"连接"toggle按钮的状态变化（索引7对应"连接"）
-    GtkWidget *link_toggle = NULL;
-    GtkWidget *child = gtk_widget_get_first_child(GTK_WIDGET(flow_box));
-    int i = 0;
-    while (child && i <= 7) {
-        if (i == 7) {
-            link_toggle = gtk_flow_box_child_get_child(GTK_FLOW_BOX_CHILD(child));
-            break;
-        }
-        child = gtk_widget_get_next_sibling(child);
-        i++;
-    }
-    
-    if (link_toggle && GTK_IS_TOGGLE_BUTTON(link_toggle)) {
-        g_signal_connect(link_toggle, "toggled", G_CALLBACK(on_link_toggle_changed), link_markers_group);
-        // 触发一次以设置初始状态
-        on_link_toggle_changed(GTK_TOGGLE_BUTTON(link_toggle), link_markers_group);
-    }
-    
-    // 监听"灵摆"toggle按钮的状态变化（索引6对应"灵摆"）
-    GtkWidget *pendulum_toggle = NULL;
-    child = gtk_widget_get_first_child(GTK_WIDGET(flow_box));
-    i = 0;
-    while (child && i <= 6) {
-        if (i == 6) {
-            pendulum_toggle = gtk_flow_box_child_get_child(GTK_FLOW_BOX_CHILD(child));
-            break;
-        }
-        child = gtk_widget_get_next_sibling(child);
-        i++;
-    }
-    
-    if (pendulum_toggle && GTK_IS_TOGGLE_BUTTON(pendulum_toggle)) {
-        g_signal_connect(pendulum_toggle, "toggled", G_CALLBACK(on_link_toggle_changed), pendulum_group);
-        // 触发一次以设置初始状态
-        on_link_toggle_changed(GTK_TOGGLE_BUTTON(pendulum_toggle), pendulum_group);
-    }
-    
+    FilterVisibility *visibility = g_new(FilterVisibility, 1);
+    *visibility = (FilterVisibility){
+        .type = type_row,
+        .pendulum = pendulum_toggle,
+        .link = link_toggle,
+        .monster_types = GTK_WIDGET(monster_type_group),
+        .monster_attrs = GTK_WIDGET(monster_attrs_group),
+        .stats = GTK_WIDGET(stats_group),
+        .scales = GTK_WIDGET(pendulum_group),
+        .arrows = GTK_WIDGET(link_markers_group),
+        .spell_types = GTK_WIDGET(spell_type_group),
+        .trap_types = GTK_WIDGET(trap_type_group),
+    };
+    g_object_set_data_full(G_OBJECT(dialog), "filter_visibility", visibility, g_free);
+    g_signal_connect_object(type_row, "notify::selected", G_CALLBACK(update_filter_visibility), dialog, G_CONNECT_SWAPPED);
+    g_signal_connect_object(pendulum_toggle, "toggled", G_CALLBACK(update_filter_visibility), dialog, G_CONNECT_SWAPPED);
+    g_signal_connect_object(link_toggle, "toggled", G_CALLBACK(update_filter_visibility), dialog, G_CONNECT_SWAPPED);
+    update_filter_visibility(dialog);
+
     // 连接对话框关闭信号以保存状态
     g_signal_connect(dialog, "closed", G_CALLBACK(on_filter_dialog_closed), NULL);
     
@@ -3474,6 +3386,9 @@ static void on_offline_data_switch_changed(GtkSwitch *switch_widget, GParamSpec 
 
     // 无论离线数据当前是否存在，开关状态变化都应立即持久化
     save_offline_data_switch_state(active);
+    if (!active) {
+        reset_filter_state();
+    }
     
     if (active && !offline_data_exists()) {
         // 从关闭改为开启：下载离线数据
@@ -3489,9 +3404,6 @@ static void on_offline_data_switch_changed(GtkSwitch *switch_widget, GParamSpec 
     } else if (!active && offline_data_exists()) {
         // 从开启改为关闭：清理离线数据
         g_message("Clearing offline data...");
-        
-        // 重置筛选状态为默认值
-        reset_filter_state();
         
         if (clear_offline_data()) {
             // 显示清理成功的 toast

@@ -48,9 +48,8 @@ uint32_t get_race_from_string(const char* race);
 // 返回值：对应的setcode十进制值，如果未找到返回0
 uint64_t get_setcode_from_field_name(const char* field_name);
 
-// 解析 strings.conf 的文本内容，返回字段名对应的 setcode（首个匹配项）；未找到返回 0。
-// 纯函数（不读文件），便于单元测试；匹配语义与原来的逐行解析完全一致：
-// 仅处理 "!setname 0x... 名称" 行，名称用 strstr 做子串匹配，首个匹配即返回。
+// 解析 strings.conf 的 !setname 行，优先匹配完整名称或别名，其次取首个子串匹配项。
+// 未找到返回 0。
 uint64_t strings_conf_parse_setcode(const char *content, const char *field_name);
 
 // 带缓存的 setcode 查询：按 (path, mtime, size) 失效，并按字段名记忆化结果。

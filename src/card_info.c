@@ -395,6 +395,16 @@ static gchar* get_strings_conf_path(void) {
     return g_build_filename(data_home, "ygo-deck-builder", "cards", "strings.conf", NULL);
 }
 
+static gboolean setname_matches_exactly(const char *names, const char *field_name) {
+    g_auto(GStrv) aliases = g_strsplit(names, "\t", -1);
+    for (guint i = 0; aliases[i]; i++) {
+        if (g_str_equal(g_strstrip(aliases[i]), field_name)) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 uint64_t strings_conf_parse_setcode(const char *content, const char *field_name) {
     if (!content || !field_name || field_name[0] == '\0') {
         return 0;
@@ -424,9 +434,15 @@ uint64_t strings_conf_parse_setcode(const char *content, const char *field_name)
                 if (name && strstr(name, field_name) != NULL) {
                     // 解析十六进制数（去掉"0x"前缀）
                     if (g_str_has_prefix(hex_str, "0x") || g_str_has_prefix(hex_str, "0X")) {
-                        result = g_ascii_strtoull(hex_str + 2, NULL, 16);
-                        g_strfreev(parts);
-                        break;
+                        uint64_t code = g_ascii_strtoull(hex_str + 2, NULL, 16);
+                        if (code && setname_matches_exactly(name, field_name)) {
+                            result = code;
+                            g_strfreev(parts);
+                            break;
+                        }
+                        if (!result) {
+                            result = code;
+                        }
                     }
                 }
             }
@@ -557,19 +573,13 @@ gboolean match_setcode_with_field(uint64_t card_setcode, const char* field_name)
         return FALSE;  // 未找到对应的字段
     }
     
-    // setcode是64位整数，可能包含多个字段代码（每16位一个）
-    // 需要逐个检查
+    // 每个字段代码低12位是系列，高4位是子系列标记。
+    uint64_t target_series = target_setcode & 0x0FFF;
+    uint64_t target_subseries = target_setcode & 0xF000;
     for (int shift = 0; shift < 64; shift += 16) {
         uint64_t code_part = (card_setcode >> shift) & 0xFFFF;
-        if (code_part == 0) {
-            break;  // 没有更多字段代码
-        }
-        
-        // 检查是否匹配（考虑掩码）
-        uint64_t target_masked = target_setcode & 0xFFF;  // 取低12位作为实际代码
-        uint64_t card_masked = code_part & 0xFFF;
-        
-        if (card_masked == target_masked) {
+        if (code_part && (code_part & 0x0FFF) == target_series &&
+            (code_part & target_subseries) == target_subseries) {
             return TRUE;
         }
     }

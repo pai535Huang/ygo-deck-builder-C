@@ -776,13 +776,13 @@ void download_offline_data(GSourceFunc callback, gpointer user_data) {
  * 检查离线数据是否存在
  */
 gboolean offline_data_exists(void) {
-    gchar *cards_dir = get_cards_dir();
-    if (!cards_dir) {
+    gchar *json_path = get_cards_json_path();
+    if (!json_path) {
         return FALSE;
     }
-    
-    gboolean exists = g_file_test(cards_dir, G_FILE_TEST_IS_DIR);
-    g_free(cards_dir);
+
+    gboolean exists = g_file_test(json_path, G_FILE_TEST_IS_REGULAR);
+    g_free(json_path);
     
     return exists;
 }
