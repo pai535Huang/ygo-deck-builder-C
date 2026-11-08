@@ -19,8 +19,9 @@ libsoup_dep = dependency('libsoup-3.0')
 gdk_pixbuf_dep = dependency('gdk-pixbuf-2.0')
 libarchive_dep = dependency('libarchive')
 sqlite3_dep = dependency('sqlite3')
+xml_dep = dependency('libxml-2.0')
 
-deps = [gtk4_dep, adw_dep, json_glib_dep, libsoup_dep, gdk_pixbuf_dep, libarchive_dep, sqlite3_dep]
+deps = [gtk4_dep, adw_dep, json_glib_dep, libsoup_dep, gdk_pixbuf_dep, libarchive_dep, sqlite3_dep, xml_dep]
 
 subdir('src')
 
@@ -80,7 +81,7 @@ test_prerelease_clear = executable('test_prerelease_clear',
   'src/prerelease.c',
   'src/archive_path.c',
   include_directories: ['src'],
-  dependencies: [glib_dep, json_glib_dep, libsoup_dep, libarchive_dep, sqlite3_dep],
+  dependencies: [glib_dep, json_glib_dep, libsoup_dep, libarchive_dep, sqlite3_dep, xml_dep],
 )
 test('prerelease_clear', test_prerelease_clear)
 

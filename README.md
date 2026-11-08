@@ -31,6 +31,7 @@
 - gdk-pixbuf-2.0
 - libarchive
 - sqlite3
+- libxml2
 
 ### 3. 运行时依赖
 - gtk4
@@ -40,6 +41,7 @@
 - gdk-pixbuf-2.0
 - libarchive
 - sqlite3
+- libxml2
 
 ## 构建与运行
 简单运行方法如下：
@@ -48,12 +50,12 @@
 	```bash
 	sudo apt install build-essential clang meson ninja-build pkg-config \
 	  libgtk-4-dev libadwaita-1-dev libjson-glib-dev libsoup-3.0-dev \
-	  libgdk-pixbuf-2.0-dev libarchive-dev libsqlite3-dev
+	  libgdk-pixbuf-2.0-dev libarchive-dev libsqlite3-dev libxml2-dev
 	```
 2. （可选）仅运行程序所需依赖：
 	```bash
 	sudo apt install libgtk-4-1 libadwaita-1-0 libjson-glib-1.0-0 libsoup-3.0-0 \
-	  libgdk-pixbuf-2.0-0 libarchive13 libsqlite3-0
+	  libgdk-pixbuf-2.0-0 libarchive13 libsqlite3-0 libxml2
 	```
 3. 	```bash
 	meson setup build
@@ -74,6 +76,8 @@
 安装方法（包括系统级安装和便携模式）参见 [INSTALL.md](INSTALL.md)。
 
 ## 使用说明
+- 在「主菜单 → 首选项 → 界面语言」可实时切换跟随系统、简体中文或 English。系统文件选择器的内置文案由桌面环境或启动时的工具包语言决定。
+- 英文界面使用卡库提供的官方英文卡名。预览时从 Konami 卡片数据库获取英文卡文并缓存，无英文版本或未缓存且无法联网时显示原始卡文。
 - 启动后可通过搜索栏检索卡片并自由编辑自己的卡组，支持类似 YGOPro 的点击和拖拽互动
 - 通过顶部菜单栏进行各种操作
 - 禁限卡表自动下载并可切换 OCG/TCG/简中版本，卡组内卡的数量会受到所选择卡表的限制

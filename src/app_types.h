@@ -9,7 +9,7 @@
 typedef struct {
     int id;   // 数据库ID，用于图片URL
     int cid;  // 卡片ID，用于禁限卡表和卡组统计
-    char *cn_name;
+    char *original_name;
     char *en_name;  // 英文名，用于 GENESYS 分值查找
     uint32_t type;  // 用于程序内部判断
     char *types;    // 用于UI显示
@@ -50,6 +50,9 @@ typedef struct {
     GtkLabel *side_count;
     // GENESYS 总分标签（仅 GENESYS 模式可见）
     GtkLabel *genesys_score_label;
+    GtkMenuButton *app_menu;
+    GtkMenuButton *import_menu;
+    GtkMenuButton *export_menu;
     // 禁限卡表
     GtkDropDown *forbidden_dropdown;
     GHashTable *ocg_forbidden;

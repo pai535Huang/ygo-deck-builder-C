@@ -1,4 +1,6 @@
 #include "search_filter.h"
+#include "ui_language.h"
+#include "card_language.h"
 #include "image_loader.h"
 #include "prerelease.h"
 #include "offline_data.h"
@@ -369,9 +371,9 @@ static GtkWidget *create_art_menu_button(GtkWidget *row_box, GArray *variants, i
     SearchUI *ui = (SearchUI *)g_object_get_data(G_OBJECT(row_box), "search_ui");
 
     GtkWidget *button = gtk_menu_button_new();
-    gtk_menu_button_set_label(GTK_MENU_BUTTON(button), "异画");
+    ui_language_bind_text(G_OBJECT(button), "label", "异画", "Artwork");
     gtk_menu_button_set_always_show_arrow(GTK_MENU_BUTTON(button), FALSE);
-    gtk_widget_set_tooltip_text(button, "切换异画");
+    ui_language_bind_text(G_OBJECT(button), "tooltip-text", "切换异画", "Choose Artwork");
     gtk_widget_set_halign(button, GTK_ALIGN_START);
     gtk_widget_set_valign(button, GTK_ALIGN_CENTER);
     gtk_widget_add_css_class(button, "flat");
@@ -402,10 +404,11 @@ static GtkWidget *create_art_menu_button(GtkWidget *row_box, GArray *variants, i
         if (art_id == selected_art) {
             gtk_widget_add_css_class(item, "art-choice-selected");
         }
-        gchar *tip = (i == 0) ? g_strdup_printf("原画 (%d)", art_id)
-                              : g_strdup_printf("异画 %u (%d)", i, art_id);
-        gtk_widget_set_tooltip_text(item, tip);
-        g_free(tip);
+        g_autofree char *chinese_tip = i == 0 ? g_strdup_printf("原画 (%d)", art_id)
+                                               : g_strdup_printf("异画 %u (%d)", i, art_id);
+        g_autofree char *english_tip = i == 0 ? g_strdup_printf("Original Artwork (%d)", art_id)
+                                               : g_strdup_printf("Alternate Artwork %u (%d)", i, art_id);
+        ui_language_bind_text(G_OBJECT(item), "tooltip-text", chinese_tip, english_tip);
 
         GtkWidget *stack = gtk_stack_new();
         gtk_stack_set_transition_type(GTK_STACK(stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
@@ -595,7 +598,7 @@ static void on_alt_art_ready(gpointer user_data) {
     const char *q = gtk_editable_get_text(GTK_EDITABLE(ui->entry));
     if ((!q || *q == '\0') && !has_active_filter()) return;
     if (ui->toast_overlay) {
-        AdwToast *toast = adw_toast_new("异画数据已就绪，已刷新搜索结果");
+        AdwToast *toast = adw_toast_new(TR("异画数据已就绪，已刷新搜索结果", "Alternate artwork data loaded and search results refreshed"));
         adw_toast_set_timeout(toast, 3);
         adw_toast_overlay_add_toast(ui->toast_overlay, toast);
     }
@@ -626,23 +629,55 @@ void queue_result_for_render(SearchUI *ui, JsonObject *obj) {
     }
 }
 
+typedef struct {
+    GtkLabel *title;
+    GtkLabel *subtitle;
+    GtkLabel *status;
+    char *raw_status;
+    gboolean points;
+    gboolean show_status_tooltip;
+} ResultLanguageLabels;
+
+static void free_result_language_labels(gpointer data) {
+    ResultLanguageLabels *labels = data;
+    g_free(labels->raw_status);
+    g_free(labels);
+}
+
+static void refresh_result_row_language(GtkWidget *row) {
+    ResultLanguageLabels *labels = g_object_get_data(G_OBJECT(row), "result-language");
+    const CardPreview *card = g_object_get_data(G_OBJECT(row), "preview");
+    if (!labels || !card)
+        return;
+
+    const char *name = card_name_for_language(card->original_name, card->en_name);
+    gtk_label_set_text(labels->title, name ? name : TR("(无名)", "(Unnamed)"));
+    g_autofree char *metadata = card_display_metadata(card->types);
+    gtk_label_set_text(labels->subtitle, metadata ? metadata : "");
+    gtk_label_set_wrap(labels->subtitle, ui_is_english());
+    gtk_label_set_lines(labels->subtitle, ui_is_english() ? 3 : -1);
+
+    if (labels->status) {
+        g_autofree char *status = labels->points
+            ? g_strdup_printf(TR("%s分", "%s pts"), labels->raw_status)
+            : card_display_metadata(labels->raw_status);
+        g_autofree char *markup = g_markup_printf_escaped("<b>[%s]</b>", status);
+        gtk_label_set_markup(labels->status, markup);
+        if (labels->show_status_tooltip)
+            gtk_widget_set_tooltip_text(GTK_WIDGET(labels->status), status);
+    }
+}
+
+void refresh_search_result_language(SearchUI *ui) {
+    for (GtkWidget *row = gtk_widget_get_first_child(ui->list); row;
+         row = gtk_widget_get_next_sibling(row)) {
+        refresh_result_row_language(row);
+    }
+}
+
 // 立即渲染单个结果行（原 add_result_row 函数）
 void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
-    const char *name = NULL;
-    
-    // 先检查是否有 text.name（先行卡格式）
-    if (json_object_has_member(obj, "text")) {
-        JsonObject *text = json_object_get_object_member(obj, "text");
-        if (text && json_object_has_member(text, "name")) {
-            name = json_object_get_string_member(text, "name");
-        }
-    }
-    
-    // 如果没有 text.name，按原顺序查找其他名称
-    if (!name) name = json_object_get_string_member(obj, "cn_name");
-    if (!name) name = json_object_get_string_member(obj, "sc_name");
-    if (!name) name = json_object_get_string_member(obj, "jp_name");
-    if (!name) name = json_object_get_string_member(obj, "en_name");
+    const char *english_name = card_english_name(obj);
     
     int id = 0;
     if (json_object_has_member(obj, "id")) id = json_object_get_int_member(obj, "id");
@@ -720,9 +755,7 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
     g_object_set_data(G_OBJECT(picture), "card_id", GINT_TO_POINTER(cid));
     // 当前应显示的版本；异步图片回调据此丢弃旧异画
     g_object_set_data(G_OBJECT(picture), "art_expected_id", GINT_TO_POINTER(selected_art));
-    if (json_object_has_member(obj, "en_name")) {
-        slot_set_en_name(picture, json_object_get_string_member(obj, "en_name"));
-    }
+    slot_set_en_name(picture, english_name);
     apply_overlay_to_widget(picture, ui);
     
     // 检查是否是先行卡（优先通过ID位数判断，9位数=先行卡）
@@ -766,34 +799,28 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
         }
     }
 
-    // 文字容器：固定宽度 208px（右栏300 - 左右边距16 - 图片68 - 间距8）
-    // 防止文字区域扩展导致整行被拉伸
     GtkWidget *vbox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    gtk_widget_set_size_request(vbox, 208, -1);
-    gtk_widget_set_hexpand(vbox, FALSE);
-    gtk_widget_set_vexpand(vbox, FALSE);
-    gtk_widget_set_halign(vbox, GTK_ALIGN_START);
+    gtk_widget_set_hexpand(vbox, TRUE);
     gtk_widget_set_valign(vbox, GTK_ALIGN_CENTER);
 
-    GtkWidget *title = gtk_label_new(name ? name : "(无名)" );
+    GtkWidget *title = gtk_label_new(NULL);
     gtk_label_set_xalign(GTK_LABEL(title), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(title), PANGO_ELLIPSIZE_END);
     gtk_label_set_max_width_chars(GTK_LABEL(title), 20);
+    gtk_widget_add_css_class(title, "heading");
 
-    // 从 text.types 获取类型字符串用于显示
-    const char *types = NULL;
-    if (json_object_has_member(obj, "text")) {
-        JsonObject *text = json_object_get_object_member(obj, "text");
-        if (text && json_object_has_member(text, "types")) types = json_object_get_string_member(text, "types");
-    }
-    GtkWidget *subtitle = gtk_label_new(types ? types : "");
+    GtkWidget *subtitle = gtk_label_new(NULL);
     gtk_label_set_xalign(GTK_LABEL(subtitle), 0.0);
     gtk_label_set_ellipsize(GTK_LABEL(subtitle), PANGO_ELLIPSIZE_END);
     gtk_label_set_max_width_chars(GTK_LABEL(subtitle), 20);
+    gtk_label_set_wrap_mode(GTK_LABEL(subtitle), PANGO_WRAP_WORD_CHAR);
     gtk_widget_add_css_class(subtitle, "dim-label");
 
     gtk_box_append(GTK_BOX(vbox), title);
     gtk_box_append(GTK_BOX(vbox), subtitle);
+    ResultLanguageLabels *labels = g_new0(ResultLanguageLabels, 1);
+    labels->title = GTK_LABEL(title);
+    labels->subtitle = GTK_LABEL(subtitle);
 
     // 禁限状态和“异画”按钮放同一排：禁限在左，异画在右。
     // 没有异画时这一排只有禁限，保证所有卡片的禁限状态纵向对齐。
@@ -820,10 +847,11 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
             gtk_widget_set_valign(forbidden_box, GTK_ALIGN_CENTER);
 
             GtkWidget *forbidden_label = gtk_label_new(NULL);
-            char *markup = g_strdup_printf("<b>[%s]</b>", change_str);
-            gtk_label_set_markup(GTK_LABEL(forbidden_label), markup);
-            g_free(markup);
+            labels->status = GTK_LABEL(forbidden_label);
+            labels->raw_status = g_strdup(change_str);
+            labels->show_status_tooltip = TRUE;
             gtk_label_set_xalign(GTK_LABEL(forbidden_label), 0.0);
+            gtk_label_set_ellipsize(GTK_LABEL(forbidden_label), PANGO_ELLIPSIZE_END);
 
             // 根据新状态（→后面的部分）设置颜色
             const char *arrow = strstr(change_str, "→");
@@ -871,22 +899,17 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
 
             const char *display_status = NULL;
             const char *css_class = NULL;
-            gchar *points_buf = NULL;
 
             if (is_pendulum || is_link) {
                 display_status = "禁止";
                 css_class = "error";
             } else if (cid > 0 && ui->genesys_forbidden) {
                 // 通过英文卡名查找分值（GENESYS表键为英文卡名）
-                const char *en_name = NULL;
-                if (json_object_has_member(obj, "en_name")) {
-                    en_name = json_object_get_string_member(obj, "en_name");
-                }
-                if (en_name && *en_name != '\0') {
-                    const char *pts = (const char *)g_hash_table_lookup(ui->genesys_forbidden, en_name);
+                if (english_name) {
+                    const char *pts = (const char *)g_hash_table_lookup(ui->genesys_forbidden, english_name);
                     if (pts && *pts != '\0') {
-                        points_buf = g_strdup_printf("%s分", pts);
-                        display_status = points_buf;
+                        display_status = pts;
+                        labels->points = TRUE;
                         css_class = "accent";
                     }
                 }
@@ -898,9 +921,8 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
                 gtk_widget_set_valign(forbidden_box, GTK_ALIGN_CENTER);
 
                 GtkWidget *forbidden_label = gtk_label_new(NULL);
-                char *markup = g_strdup_printf("<b>[%s]</b>", display_status);
-                gtk_label_set_markup(GTK_LABEL(forbidden_label), markup);
-                g_free(markup);
+                labels->status = GTK_LABEL(forbidden_label);
+                labels->raw_status = g_strdup(display_status);
                 gtk_label_set_xalign(GTK_LABEL(forbidden_label), 0.0);
 
                 if (css_class) {
@@ -910,8 +932,6 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
                 gtk_box_append(GTK_BOX(forbidden_box), forbidden_label);
                 gtk_box_append(GTK_BOX(status_box), forbidden_box);
             }
-
-            g_free(points_buf);
 
         } else {
             // ---- OCG / TCG / AE / SC 模式（原逻辑）----
@@ -938,9 +958,8 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
                     gtk_widget_set_valign(forbidden_box, GTK_ALIGN_CENTER);
 
                     GtkWidget *forbidden_label = gtk_label_new(NULL);
-                    char *markup = g_strdup_printf("<b>[%s]</b>", status);
-                    gtk_label_set_markup(GTK_LABEL(forbidden_label), markup);
-                    g_free(markup);
+                    labels->status = GTK_LABEL(forbidden_label);
+                    labels->raw_status = g_strdup(status);
                     gtk_label_set_xalign(GTK_LABEL(forbidden_label), 0.0);
 
                     if (g_strcmp0(status, "禁止") == 0) {
@@ -965,10 +984,6 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
     gtk_widget_set_visible(status_box, gtk_widget_get_first_child(status_box) != NULL);
     gtk_box_append(GTK_BOX(vbox), status_box);
 
-    // 防止 row 扩展
-    gtk_widget_set_hexpand(row, FALSE);
-    gtk_widget_set_halign(row, GTK_ALIGN_START);
-
     gtk_box_append(GTK_BOX(row), thumb_stack);
     gtk_box_append(GTK_BOX(row), vbox);
 
@@ -988,10 +1003,9 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
     CardPreview *pv = g_new0(CardPreview, 1);
     pv->id = selected_art;
     pv->cid = cid;
-    pv->cn_name = name ? g_strdup(name) : NULL;
+    pv->original_name = g_strdup(card_original_name(obj));
     // 英文卡名（GENESYS 分值查找用）
-    const char *en_name_raw = json_object_has_member(obj, "en_name") ? json_object_get_string_member(obj, "en_name") : NULL;
-    pv->en_name = en_name_raw ? g_strdup(en_name_raw) : NULL;
+    pv->en_name = g_strdup(english_name);
     pv->is_prerelease = is_prerelease;  // 设置是否是先行卡
     
     // 获取类型和其他 data 字段：先行卡的字段在顶层，普通卡的在 data 对象中
@@ -1032,6 +1046,8 @@ void add_result_row_immediate(SearchUI *ui, JsonObject *obj) {
         }
     }
     g_object_set_data_full(G_OBJECT(list_row), "preview", pv, free_card_preview);
+    g_object_set_data_full(G_OBJECT(list_row), "result-language", labels, free_result_language_labels);
+    refresh_result_row_language(list_row);
     // 右栏行支持拖拽到中栏：提供字符串 payload "search:<id>:<isExtra>"
     GtkDragSource *ds = gtk_drag_source_new();
     // 与中栏一致，采用 MOVE 动作，确保目标接受
@@ -1093,7 +1109,7 @@ void search_response_cb(GObject *source, GAsyncResult *res, gpointer user_data) 
                     }
                 }
                 if (nitems > SEARCH_MAX_RESULTS && ui && ui->toast_overlay) {
-                    AdwToast *toast = adw_toast_new("搜索结果过多，已限制为 500 条。请缩小搜索范围。");
+                    AdwToast *toast = adw_toast_new(TR("搜索结果过多，已限制为 500 条。请缩小搜索范围。", "Showing up to 500 results. Narrow your search for more specific results."));
                     adw_toast_set_timeout(toast, 3);
                     adw_toast_overlay_add_toast(ui->toast_overlay, toast);
                 }
@@ -1221,7 +1237,7 @@ static void offline_search_finished(GObject *source, GAsyncResult *res, gpointer
 
     if (t->result_count_before + t->results->len >= SEARCH_MAX_RESULTS && ui->toast_overlay) {
         g_message("Reached maximum result limit (%u), stopping search", SEARCH_MAX_RESULTS);
-        AdwToast *toast = adw_toast_new("搜索结果过多，已限制为 500 条。请缩小搜索范围。");
+        AdwToast *toast = adw_toast_new(TR("搜索结果过多，已限制为 500 条。请缩小搜索范围。", "Showing up to 500 results. Narrow your search for more specific results."));
         adw_toast_set_timeout(toast, 3);
         adw_toast_overlay_add_toast(ui->toast_overlay, toast);
     }
@@ -1277,13 +1293,13 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
     gboolean offline_enabled = load_offline_data_switch_state() && offline_data_exists();
     if (filter_active && !offline_enabled) {
         if (ui->toast_overlay) {
-            adw_toast_overlay_add_toast(ui->toast_overlay, adw_toast_new("使用筛选前请启用并下载离线数据。"));
+            adw_toast_overlay_add_toast(ui->toast_overlay, adw_toast_new(TR("使用筛选前请启用并下载离线数据。", "Enable and download offline data to use filters.")));
         }
         return;
     }
     if (has_invalid_filter_number(filter)) {
         if (ui->toast_overlay) {
-            adw_toast_overlay_add_toast(ui->toast_overlay, adw_toast_new("数值筛选请输入非负整数。攻击力和守备力也支持 ?。"));
+            adw_toast_overlay_add_toast(ui->toast_overlay, adw_toast_new(TR("数值筛选请输入非负整数。攻击力和守备力也支持 ?。", "Enter non-negative integers. ATK and DEF also accept ?.")));
         }
         return;
     }
@@ -1375,7 +1391,7 @@ void on_search_clicked(GtkButton *btn, gpointer user_data) {
             if (result_count >= SEARCH_MAX_RESULTS) {
                 g_message("Reached maximum result limit (%u) with prerelease cards", SEARCH_MAX_RESULTS);
                 if (ui->toast_overlay) {
-                    AdwToast *toast = adw_toast_new("搜索结果过多，已限制为 500 条。请缩小搜索范围。");
+                    AdwToast *toast = adw_toast_new(TR("搜索结果过多，已限制为 500 条。请缩小搜索范围。", "Showing up to 500 results. Narrow your search for more specific results."));
                     adw_toast_set_timeout(toast, 3);
                     adw_toast_overlay_add_toast(ui->toast_overlay, toast);
                 }

@@ -33,6 +33,7 @@ gboolean search_load_next_image(gpointer user_data);
 void queue_result_for_render(SearchUI *ui, JsonObject *obj);
 gboolean batch_render_results(gpointer user_data);
 void add_result_row_immediate(SearchUI *ui, JsonObject *obj);
+void refresh_search_result_language(SearchUI *ui);
 
 // 禁限卡表变化回调
 void on_forbidden_dropdown_changed(GtkDropDown *dropdown, GParamSpec *pspec, gpointer user_data);

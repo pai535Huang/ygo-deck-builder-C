@@ -36,6 +36,7 @@
 #include "alt_art.h"
 #include "pixbuf_utils.h"
 #include "card_info.h"
+#include "card_language.h"
 #include "card_sort.h"
 #include "card_shuffle.h"
 #include "deck_slot.h"
@@ -48,6 +49,7 @@
 #include "search_filter.h"
 #include "deck_url.h"
 #include "json_utils.h"
+#include "ui_language.h"
 
 // 全局变量：程序所在目录
 static char *program_directory = NULL;
@@ -58,8 +60,6 @@ static gboolean portable_mode = FALSE;
 static char *last_export_directory = NULL;
 static char *last_import_directory = NULL;
 static char *last_deck_sheet_directory = NULL;
-// 全局变量：个人信息（Konami ID）
-static char *personal_konami_id = NULL;
 
 // 全局变量：是否在搜索结果中显示先行卡（默认显示）
 gboolean show_prerelease_cards = TRUE;
@@ -142,8 +142,6 @@ static gchar *get_forbidden_list_path(const char *filename) {
 
 // 前置声明
 static void on_export_clicked(GtkButton *btn, gpointer user_data);
-static void on_action_generate_sheet(GSimpleAction *action, GVariant *parameter, gpointer user_data);
-static void on_action_edit_personal_info(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 static void on_show_forbidden_changes_action(GSimpleAction *action, GVariant *parameter, gpointer user_data);
 
 void list_clear(GtkListBox *list) {
@@ -729,7 +727,7 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
 void free_card_preview(gpointer data) {
     CardPreview *pv = (CardPreview*)data;
     if (!pv) return;
-    g_free(pv->cn_name);
+    g_free(pv->original_name);
     g_free(pv->en_name);
     g_free(pv->types);
     g_free(pv->pdesc);
@@ -773,7 +771,7 @@ void update_genesys_score(SearchUI *ui) {
         }
     }
     char buf[64];
-    g_snprintf(buf, sizeof(buf), "总分: %d/100", total);
+    g_snprintf(buf, sizeof(buf), TR("总分: %d/100", "Total: %d/100"), total);
     gtk_label_set_text(ui->genesys_score_label, buf);
     gtk_widget_set_visible(GTK_WIDGET(ui->genesys_score_label), TRUE);
 }
@@ -888,11 +886,8 @@ typedef struct {
 
 typedef struct {
     SearchUI *ui;
-    AdwDialog *dialog;
-    GtkWidget *konami_id_entry;
-} PersonalInfoDialogData;
-
-
+    char *konami_id;
+} SheetExportData;
 
 // 文件保存对话框回调
 static void on_export_file_save_finish(GObject *source, GAsyncResult *result, gpointer user_data) {
@@ -932,7 +927,7 @@ static void on_export_file_save_finish(GObject *source, GAsyncResult *result, gp
 
 // 卡表保存回调
 static void on_sheet_save_finish(GObject *source, GAsyncResult *result, gpointer user_data) {
-    ExportData *export_data = (ExportData*)user_data;
+    SheetExportData *export_data = user_data;
     GError *error = NULL;
     GFile *file = gtk_file_dialog_save_finish(GTK_FILE_DIALOG(source), result, &error);
 
@@ -943,7 +938,7 @@ static void on_sheet_save_finish(GObject *source, GAsyncResult *result, gpointer
             export_data->ui->main_pics, export_data->ui->main_idx,
             export_data->ui->extra_pics, export_data->ui->extra_idx,
             export_data->ui->side_pics, export_data->ui->side_idx,
-            personal_konami_id,
+            export_data->konami_id,
             path,
             &gen_error
         );
@@ -953,16 +948,17 @@ static void on_sheet_save_finish(GObject *source, GAsyncResult *result, gpointer
             g_free(last_deck_sheet_directory);
             last_deck_sheet_directory = dir;
             save_io_config(last_export_directory, last_import_directory, last_deck_sheet_directory);
+            save_personal_konami_id(export_data->konami_id);
 
             if (export_data->ui && export_data->ui->toast_overlay) {
-                AdwToast *toast = adw_toast_new("卡表已生成");
+                AdwToast *toast = adw_toast_new(TR("卡表已生成", "Deck list exported"));
                 adw_toast_set_timeout(toast, 2);
                 adw_toast_overlay_add_toast(export_data->ui->toast_overlay, toast);
             }
         } else {
             g_warning("生成卡表失败: %s", gen_error ? gen_error->message : "未知错误");
             if (export_data->ui && export_data->ui->toast_overlay) {
-                AdwToast *toast = adw_toast_new("卡表生成失败");
+                AdwToast *toast = adw_toast_new(TR("卡表生成失败", "Could not export the deck list"));
                 adw_toast_set_timeout(toast, 2);
                 adw_toast_overlay_add_toast(export_data->ui->toast_overlay, toast);
             }
@@ -978,7 +974,7 @@ static void on_sheet_save_finish(GObject *source, GAsyncResult *result, gpointer
         g_error_free(error);
     }
 
-    g_object_unref(export_data->dialog);
+    g_free(export_data->konami_id);
     g_free(export_data);
 }
 
@@ -1027,7 +1023,7 @@ static void on_import_clicked(GtkButton *btn, gpointer user_data) {
     SearchUI *ui = (SearchUI*)user_data;
     
     GtkFileDialog *dialog = gtk_file_dialog_new();
-    gtk_file_dialog_set_title(dialog, "导入卡组");
+    gtk_file_dialog_set_title(dialog, TR("导入卡组", "Import Deck"));
     
     // 设置初始目录
     if (last_import_directory && g_file_test(last_import_directory, G_FILE_TEST_IS_DIR)) {
@@ -1039,7 +1035,7 @@ static void on_import_clicked(GtkButton *btn, gpointer user_data) {
     // 设置文件过滤器
     GtkFileFilter *filter = gtk_file_filter_new();
     gtk_file_filter_add_pattern(filter, "*.ydk");
-    gtk_file_filter_set_name(filter, "YDK文件 (*.ydk)");
+    gtk_file_filter_set_name(filter, TR("YDK文件 (*.ydk)", "YDK Files (*.ydk)"));
     
     GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
     g_list_store_append(filters, filter);
@@ -1294,14 +1290,66 @@ static void on_filter_dialog_closed(AdwDialog *dialog, gpointer user_data) {
     filter_state.field_text = field_row ? g_strstrip(g_strdup(gtk_editable_get_text(GTK_EDITABLE(field_row)))) : NULL;
 }
 
+static void refresh_main_language(SearchUI *ui);
+
+static void on_interface_language_changed(AdwComboRow *row, GParamSpec *pspec, gpointer user_data) {
+    (void)pspec;
+    SearchUI *ui = user_data;
+    UiLanguage language = adw_combo_row_get_selected(row);
+    gboolean was_english = ui_is_english();
+    if (!ui_language_set_preference(language)) {
+        g_signal_handlers_block_by_func(row, on_interface_language_changed, ui);
+        adw_combo_row_set_selected(row, ui_language_get_preference());
+        g_signal_handlers_unblock_by_func(row, on_interface_language_changed, ui);
+        AdwPreferencesDialog *dialog = ADW_PREFERENCES_DIALOG(
+            gtk_widget_get_ancestor(GTK_WIDGET(row), ADW_TYPE_PREFERENCES_DIALOG));
+        adw_preferences_dialog_add_toast(dialog, adw_toast_new(
+            TR("无法保存界面语言", "Could not save the interface language")));
+        return;
+    }
+    if (was_english == ui_is_english())
+        return;
+
+    const char *const system_option[] = {TR("跟随系统", "Follow System"), NULL};
+    g_signal_handlers_block_by_func(row, on_interface_language_changed, ui);
+    gtk_string_list_splice(GTK_STRING_LIST(adw_combo_row_get_model(row)), 0, 1, system_option);
+    adw_combo_row_set_selected(row, language);
+    g_signal_handlers_unblock_by_func(row, on_interface_language_changed, ui);
+    refresh_main_language(ui);
+}
+
+static void on_preferences(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+    (void)action;
+    (void)parameter;
+    SearchUI *ui = user_data;
+    AdwPreferencesDialog *dialog = ADW_PREFERENCES_DIALOG(adw_preferences_dialog_new());
+    ui_language_bind_text(G_OBJECT(dialog), "title", "首选项", "Preferences");
+    adw_preferences_dialog_set_search_enabled(dialog, FALSE);
+
+    AdwPreferencesPage *page = ADW_PREFERENCES_PAGE(adw_preferences_page_new());
+    AdwPreferencesGroup *group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
+    AdwComboRow *language = ADW_COMBO_ROW(adw_combo_row_new());
+    ui_language_bind_text(G_OBJECT(language), "title", "界面语言", "Interface Language");
+    const char *const options[] = {TR("跟随系统", "Follow System"), "简体中文", "English", NULL};
+    g_autoptr(GtkStringList) model = gtk_string_list_new(options);
+    adw_combo_row_set_model(language, G_LIST_MODEL(model));
+    adw_combo_row_set_selected(language, ui_language_get_preference());
+    g_signal_connect(language, "notify::selected", G_CALLBACK(on_interface_language_changed), ui);
+
+    adw_preferences_group_add(group, GTK_WIDGET(language));
+    adw_preferences_page_add(page, group);
+    adw_preferences_dialog_add(dialog, page);
+    adw_dialog_present(ADW_DIALOG(dialog), GTK_WIDGET(ui->window));
+}
+
 // 筛选按钮回调：打开筛选选项对话框
 static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     GtkWindow *parent_window = GTK_WINDOW(user_data);
     
     if (!load_offline_data_switch_state() || !offline_data_exists()) {
-        AdwDialog *alert_dialog = ADW_DIALOG(adw_alert_dialog_new("筛选功能", "请先启用并下载离线数据。"));
-        adw_alert_dialog_add_response(ADW_ALERT_DIALOG(alert_dialog), "ok", "确定");
+        AdwDialog *alert_dialog = ADW_DIALOG(adw_alert_dialog_new(TR("筛选功能", "Card Filters"), TR("请先启用并下载离线数据。", "Enable and download offline data to use filters.")));
+        adw_alert_dialog_add_response(ADW_ALERT_DIALOG(alert_dialog), "ok", TR("确定", "OK"));
         adw_alert_dialog_set_default_response(ADW_ALERT_DIALOG(alert_dialog), "ok");
         adw_dialog_present(alert_dialog, GTK_WIDGET(parent_window));
         return;
@@ -1309,21 +1357,21 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // 创建 AdwPreferencesDialog
     AdwDialog *dialog = ADW_DIALOG(adw_preferences_dialog_new());
-    adw_dialog_set_title(dialog, "筛选选项");
+    adw_dialog_set_title(dialog, TR("筛选选项", "Filters"));
     
     // 设置对话框内容高度
     adw_dialog_set_content_height(dialog, 800);
     
     // 创建 PreferencesPage
     AdwPreferencesPage *page = ADW_PREFERENCES_PAGE(adw_preferences_page_new());
-    adw_preferences_page_set_title(page, "卡片筛选");
+    adw_preferences_page_set_title(page, TR("卡片筛选", "Card Filters"));
     adw_preferences_page_set_icon_name(page, "preferences-system-symbolic");
     
     // === 恢复默认按钮组 ===
     AdwPreferencesGroup *reset_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
     
     // 创建按钮
-    GtkWidget *reset_button = gtk_button_new_with_label("恢复默认");
+    GtkWidget *reset_button = gtk_button_new_with_label(TR("恢复默认", "Reset Filters"));
     gtk_widget_set_hexpand(reset_button, TRUE);
     gtk_widget_set_halign(reset_button, GTK_ALIGN_FILL);
     gtk_widget_add_css_class(reset_button, "suggested-action");
@@ -1338,11 +1386,11 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // === 卡片字段组 ===
     AdwPreferencesGroup *field_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(field_group, "卡片字段");
+    adw_preferences_group_set_title(field_group, TR("卡片字段", "Archetype"));
     
     // 卡片字段输入行
     AdwEntryRow *field_row = ADW_ENTRY_ROW(adw_entry_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(field_row), "字段");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(field_row), TR("字段", "Archetype"));
     gtk_editable_set_text(GTK_EDITABLE(field_row), filter_state.field_text ? filter_state.field_text : "");  // 恢复状态
     adw_preferences_group_add(field_group, GTK_WIDGET(field_row));
     
@@ -1353,16 +1401,16 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // === 卡片类型组（顶层）===
     AdwPreferencesGroup *type_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(type_group, "卡片类型");
+    adw_preferences_group_set_title(type_group, TR("卡片类型", "Card Type"));
     
     // 卡片类型下拉菜单
     AdwComboRow *type_row = ADW_COMBO_ROW(adw_combo_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(type_row), "类型");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(type_row), TR("类型", "Type"));
     GtkStringList *type_list = gtk_string_list_new(NULL);
-    gtk_string_list_append(type_list, "全部");
-    gtk_string_list_append(type_list, "怪兽");
-    gtk_string_list_append(type_list, "魔法");
-    gtk_string_list_append(type_list, "陷阱");
+    gtk_string_list_append(type_list, TR("全部", "Any"));
+    gtk_string_list_append(type_list, TR("怪兽", "Monster"));
+    gtk_string_list_append(type_list, TR("魔法", "Spell"));
+    gtk_string_list_append(type_list, TR("陷阱", "Trap"));
     adw_combo_row_set_model(type_row, G_LIST_MODEL(type_list));
     g_object_unref(type_list);  // set_model 是 transfer-none，需释放调用方引用
     adw_combo_row_set_selected(type_row, filter_state.card_type_selected);  // 恢复状态
@@ -1375,12 +1423,12 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // === 怪兽类别组（仅怪兽）===
     AdwPreferencesGroup *monster_type_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(monster_type_group, "怪兽类别");
+    adw_preferences_group_set_title(monster_type_group, TR("怪兽类别", "Monster Subtypes"));
     
     // 创建包含 toggle buttons 的 ActionRow
     AdwActionRow *type_buttons_row = ADW_ACTION_ROW(adw_action_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(type_buttons_row), "类别筛选");
-    adw_action_row_set_subtitle(type_buttons_row, "选择要包含的怪兽类别");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(type_buttons_row), TR("类别筛选", "Subtypes"));
+    adw_action_row_set_subtitle(type_buttons_row, TR("选择要包含的怪兽类别", "Select the monster subtypes to include"));
     
     // 创建 flow box 容纳 toggle buttons
     GtkWidget *flow_box = gtk_flow_box_new();
@@ -1396,9 +1444,11 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // 定义怪兽类别
     const char *monster_types[] = {
-        "通常", "效果", "仪式", "融合", "同调", "超量", 
-        "灵摆", "连接", "调整", "灵魂", "同盟", "二重", "反转", 
-        "卡通", "特殊召唤"
+        TR("通常", "Normal"), TR("效果", "Effect"), TR("仪式", "Ritual"),
+        TR("融合", "Fusion"), TR("同调", "Synchro"), TR("超量", "Xyz"),
+        TR("灵摆", "Pendulum"), TR("连接", "Link"), TR("调整", "Tuner"),
+        TR("灵魂", "Spirit"), TR("同盟", "Union"), TR("二重", "Gemini"), TR("反转", "Flip"),
+        TR("卡通", "Toon"), TR("特殊召唤", "Special Summon")
     };
     
     // 创建 toggle buttons
@@ -1430,19 +1480,19 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // === 魔法类别组（仅魔法）===
     AdwPreferencesGroup *spell_type_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(spell_type_group, "魔法类别");
+    adw_preferences_group_set_title(spell_type_group, TR("魔法类别", "Spell Subtype"));
     
     // 魔法类别下拉菜单
     AdwComboRow *spell_type_row = ADW_COMBO_ROW(adw_combo_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(spell_type_row), "类别");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(spell_type_row), TR("类别", "Subtype"));
     GtkStringList *spell_type_list = gtk_string_list_new(NULL);
-    gtk_string_list_append(spell_type_list, "全部");
-    gtk_string_list_append(spell_type_list, "通常");
-    gtk_string_list_append(spell_type_list, "仪式");
-    gtk_string_list_append(spell_type_list, "速攻");
-    gtk_string_list_append(spell_type_list, "永续");
-    gtk_string_list_append(spell_type_list, "装备");
-    gtk_string_list_append(spell_type_list, "场地");
+    gtk_string_list_append(spell_type_list, TR("全部", "Any"));
+    gtk_string_list_append(spell_type_list, TR("通常", "Normal"));
+    gtk_string_list_append(spell_type_list, TR("仪式", "Ritual"));
+    gtk_string_list_append(spell_type_list, TR("速攻", "Quick-Play"));
+    gtk_string_list_append(spell_type_list, TR("永续", "Continuous"));
+    gtk_string_list_append(spell_type_list, TR("装备", "Equip"));
+    gtk_string_list_append(spell_type_list, TR("场地", "Field"));
     adw_combo_row_set_model(spell_type_row, G_LIST_MODEL(spell_type_list));
     g_object_unref(spell_type_list);
     adw_combo_row_set_selected(spell_type_row, filter_state.spell_type_selected);  // 恢复状态
@@ -1457,16 +1507,16 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // === 陷阱类别组（仅陷阱）===
     AdwPreferencesGroup *trap_type_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(trap_type_group, "陷阱类别");
+    adw_preferences_group_set_title(trap_type_group, TR("陷阱类别", "Trap Subtype"));
     
     // 陷阱类别下拉菜单
     AdwComboRow *trap_type_row = ADW_COMBO_ROW(adw_combo_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(trap_type_row), "类别");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(trap_type_row), TR("类别", "Subtype"));
     GtkStringList *trap_type_list = gtk_string_list_new(NULL);
-    gtk_string_list_append(trap_type_list, "全部");
-    gtk_string_list_append(trap_type_list, "通常");
-    gtk_string_list_append(trap_type_list, "永续");
-    gtk_string_list_append(trap_type_list, "反击");
+    gtk_string_list_append(trap_type_list, TR("全部", "Any"));
+    gtk_string_list_append(trap_type_list, TR("通常", "Normal"));
+    gtk_string_list_append(trap_type_list, TR("永续", "Continuous"));
+    gtk_string_list_append(trap_type_list, TR("反击", "Counter"));
     adw_combo_row_set_model(trap_type_row, G_LIST_MODEL(trap_type_list));
     g_object_unref(trap_type_list);
     adw_combo_row_set_selected(trap_type_row, filter_state.trap_type_selected);  // 恢复状态
@@ -1481,20 +1531,20 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // === 怪兽属性组（仅怪兽）===
     AdwPreferencesGroup *monster_attrs_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(monster_attrs_group, "怪兽属性");
+    adw_preferences_group_set_title(monster_attrs_group, TR("怪兽属性", "Monster Attributes"));
     
     // 属性下拉菜单
     AdwComboRow *attribute_row = ADW_COMBO_ROW(adw_combo_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(attribute_row), "属性");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(attribute_row), TR("属性", "Attribute"));
     GtkStringList *attribute_list = gtk_string_list_new(NULL);
-    gtk_string_list_append(attribute_list, "全部");
-    gtk_string_list_append(attribute_list, "地");
-    gtk_string_list_append(attribute_list, "水");
-    gtk_string_list_append(attribute_list, "炎");
-    gtk_string_list_append(attribute_list, "风");
-    gtk_string_list_append(attribute_list, "光");
-    gtk_string_list_append(attribute_list, "暗");
-    gtk_string_list_append(attribute_list, "神");
+    gtk_string_list_append(attribute_list, TR("全部", "Any"));
+    gtk_string_list_append(attribute_list, TR("地", "EARTH"));
+    gtk_string_list_append(attribute_list, TR("水", "WATER"));
+    gtk_string_list_append(attribute_list, TR("炎", "FIRE"));
+    gtk_string_list_append(attribute_list, TR("风", "WIND"));
+    gtk_string_list_append(attribute_list, TR("光", "LIGHT"));
+    gtk_string_list_append(attribute_list, TR("暗", "DARK"));
+    gtk_string_list_append(attribute_list, TR("神", "DIVINE"));
     adw_combo_row_set_model(attribute_row, G_LIST_MODEL(attribute_list));
     g_object_unref(attribute_list);
     adw_combo_row_set_selected(attribute_row, filter_state.attribute_selected);  // 恢复状态
@@ -1505,35 +1555,35 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // 种族下拉菜单
     AdwComboRow *race_row = ADW_COMBO_ROW(adw_combo_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(race_row), "种族");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(race_row), TR("种族", "Monster Type"));
     GtkStringList *race_list = gtk_string_list_new(NULL);
-    gtk_string_list_append(race_list, "全部");
-    gtk_string_list_append(race_list, "战士");
-    gtk_string_list_append(race_list, "魔法师");
-    gtk_string_list_append(race_list, "天使");
-    gtk_string_list_append(race_list, "恶魔");
-    gtk_string_list_append(race_list, "不死");
-    gtk_string_list_append(race_list, "机械");
-    gtk_string_list_append(race_list, "水");
-    gtk_string_list_append(race_list, "炎");
-    gtk_string_list_append(race_list, "岩石");
-    gtk_string_list_append(race_list, "鸟兽");
-    gtk_string_list_append(race_list, "植物");
-    gtk_string_list_append(race_list, "昆虫");
-    gtk_string_list_append(race_list, "雷");
-    gtk_string_list_append(race_list, "龙");
-    gtk_string_list_append(race_list, "兽");
-    gtk_string_list_append(race_list, "兽战士");
-    gtk_string_list_append(race_list, "恐龙");
-    gtk_string_list_append(race_list, "鱼");
-    gtk_string_list_append(race_list, "海龙");
-    gtk_string_list_append(race_list, "爬虫类");
-    gtk_string_list_append(race_list, "念动力");
-    gtk_string_list_append(race_list, "幻神兽");
-    gtk_string_list_append(race_list, "创造神");
-    gtk_string_list_append(race_list, "幻龙");
-    gtk_string_list_append(race_list, "电子界");
-    gtk_string_list_append(race_list, "幻想魔");
+    gtk_string_list_append(race_list, TR("全部", "Any"));
+    gtk_string_list_append(race_list, TR("战士", "Warrior"));
+    gtk_string_list_append(race_list, TR("魔法师", "Spellcaster"));
+    gtk_string_list_append(race_list, TR("天使", "Fairy"));
+    gtk_string_list_append(race_list, TR("恶魔", "Fiend"));
+    gtk_string_list_append(race_list, TR("不死", "Zombie"));
+    gtk_string_list_append(race_list, TR("机械", "Machine"));
+    gtk_string_list_append(race_list, TR("水", "Aqua"));
+    gtk_string_list_append(race_list, TR("炎", "Pyro"));
+    gtk_string_list_append(race_list, TR("岩石", "Rock"));
+    gtk_string_list_append(race_list, TR("鸟兽", "Winged Beast"));
+    gtk_string_list_append(race_list, TR("植物", "Plant"));
+    gtk_string_list_append(race_list, TR("昆虫", "Insect"));
+    gtk_string_list_append(race_list, TR("雷", "Thunder"));
+    gtk_string_list_append(race_list, TR("龙", "Dragon"));
+    gtk_string_list_append(race_list, TR("兽", "Beast"));
+    gtk_string_list_append(race_list, TR("兽战士", "Beast-Warrior"));
+    gtk_string_list_append(race_list, TR("恐龙", "Dinosaur"));
+    gtk_string_list_append(race_list, TR("鱼", "Fish"));
+    gtk_string_list_append(race_list, TR("海龙", "Sea Serpent"));
+    gtk_string_list_append(race_list, TR("爬虫类", "Reptile"));
+    gtk_string_list_append(race_list, TR("念动力", "Psychic"));
+    gtk_string_list_append(race_list, TR("幻神兽", "Divine-Beast"));
+    gtk_string_list_append(race_list, TR("创造神", "Creator God"));
+    gtk_string_list_append(race_list, TR("幻龙", "Wyrm"));
+    gtk_string_list_append(race_list, TR("电子界", "Cyberse"));
+    gtk_string_list_append(race_list, TR("幻想魔", "Illusion"));
     adw_combo_row_set_model(race_row, G_LIST_MODEL(race_list));
     g_object_unref(race_list);
     adw_combo_row_set_selected(race_row, filter_state.race_selected);  // 恢复状态
@@ -1548,11 +1598,11 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // === 数值信息组（仅怪兽）===
     AdwPreferencesGroup *stats_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(stats_group, "数值信息");
+    adw_preferences_group_set_title(stats_group, TR("数值信息", "Card Stats"));
     
     // 攻击力输入框
     AdwEntryRow *atk_row = ADW_ENTRY_ROW(adw_entry_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(atk_row), "攻击力");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(atk_row), TR("攻击力", "ATK"));
     adw_entry_row_set_input_hints(atk_row, GTK_INPUT_HINT_NO_EMOJI);
     gtk_editable_set_text(GTK_EDITABLE(atk_row), filter_state.atk_text ? filter_state.atk_text : "");  // 恢复状态
     gtk_editable_set_max_width_chars(GTK_EDITABLE(atk_row), 10);
@@ -1561,7 +1611,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // 守备力输入框
     AdwEntryRow *def_row = ADW_ENTRY_ROW(adw_entry_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(def_row), "守备力");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(def_row), TR("守备力", "DEF"));
     adw_entry_row_set_input_hints(def_row, GTK_INPUT_HINT_NO_EMOJI);
     gtk_editable_set_text(GTK_EDITABLE(def_row), filter_state.def_text ? filter_state.def_text : "");  // 恢复状态
     gtk_editable_set_max_width_chars(GTK_EDITABLE(def_row), 10);
@@ -1570,7 +1620,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // 等级输入框
     AdwEntryRow *level_row = ADW_ENTRY_ROW(adw_entry_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(level_row), "等级");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(level_row), TR("等级", "Level"));
     adw_entry_row_set_input_hints(level_row, GTK_INPUT_HINT_NO_EMOJI);
     gtk_editable_set_text(GTK_EDITABLE(level_row), filter_state.level_text ? filter_state.level_text : "");  // 恢复状态
     gtk_editable_set_max_width_chars(GTK_EDITABLE(level_row), 10);
@@ -1583,16 +1633,16 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // === 灵摆刻度组（仅怪兽）===
     AdwPreferencesGroup *pendulum_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(pendulum_group, "灵摆刻度");
+    adw_preferences_group_set_title(pendulum_group, TR("灵摆刻度", "Pendulum Scale"));
     
     // 创建一个 ActionRow 包含两个刻度输入框
     AdwActionRow *scale_row = ADW_ACTION_ROW(adw_action_row_new());
-    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(scale_row), "灵摆刻度");
-    adw_action_row_set_subtitle(scale_row, "左刻度 / 右刻度");
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(scale_row), TR("灵摆刻度", "Pendulum Scale"));
+    adw_action_row_set_subtitle(scale_row, TR("左刻度 / 右刻度", "Left Scale / Right Scale"));
     
     // 左刻度输入框
     GtkWidget *left_scale_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(left_scale_entry), "左");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(left_scale_entry), TR("左", "Left"));
     gtk_editable_set_text(GTK_EDITABLE(left_scale_entry), filter_state.left_scale_text ? filter_state.left_scale_text : "");  // 恢复状态
     gtk_editable_set_max_width_chars(GTK_EDITABLE(left_scale_entry), 5);
     gtk_widget_set_valign(left_scale_entry, GTK_ALIGN_CENTER);
@@ -1601,7 +1651,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // 右刻度输入框
     GtkWidget *right_scale_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(right_scale_entry), "右");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(right_scale_entry), TR("右", "Right"));
     gtk_editable_set_text(GTK_EDITABLE(right_scale_entry), filter_state.right_scale_text ? filter_state.right_scale_text : "");  // 恢复状态
     gtk_editable_set_max_width_chars(GTK_EDITABLE(right_scale_entry), 5);
     gtk_widget_set_valign(right_scale_entry, GTK_ALIGN_CENTER);
@@ -1620,7 +1670,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     
     // === 连接箭头组（仅连接怪兽）===
     AdwPreferencesGroup *link_markers_group = ADW_PREFERENCES_GROUP(adw_preferences_group_new());
-    adw_preferences_group_set_title(link_markers_group, "连接箭头");
+    adw_preferences_group_set_title(link_markers_group, TR("连接箭头", "Link Arrows"));
     
     // 创建3x3网格布局（中间位置留空）
     GtkWidget *link_grid = gtk_grid_new();
@@ -2018,7 +2068,7 @@ static void on_action_import_from_url(GSimpleAction *action, GVariant *parameter
     
     // 创建 AdwDialog
     AdwDialog *dialog = ADW_DIALOG(adw_dialog_new());
-    adw_dialog_set_title(dialog, "从URL导入...");
+    adw_dialog_set_title(dialog, TR("从URL导入...", "Import from Link…"));
     adw_dialog_set_content_width(dialog, 400);
     
     // 创建对话框内容容器
@@ -2030,7 +2080,7 @@ static void on_action_import_from_url(GSimpleAction *action, GVariant *parameter
 
     // 添加更大字号并居中的 Heading 标签
     GtkWidget *heading = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(heading), "<span size='xx-large' weight='bold'>从URL导入...</span>");
+    gtk_label_set_markup(GTK_LABEL(heading), TR("<span size='xx-large' weight='bold'>从URL导入...</span>", "<span size='xx-large' weight='bold'>Import from Link</span>"));
     gtk_label_set_xalign(GTK_LABEL(heading), 0.5); // 居中
     gtk_widget_set_halign(heading, GTK_ALIGN_CENTER);
     gtk_widget_add_css_class(heading, "heading");
@@ -2049,10 +2099,10 @@ static void on_action_import_from_url(GSimpleAction *action, GVariant *parameter
     gtk_widget_set_margin_top(button_box, 18);
     gtk_widget_set_halign(button_box, GTK_ALIGN_CENTER);
 
-    GtkWidget *import_btn = gtk_button_new_with_label("导入");
+    GtkWidget *import_btn = gtk_button_new_with_label(TR("导入", "Import"));
     GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_hexpand(spacer, TRUE);
-    GtkWidget *cancel_btn = gtk_button_new_with_label("取消");
+    GtkWidget *cancel_btn = gtk_button_new_with_label(TR("取消", "Cancel"));
     gtk_box_append(GTK_BOX(button_box), import_btn);
     gtk_box_append(GTK_BOX(button_box), spacer);
     gtk_box_append(GTK_BOX(button_box), cancel_btn);
@@ -2094,14 +2144,13 @@ static void on_action_export_to_file(GSimpleAction *action, GVariant *parameter,
     on_export_clicked(NULL, ui);
 }
 
-// GAction 激活回调：从菜单中选择“生成卡表”时触发
-static void on_action_generate_sheet(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
-    (void)action;
-    (void)parameter;
-    SearchUI *ui = (SearchUI*)user_data;
+static void on_sheet_options_continue(AdwAlertDialog *options, const char *response, gpointer user_data) {
+    (void)response;
+    SearchUI *ui = user_data;
+    GtkEditable *entry = g_object_get_data(G_OBJECT(options), "konami-id-entry");
 
-    GtkFileDialog *dialog = gtk_file_dialog_new();
-    gtk_file_dialog_set_title(dialog, "生成卡表");
+    g_autoptr(GtkFileDialog) dialog = gtk_file_dialog_new();
+    gtk_file_dialog_set_title(dialog, TR("保存卡表", "Save Deck List"));
 
     if (last_deck_sheet_directory && g_file_test(last_deck_sheet_directory, G_FILE_TEST_IS_DIR)) {
         char *full_path = g_build_filename(last_deck_sheet_directory, "deck_ja_filled.pdf", NULL);
@@ -2117,7 +2166,7 @@ static void on_action_generate_sheet(GSimpleAction *action, GVariant *parameter,
 
     GtkFileFilter *filter = gtk_file_filter_new();
     gtk_file_filter_add_pattern(filter, "*.pdf");
-    gtk_file_filter_set_name(filter, "PDF文件 (*.pdf)");
+    gtk_file_filter_set_name(filter, TR("PDF文件 (*.pdf)", "PDF Files (*.pdf)"));
 
     GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
     g_list_store_append(filters, filter);
@@ -2125,95 +2174,42 @@ static void on_action_generate_sheet(GSimpleAction *action, GVariant *parameter,
     g_object_unref(filters);
     g_object_unref(filter);
 
-    ExportData *data = g_new0(ExportData, 1);
+    SheetExportData *data = g_new0(SheetExportData, 1);
     data->ui = ui;
-    data->dialog = g_object_ref(dialog);
+    data->konami_id = g_strdup(gtk_editable_get_text(entry));
+    g_strstrip(data->konami_id);
 
     gtk_file_dialog_save(dialog,
-                        NULL,
+                        GTK_WINDOW(ui->window),
                         NULL,
                         on_sheet_save_finish,
                         data);
-    // 释放调用方引用（回调持有 data->dialog），避免每次生成卡表泄漏一个对话框
-    g_object_unref(dialog);
 }
 
-static void on_personal_info_save_clicked(GtkButton *btn, gpointer user_data) {
-    (void)btn;
-    PersonalInfoDialogData *data = (PersonalInfoDialogData*)user_data;
-    if (!data || !data->konami_id_entry) return;
-
-    const char *entry_text = gtk_editable_get_text(GTK_EDITABLE(data->konami_id_entry));
-    char *new_id = g_strdup(entry_text ? entry_text : "");
-    g_strstrip(new_id);
-
-    save_personal_konami_id(new_id);
-
-    g_free(personal_konami_id);
-    personal_konami_id = (*new_id) ? g_strdup(new_id) : NULL;
-
-    if (data->ui && data->ui->toast_overlay) {
-        AdwToast *toast = adw_toast_new("个人信息已保存");
-        adw_toast_set_timeout(toast, 2);
-        adw_toast_overlay_add_toast(data->ui->toast_overlay, toast);
-    }
-
-    g_free(new_id);
-    adw_dialog_close(data->dialog);
-}
-
-static void on_action_edit_personal_info(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
+static void on_action_generate_sheet(GSimpleAction *action, GVariant *parameter, gpointer user_data) {
     (void)action;
     (void)parameter;
-    SearchUI *ui = (SearchUI*)user_data;
+    SearchUI *ui = user_data;
     if (!ui || !ui->window) return;
 
-    AdwDialog *dialog = ADW_DIALOG(adw_dialog_new());
-    adw_dialog_set_title(dialog, "个人信息");
-    adw_dialog_set_content_width(dialog, 420);
+    AdwAlertDialog *dialog = ADW_ALERT_DIALOG(adw_alert_dialog_new(
+        TR("生成卡表", "Export Deck List"), TR("Konami ID 会写入 PDF。成功导出后，下次会预填本次使用的值。", "The Konami ID is included in the PDF and remembered after a successful export.")));
 
-    GtkWidget *content_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
-    gtk_widget_set_margin_start(content_box, 24);
-    gtk_widget_set_margin_end(content_box, 24);
-    gtk_widget_set_margin_top(content_box, 24);
-    gtk_widget_set_margin_bottom(content_box, 24);
+    GtkWidget *entry = adw_entry_row_new();
+    adw_preferences_row_set_title(ADW_PREFERENCES_ROW(entry), TR("Konami ID（选填）", "Konami ID (Optional)"));
+    g_autofree char *saved_id = load_personal_konami_id();
+    gtk_editable_set_text(GTK_EDITABLE(entry), saved_id ? saved_id : "");
 
-    GtkWidget *heading = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(heading), "<span size='x-large' weight='bold'>个人信息</span>");
-    gtk_label_set_xalign(GTK_LABEL(heading), 0.0);
-    gtk_widget_add_css_class(heading, "heading");
-    gtk_box_append(GTK_BOX(content_box), heading);
-
-    GtkWidget *konami_id_entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(konami_id_entry), "Konami ID");
-    if (personal_konami_id && *personal_konami_id) {
-        gtk_editable_set_text(GTK_EDITABLE(konami_id_entry), personal_konami_id);
-    }
-    gtk_box_append(GTK_BOX(content_box), konami_id_entry);
-
-    GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 12);
-    gtk_widget_set_margin_top(button_box, 16);
-    gtk_widget_set_halign(button_box, GTK_ALIGN_END);
-
-    GtkWidget *cancel_btn = gtk_button_new_with_label("取消");
-    GtkWidget *save_btn = gtk_button_new_with_label("保存");
-    gtk_widget_add_css_class(save_btn, "suggested-action");
-    gtk_box_append(GTK_BOX(button_box), cancel_btn);
-    gtk_box_append(GTK_BOX(button_box), save_btn);
-    gtk_box_append(GTK_BOX(content_box), button_box);
-
-    PersonalInfoDialogData *dialog_data = g_new0(PersonalInfoDialogData, 1);
-    dialog_data->ui = ui;
-    dialog_data->dialog = dialog;
-    dialog_data->konami_id_entry = konami_id_entry;
-
-    g_signal_connect(save_btn, "clicked", G_CALLBACK(on_personal_info_save_clicked), dialog_data);
-    g_signal_connect_swapped(cancel_btn, "clicked", G_CALLBACK(adw_dialog_close), dialog);
-    g_signal_connect(konami_id_entry, "activate", G_CALLBACK(on_personal_info_save_clicked), dialog_data);
-
-    g_object_set_data_full(G_OBJECT(dialog), "personal-info-data", dialog_data, g_free);
-    adw_dialog_set_child(dialog, content_box);
-    adw_dialog_present(dialog, GTK_WIDGET(ui->window));
+    GtkWidget *group = adw_preferences_group_new();
+    adw_preferences_group_add(ADW_PREFERENCES_GROUP(group), entry);
+    adw_alert_dialog_set_extra_child(dialog, group);
+    adw_alert_dialog_add_response(dialog, "cancel", TR("取消", "Cancel"));
+    adw_alert_dialog_add_response(dialog, "continue", TR("选择保存位置…", "Choose Save Location…"));
+    adw_alert_dialog_set_close_response(dialog, "cancel");
+    adw_alert_dialog_set_response_appearance(dialog, "continue", ADW_RESPONSE_SUGGESTED);
+    g_object_set_data(G_OBJECT(dialog), "konami-id-entry", entry);
+    g_signal_connect(dialog, "response::continue", G_CALLBACK(on_sheet_options_continue), ui);
+    adw_dialog_present(ADW_DIALOG(dialog), GTK_WIDGET(ui->window));
 }
 
 // 复制按钮回调：将URL文本视图中的文本复制到剪贴板
@@ -2230,7 +2226,7 @@ static void on_copy_url_clicked(GtkButton *btn, gpointer user_data) {
     gchar *url_text = gtk_text_buffer_get_text(buffer, &start, &end, FALSE);
     
     // 如果文本为空或是占位符，则不复制
-    if (!url_text || *url_text == '\0' || g_strcmp0(url_text, "(生成URL失败)") == 0) {
+    if (!url_text || *url_text == '\0' || g_strcmp0(url_text, TR("(生成URL失败)", "(Could not create link)")) == 0) {
         g_free(url_text);
         return;
     }
@@ -2243,7 +2239,7 @@ static void on_copy_url_clicked(GtkButton *btn, gpointer user_data) {
     
     // 显示Toast通知
     if (data->toast_overlay) {
-        AdwToast *toast = adw_toast_new("已复制到剪贴板");
+        AdwToast *toast = adw_toast_new(TR("已复制到剪贴板", "Copied to clipboard"));
         adw_toast_set_timeout(toast, 2);
         adw_toast_overlay_add_toast(data->toast_overlay, toast);
     }
@@ -2284,7 +2280,7 @@ static void on_import_url_clicked(GtkButton *btn, gpointer user_data) {
         // 显示错误Toast通知
         SearchUI *ui = data->ui;
         if (ui->toast_overlay) {
-            AdwToast *toast = adw_toast_new("URL错误");
+            AdwToast *toast = adw_toast_new(TR("URL错误", "Invalid deck link"));
             adw_toast_set_timeout(toast, 2);
             adw_toast_overlay_add_toast(ui->toast_overlay, toast);
         }
@@ -2374,7 +2370,7 @@ static void on_import_url_clicked(GtkButton *btn, gpointer user_data) {
     
     // 显示Toast通知
     if (ui->toast_overlay) {
-        AdwToast *toast = adw_toast_new("从URL导入成功");
+        AdwToast *toast = adw_toast_new(TR("从URL导入成功", "Deck imported from link"));
         adw_toast_set_timeout(toast, 2);
         adw_toast_overlay_add_toast(ui->toast_overlay, toast);
     }
@@ -2449,7 +2445,7 @@ static void on_action_export_to_url(GSimpleAction *action, GVariant *parameter, 
 
     // 创建对话框
     AdwDialog *dialog = ADW_DIALOG(adw_dialog_new());
-    adw_dialog_set_title(dialog, "导出到URL...");
+    adw_dialog_set_title(dialog, TR("导出到URL...", "Export as Link…"));
     adw_dialog_set_content_width(dialog, 380);
 
     GtkWidget *content_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 12);
@@ -2459,7 +2455,7 @@ static void on_action_export_to_url(GSimpleAction *action, GVariant *parameter, 
     gtk_widget_set_margin_bottom(content_box, 20);
 
     GtkWidget *heading = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(heading), "<span size='large' weight='bold'>导出到URL...</span>");
+    gtk_label_set_markup(GTK_LABEL(heading), TR("<span size='large' weight='bold'>导出到URL...</span>", "<span size='large' weight='bold'>Export as Link</span>"));
     gtk_label_set_xalign(GTK_LABEL(heading), 0.5);
     gtk_widget_set_halign(heading, GTK_ALIGN_CENTER);
     gtk_widget_add_css_class(heading, "heading");
@@ -2489,7 +2485,7 @@ static void on_action_export_to_url(GSimpleAction *action, GVariant *parameter, 
         // 当对话框关闭时释放URL字符串
         g_object_set_data_full(G_OBJECT(dialog), "deck-url", deck_url, g_free);
     } else {
-        gtk_text_buffer_set_text(buffer, "(生成URL失败)", -1);
+        gtk_text_buffer_set_text(buffer, TR("(生成URL失败)", "(Could not create link)"), -1);
     }
     
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scrolled_window), url_text_view);
@@ -2499,10 +2495,10 @@ static void on_action_export_to_url(GSimpleAction *action, GVariant *parameter, 
     GtkWidget *button_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 36);
     gtk_widget_set_margin_top(button_box, 18);
     gtk_widget_set_halign(button_box, GTK_ALIGN_CENTER);
-    GtkWidget *export_btn = gtk_button_new_with_label("复制");
+    GtkWidget *export_btn = gtk_button_new_with_label(TR("复制", "Copy"));
     GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_hexpand(spacer, TRUE);
-    GtkWidget *cancel_btn = gtk_button_new_with_label("取消");
+    GtkWidget *cancel_btn = gtk_button_new_with_label(TR("取消", "Cancel"));
     gtk_box_append(GTK_BOX(button_box), export_btn);
     gtk_box_append(GTK_BOX(button_box), spacer);
     gtk_box_append(GTK_BOX(button_box), cancel_btn);
@@ -2595,11 +2591,11 @@ static void on_clear_clicked(GtkButton *btn, gpointer user_data) {
     if (!ui) return;
     
     // 创建确认对话框
-    AdwDialog *dialog = adw_alert_dialog_new("确认清空", "确定要清空所有卡组区域（Main、Extra、Side）吗？此操作无法撤销。");
+    AdwDialog *dialog = adw_alert_dialog_new(TR("确认清空", "Clear Deck?"), TR("确定要清空主卡组、额外卡组和副卡组吗？此操作无法撤销。", "Remove all cards from the Main, Extra, and Side Decks? This cannot be undone."));
     
     // 添加取消和确认按钮
-    adw_alert_dialog_add_response(ADW_ALERT_DIALOG(dialog), "cancel", "取消");
-    adw_alert_dialog_add_response(ADW_ALERT_DIALOG(dialog), "clear", "清空");
+    adw_alert_dialog_add_response(ADW_ALERT_DIALOG(dialog), "cancel", TR("取消", "Cancel"));
+    adw_alert_dialog_add_response(ADW_ALERT_DIALOG(dialog), "clear", TR("清空", "Clear"));
     
     // 设置清空按钮为破坏性样式（红色）
     adw_alert_dialog_set_response_appearance(ADW_ALERT_DIALOG(dialog), "clear", ADW_RESPONSE_DESTRUCTIVE);
@@ -2618,7 +2614,7 @@ static void on_export_clicked(GtkButton *btn, gpointer user_data) {
     SearchUI *ui = (SearchUI*)user_data;
     
     GtkFileDialog *dialog = gtk_file_dialog_new();
-    gtk_file_dialog_set_title(dialog, "导出卡组");
+    gtk_file_dialog_set_title(dialog, TR("导出卡组", "Export Deck"));
     
     // 设置默认文件名和目录
     if (last_export_directory && g_file_test(last_export_directory, G_FILE_TEST_IS_DIR)) {
@@ -2638,7 +2634,7 @@ static void on_export_clicked(GtkButton *btn, gpointer user_data) {
     // 设置文件过滤器
     GtkFileFilter *filter = gtk_file_filter_new();
     gtk_file_filter_add_pattern(filter, "*.ydk");
-    gtk_file_filter_set_name(filter, "YDK文件 (*.ydk)");
+    gtk_file_filter_set_name(filter, TR("YDK文件 (*.ydk)", "YDK Files (*.ydk)"));
     
     GListStore *filters = g_list_store_new(GTK_TYPE_FILE_FILTER);
     g_list_store_append(filters, filter);
@@ -2659,14 +2655,17 @@ static void on_export_clicked(GtkButton *btn, gpointer user_data) {
     g_object_unref(dialog);
 }
 
-char* format_card_text(const CardPreview *pv) {
+static char *format_card_text(const CardPreview *pv, const char *metadata) {
     GString *s = g_string_new(NULL);
-    char *name = pv->cn_name ? g_markup_escape_text(pv->cn_name, -1) : g_strdup("(无名)");
-    char *types = pv->types ? g_markup_escape_text(pv->types, -1) : g_strdup("");
+    const char *display_name = card_name_for_language(pv->original_name, pv->en_name);
+    char *name = g_markup_escape_text(display_name ? display_name : TR("(无名)", "(Unnamed)"), -1);
+    char *types = metadata ? g_markup_escape_text(metadata, -1) : g_strdup("");
     char *pdesc = pv->pdesc ? g_markup_escape_text(pv->pdesc, -1) : g_strdup("");
     char *desc  = pv->desc  ? g_markup_escape_text(pv->desc, -1)  : g_strdup("");
     g_string_append_printf(s, "<b>%s</b>\n", name);
     if (*types) g_string_append_printf(s, "<span size=\"smaller\" color=\"#888\">%s</span>\n\n", types);
+    if (ui_is_english() && (*pdesc || *desc))
+        g_string_append(s, "<small>Original card text</small>\n");
     if (*pdesc) g_string_append_printf(s, "%s\n\n", pdesc);
     if (*desc)  g_string_append_printf(s, "%s", desc);
     g_free(name); g_free(types); g_free(pdesc); g_free(desc);
@@ -2738,13 +2737,30 @@ static void preview_load_finished(GObject *source, GAsyncResult *res, gpointer u
     g_free(data);
 }
 
+static void refresh_card_preview_text(SearchUI *ui) {
+    const CardPreview *pv = g_object_get_data(G_OBJECT(ui->left_label), "current-card");
+    if (!pv)
+        return;
+
+    g_autofree char *metadata = card_display_metadata(pv->types);
+    int english_cid = ui_is_english() && !pv->is_prerelease ? pv->cid : 0;
+    if (!card_show_english_preview(ui->left_label, ui->session, english_cid, metadata)) {
+        g_autofree char *markup = format_card_text(pv, metadata);
+        gtk_label_set_markup(ui->left_label, markup);
+    }
+}
+
 static void show_card_preview(SearchUI *ui, const CardPreview *pv) {
     if (!ui || !pv) return;
-    // 文本
-    char *markup = format_card_text(pv);
-    gtk_label_set_use_markup(ui->left_label, TRUE);
-    gtk_label_set_markup(ui->left_label, markup);
-    g_free(markup);
+    CardPreview *current = g_new(CardPreview, 1);
+    *current = *pv;
+    current->original_name = g_strdup(pv->original_name);
+    current->en_name = g_strdup(pv->en_name);
+    current->types = g_strdup(pv->types);
+    current->pdesc = g_strdup(pv->pdesc);
+    current->desc = g_strdup(pv->desc);
+    g_object_set_data_full(G_OBJECT(ui->left_label), "current-card", current, free_card_preview);
+    refresh_card_preview_text(ui);
     // 图片
     if (pv->id > 0) {
         if (pv->is_prerelease) {
@@ -3021,7 +3037,11 @@ void on_result_row_enter(GtkEventControllerMotion *controller, double x, double 
     }
     
     CardPreview *pv = (CardPreview*)g_object_get_data(G_OBJECT(row), "preview");
-    if (pv) show_card_preview(ui, pv);
+    if (ui && pv) {
+        clear_slot_hover_cache(ui);
+        ui->hover_generation++;
+        show_card_preview(ui, pv);
+    }
 }
 
 // 槽位悬停在线信息请求上下文：携带派发时的悬停代次与卡片 ID，
@@ -3032,6 +3052,30 @@ typedef struct {
     int img_id;
     guint64 generation;
 } HoverInfoCtx;
+
+static void show_card_from_data(SearchUI *ui, JsonObject *card, int img_id, gboolean prerelease) {
+    CardPreview preview = {
+        .id = img_id,
+        .cid = json_object_get_int_member_with_default(card, "cid", 0),
+        .is_prerelease = prerelease,
+    };
+    preview.original_name = g_strdup(card_original_name(card));
+    preview.en_name = g_strdup(card_english_name(card));
+    if (json_object_has_member(card, "text")) {
+        JsonObject *details = json_object_get_object_member(card, "text");
+        if (details) {
+            preview.types = g_strdup(json_object_get_string_member_with_default(details, "types", NULL));
+            preview.pdesc = g_strdup(json_object_get_string_member_with_default(details, "pdesc", NULL));
+            preview.desc = g_strdup(json_object_get_string_member_with_default(details, "desc", NULL));
+        }
+    }
+    show_card_preview(ui, &preview);
+    g_free(preview.original_name);
+    g_free(preview.en_name);
+    g_free(preview.types);
+    g_free(preview.pdesc);
+    g_free(preview.desc);
+}
 
 // 异步读取响应数据的工作线程
 static void card_info_read_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
@@ -3077,56 +3121,11 @@ static void card_info_read_finished(GObject *source, GAsyncResult *res, gpointer
     GError *jerr = NULL;
     if (json_parser_load_from_data(parser, (const char*)ba->data, (gssize)ba->len, &jerr)) {
         JsonNode *root = json_parser_get_root(parser);
-        if (root && JSON_NODE_HOLDS_OBJECT(root)) {
-            JsonObject *obj = json_node_get_object(root);
-            
-            // 构造 CardPreview 数据
-            CardPreview pv = {0};
-            
-            // 悬停的是卡组槽位里实际选中的版本；ygocdb 返回的 id 是本体，
-            // 直接使用会丢失异画，故以槽位的 img_id 为准。
-            pv.id = ctx->img_id;
-            
-            // 获取 cid (用于禁限卡表)
-            if (json_object_has_member(obj, "cid")) {
-                pv.cid = json_object_get_int_member(obj, "cid");
-            }
-            
-            // 获取type数据
-            if (json_object_has_member(obj, "data")) {
-                JsonObject *data = json_object_get_object_member(obj, "data");
-                if (data && json_object_has_member(data, "type")) {
-                    pv.type = (uint32_t)json_object_get_int_member(data, "type");
-                }
-            }
-            
-            // 获取文本数据
-            if (json_object_has_member(obj, "text")) {
-                JsonObject *text = json_object_get_object_member(obj, "text");
-                if (text) {
-                    // 获取卡名 (从 text.name 获取)
-                    if (json_object_has_member(text, "name")) 
-                        pv.cn_name = g_strdup(json_object_get_string_member(text, "name"));
-                    if (json_object_has_member(text, "types")) 
-                        pv.types = g_strdup(json_object_get_string_member(text, "types"));
-                    if (json_object_has_member(text, "pdesc")) 
-                        pv.pdesc = g_strdup(json_object_get_string_member(text, "pdesc"));
-                    if (json_object_has_member(text, "desc")) 
-                        pv.desc = g_strdup(json_object_get_string_member(text, "desc"));
-                }
-            }
-            
-            // 代次与卡片校验：悬停已切换到其他卡则丢弃过期结果
-            if (ui && ctx->generation == ui->hover_generation &&
-                ui->hovered_slot_img_id == ctx->img_id) {
-                show_card_preview(ui, &pv);
-            }
-
-            // 释放临时字符串
-            g_free(pv.cn_name);
-            g_free(pv.types);
-            g_free(pv.pdesc);
-            g_free(pv.desc);
+        if (root && JSON_NODE_HOLDS_OBJECT(root) && ui &&
+            ctx->generation == ui->hover_generation &&
+            ui->hovered_slot_img_id == ctx->img_id) {
+            // Use the selected artwork ID even if the response describes the original.
+            show_card_from_data(ui, json_node_get_object(root), ctx->img_id, FALSE);
         }
     }
     if (jerr) g_error_free(jerr);
@@ -3180,51 +3179,30 @@ static void on_slot_enter(GtkEventControllerMotion *controller, double x, double
     // 获取 img_id
     int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "img_id"));
     if (img_id <= 0) return;  // 没有卡片
-    if (ui && ui->hovered_slot_img_id == img_id) return;
-    if (ui) ui->hovered_slot_img_id = img_id;
+    if (ui->hovered_slot_img_id == img_id) return;
+    ui->hovered_slot_img_id = img_id;
+    ui->hover_generation++;
     
     // 首先尝试从先行卡中查找
     JsonObject *prerelease_card = find_prerelease_card_by_id(img_id);
     if (prerelease_card) {
-        // 从先行卡数据构造 CardPreview
-        CardPreview pv = {0};
-        pv.id = img_id;
-        pv.cid = img_id;  // 先行卡的cid与id相同
-        pv.is_prerelease = TRUE;
-        
-        // 获取type数据
-        if (json_object_has_member(prerelease_card, "type")) {
-            pv.type = (uint32_t)json_object_get_int_member(prerelease_card, "type");
-        }
-        
-        // 获取文本数据
-        if (json_object_has_member(prerelease_card, "text")) {
-            JsonObject *text = json_object_get_object_member(prerelease_card, "text");
-            if (text) {
-                if (json_object_has_member(text, "name")) 
-                    pv.cn_name = g_strdup(json_object_get_string_member(text, "name"));
-                if (json_object_has_member(text, "types")) 
-                    pv.types = g_strdup(json_object_get_string_member(text, "types"));
-                if (json_object_has_member(text, "pdesc")) 
-                    pv.pdesc = g_strdup(json_object_get_string_member(text, "pdesc"));
-                if (json_object_has_member(text, "desc")) 
-                    pv.desc = g_strdup(json_object_get_string_member(text, "desc"));
-            }
-        }
-        
-        // 显示卡片预览
-        show_card_preview(ui, &pv);
-        
-        // 释放临时字符串
-        g_free(pv.cn_name);
-        g_free(pv.types);
-        g_free(pv.pdesc);
-        g_free(pv.desc);
-        
+        show_card_from_data(ui, prerelease_card, img_id, TRUE);
         json_object_unref(prerelease_card);
         return;
     }
-    
+
+    if (ui_is_english() && load_offline_data_switch_state() && offline_data_exists()) {
+        int cid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "card_id"));
+        JsonObject *card = get_card_by_id_offline(cid);
+        if (!card)
+            card = get_card_by_id_offline(offline_get_cid_by_img_id(img_id));
+        if (card) {
+            show_card_from_data(ui, card, img_id, FALSE);
+            json_object_unref(card);
+            return;
+        }
+    }
+
     // 如果不是先行卡，则从在线API获取
     // 构造 API URL
     char url[256];
@@ -3237,7 +3215,7 @@ static void on_slot_enter(GtkEventControllerMotion *controller, double x, double
     HoverInfoCtx *ctx = g_new0(HoverInfoCtx, 1);
     ctx->ui = ui;
     ctx->img_id = img_id;
-    ctx->generation = ++ui->hover_generation;
+    ctx->generation = ui->hover_generation;
     soup_session_send_and_read_async(ui->session, msg, G_PRIORITY_DEFAULT, NULL, on_slot_card_info_received, ctx);
     g_object_unref(msg);
 }
@@ -3271,17 +3249,17 @@ static void on_prerelease_update_complete(PrereleaseUpdateResult result, gpointe
 
     switch (result) {
     case PRERELEASE_UPDATE_UPDATED:
-        message = "先行卡已更新";
+        message = TR("先行卡已更新", "Pre-release cards updated");
         break;
     case PRERELEASE_UPDATE_UP_TO_DATE:
         // 启动时的自动检查不打扰用户，只在手动勾选后提示
         if (data->user_initiated) {
-            message = "先行卡已是最新";
+            message = TR("先行卡已是最新", "Pre-release cards are up to date");
         }
         break;
     case PRERELEASE_UPDATE_FAILED:
         if (data->user_initiated) {
-            message = "先行卡更新失败";
+            message = TR("先行卡更新失败", "Could not update pre-release cards");
             timeout = 3;
         }
         break;
@@ -3301,7 +3279,7 @@ static void on_prerelease_update_complete(PrereleaseUpdateResult result, gpointe
 // 启动一次先行卡检查/更新（后台线程，ETag 未变化时不会重复下载）
 static void start_prerelease_update(SearchUI *ui, gboolean user_initiated) {
     if (user_initiated && ui && ui->toast_overlay) {
-        AdwToast *toast = adw_toast_new("正在检查先行卡更新");
+        AdwToast *toast = adw_toast_new(TR("正在检查先行卡更新", "Checking for pre-release card updates"));
         adw_toast_set_timeout(toast, 2);
         adw_toast_overlay_add_toast(ui->toast_overlay, toast);
     }
@@ -3334,8 +3312,8 @@ static void on_enable_prerelease_action(GSimpleAction *action, GVariant *paramet
         // 关闭后先行卡不可用：清空图片、JSON 与 ETag
         gboolean cleared = clear_prerelease_data();
         if (ui && ui->toast_overlay) {
-            AdwToast *toast = adw_toast_new(cleared ? "已清除本地先行卡数据"
-                                                   : "清除本地先行卡数据失败");
+            AdwToast *toast = adw_toast_new(cleared ? TR("已清除本地先行卡数据", "Local pre-release card data cleared")
+                                                   : TR("清除本地先行卡数据失败", "Could not clear local pre-release card data"));
             adw_toast_set_timeout(toast, cleared ? 2 : 3);
             adw_toast_overlay_add_toast(ui->toast_overlay, toast);
         }
@@ -3354,7 +3332,7 @@ static gboolean on_download_offline_data_complete(gpointer user_data) {
     if (offline_data_exists()) {
         // 使用 toast 显示成功消息
         if (toast_overlay) {
-            AdwToast *toast = adw_toast_new("下载成功");
+            AdwToast *toast = adw_toast_new(TR("下载成功", "Offline card data downloaded"));
             adw_toast_set_timeout(toast, 2);
             adw_toast_overlay_add_toast(toast_overlay, toast);
         }
@@ -3362,7 +3340,7 @@ static gboolean on_download_offline_data_complete(gpointer user_data) {
     } else {
         // 使用 toast 显示失败消息
         if (toast_overlay) {
-            AdwToast *toast = adw_toast_new("下载失败");
+            AdwToast *toast = adw_toast_new(TR("下载失败", "Could not download offline card data"));
             adw_toast_set_timeout(toast, 2);
             adw_toast_overlay_add_toast(toast_overlay, toast);
         }
@@ -3408,7 +3386,7 @@ static void on_offline_data_switch_changed(GtkSwitch *switch_widget, GParamSpec 
         if (clear_offline_data()) {
             // 显示清理成功的 toast
             if (ui->toast_overlay) {
-                AdwToast *toast = adw_toast_new("已清理离线数据");
+                AdwToast *toast = adw_toast_new(TR("已清理离线数据", "Offline data cleared"));
                 adw_toast_set_timeout(toast, 2);
                 adw_toast_overlay_add_toast(ui->toast_overlay, toast);
             }
@@ -3418,7 +3396,7 @@ static void on_offline_data_switch_changed(GtkSwitch *switch_widget, GParamSpec 
             // 清理失败，恢复开关状态
             gtk_switch_set_active(switch_widget, TRUE);
             if (ui->toast_overlay) {
-                AdwToast *toast = adw_toast_new("清理失败");
+                AdwToast *toast = adw_toast_new(TR("清理失败", "Could not clear offline data"));
                 adw_toast_set_timeout(toast, 2);
                 adw_toast_overlay_add_toast(ui->toast_overlay, toast);
             }
@@ -3561,7 +3539,7 @@ static void on_show_forbidden_changes_action(GSimpleAction *action, GVariant *pa
     if (!changes_table || g_hash_table_size(changes_table) == 0) {
         g_message("No forbidden changes data available for current mode");
         if (ui->toast_overlay) {
-            AdwToast *toast = adw_toast_new("没有读取到禁限变更，请检查");
+            AdwToast *toast = adw_toast_new(TR("没有读取到禁限变更，请检查", "No banlist changes available"));
             adw_toast_set_timeout(toast, 3);
             adw_toast_overlay_add_toast(ui->toast_overlay, toast);
         }
@@ -3619,36 +3597,29 @@ static void on_show_forbidden_changes_action(GSimpleAction *action, GVariant *pa
     g_message("Displayed %u forbidden changes for mode index %u", shown, selected);
 
     if (shown == 0 && ui->toast_overlay) {
-        AdwToast *toast = adw_toast_new("没有读取到禁限变更，请检查");
+        AdwToast *toast = adw_toast_new(TR("没有读取到禁限变更，请检查", "No banlist changes available"));
         adw_toast_set_timeout(toast, 3);
         adw_toast_overlay_add_toast(ui->toast_overlay, toast);
     }
 }
 
-static GtkWidget* make_section_header(const char *title_text) {
-    GtkWidget *box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
-    GtkWidget *sep = gtk_separator_new(GTK_ORIENTATION_HORIZONTAL);
+static GtkWidget *make_section_header(const char *chinese, const char *english, GtkLabel **count_label) {
     GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_margin_start(row, 12);
+    gtk_widget_set_margin_end(row, 12);
+    gtk_widget_set_margin_top(row, 10);
+
     GtkWidget *title = gtk_label_new(NULL);
-    char *markup = g_strdup_printf("<span size='large'>%s</span>", title_text);
-    gtk_label_set_markup(GTK_LABEL(title), markup);
-    g_free(markup);
-    gtk_label_set_xalign(GTK_LABEL(title), 0.0);
-    gtk_widget_add_css_class(title, "heading");
-    gtk_widget_set_margin_start(row, 8);
-    gtk_widget_set_margin_end(row, 8);
+    ui_language_bind_text(G_OBJECT(title), "label", chinese, english);
+    gtk_widget_add_css_class(title, "title-4");
     gtk_box_append(GTK_BOX(row), title);
-    // 右侧副标题 (计数)
+
     GtkWidget *count = gtk_label_new("(0)");
-    gtk_label_set_xalign(GTK_LABEL(count), 0.0);
-    gtk_widget_set_halign(count, GTK_ALIGN_START);
     gtk_widget_add_css_class(count, "dim-label");
+    gtk_widget_add_css_class(count, "numeric");
     gtk_box_append(GTK_BOX(row), count);
-    // 保存计数标签以便外部获取
-    g_object_set_data(G_OBJECT(box), "count_label", count);
-    gtk_box_append(GTK_BOX(box), sep);
-    gtk_box_append(GTK_BOX(box), row);
-    return box;
+    *count_label = GTK_LABEL(count);
+    return row;
 }
 
 // 为单个卡组区域的全部槽位接线控制器：
@@ -3683,6 +3654,48 @@ static void wire_slot_controllers(GPtrArray *pics, SearchUI *sui) {
     }
 }
 
+static void refresh_main_language(SearchUI *ui) {
+    GMenu *app_menu = g_menu_new();
+    g_menu_append(app_menu, TR("显示先行卡", "Show Pre-release Cards"), "win.show-prerelease");
+    g_menu_append(app_menu, TR("显示禁限变更", "Show Banlist Changes"), "win.show-forbidden-changes");
+    GMenu *settings_section = g_menu_new();
+    g_menu_append(settings_section, TR("启用先行卡", "Enable Pre-release Cards"), "win.enable-prerelease");
+    g_menu_append_section(app_menu, NULL, G_MENU_MODEL(settings_section));
+    g_object_unref(settings_section);
+    GMenu *preferences_section = g_menu_new();
+    g_menu_append(preferences_section, TR("首选项", "Preferences"), "win.preferences");
+    g_menu_append_section(app_menu, NULL, G_MENU_MODEL(preferences_section));
+    g_object_unref(preferences_section);
+    gtk_menu_button_set_menu_model(ui->app_menu, G_MENU_MODEL(app_menu));
+    g_object_unref(app_menu);
+
+    GMenu *import_menu = g_menu_new();
+    g_menu_append(import_menu, TR("从文件导入…", "Import from File…"), "win.import-from-file");
+    g_menu_append(import_menu, TR("从链接导入…", "Import from Link…"), "win.import-from-url");
+    gtk_menu_button_set_menu_model(ui->import_menu, G_MENU_MODEL(import_menu));
+    g_object_unref(import_menu);
+
+    GMenu *export_menu = g_menu_new();
+    g_menu_append(export_menu, TR("导出到文件…", "Export to File…"), "win.export-to-file");
+    g_menu_append(export_menu, TR("导出为链接…", "Export as Link…"), "win.export-to-url");
+    g_menu_append(export_menu, TR("生成卡表…", "Export Deck List…"), "win.generate-sheet");
+    gtk_menu_button_set_menu_model(ui->export_menu, G_MENU_MODEL(export_menu));
+    g_object_unref(export_menu);
+
+    GtkDropDown *dropdown = ui->forbidden_dropdown;
+    guint selected = gtk_drop_down_get_selected(dropdown);
+    const char *const options[] = {TR("亚洲英文", "English (Asia)"),
+                                   TR("简体中文", "Simplified Chinese"), NULL};
+    g_signal_handlers_block_by_func(dropdown, on_forbidden_dropdown_changed, ui);
+    gtk_string_list_splice(GTK_STRING_LIST(gtk_drop_down_get_model(dropdown)), 2, 2, options);
+    gtk_drop_down_set_selected(dropdown, selected);
+    g_signal_handlers_unblock_by_func(dropdown, on_forbidden_dropdown_changed, ui);
+
+    update_genesys_score(ui);
+    refresh_search_result_language(ui);
+    refresh_card_preview_text(ui);
+}
+
 static void
 on_activate(GApplication *app, gpointer user_data)
 {
@@ -3706,7 +3719,7 @@ on_activate(GApplication *app, gpointer user_data)
     AdwApplicationWindow *win = ADW_APPLICATION_WINDOW(
         adw_application_window_new(GTK_APPLICATION(app)));
 
-    // 全局样式：为搜索结果缩略图应用固定 68x99 的最小/最大尺寸
+    // 卡片尺寸和缩略图样式。
     GtkCssProvider *provider = gtk_css_provider_new();
     const char *css =
         ".thumb-fixed {\n"
@@ -3714,6 +3727,8 @@ on_activate(GApplication *app, gpointer user_data)
         "}\n"
         ".deck-card {\n"
         "  min-width: 50px; min-height: 73px;\n"
+        "  background-color: alpha(@view_fg_color, 0.04);\n"
+        "  border-radius: 4px;\n"
         "}\n"
         ".art-choice {\n"
         "  padding: 2px;\n"
@@ -3739,17 +3754,16 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_window_set_default_size(GTK_WINDOW(win), 1200, 800);
 
     AdwHeaderBar *header = ADW_HEADER_BAR(adw_header_bar_new());
-    GtkWidget *title_label = gtk_label_new(NULL);
-    gtk_label_set_use_markup(GTK_LABEL(title_label), TRUE);
-    gtk_label_set_markup(GTK_LABEL(title_label), "<b>Yu-Gi-Oh! Deck Builder</b>");
-    adw_header_bar_set_title_widget(header, title_label);
+    adw_header_bar_set_title_widget(header, adw_window_title_new("Yu-Gi-Oh! Deck Builder", NULL));
 
     AdwToolbarView *toolbar_view = ADW_TOOLBAR_VIEW(adw_toolbar_view_new());
+    adw_toolbar_view_set_top_bar_style(toolbar_view, ADW_TOOLBAR_RAISED_BORDER);
     adw_toolbar_view_add_top_bar(toolbar_view, GTK_WIDGET(header));
 
     GtkWidget *col_start = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     GtkWidget *col_mid   = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     GtkWidget *col_end   = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_widget_add_css_class(col_mid, "view");
 
     gtk_widget_set_hexpand(col_start, TRUE);
     gtk_widget_set_vexpand(col_start, TRUE);
@@ -3761,23 +3775,12 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_widget_set_size_request(col_end, 300, -1);
     // 内层：使用 OverlaySplitView（与左栏相同机制），将右栏作为侧栏并固定 300 宽
     AdwOverlaySplitView *inner = ADW_OVERLAY_SPLIT_VIEW(adw_overlay_split_view_new());
-    // 将右栏作为侧栏，主内容为中栏；同时在中/右之间加入显式分隔线
-    GtkWidget *right_with_sep = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
-    GtkWidget *inner_sep = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
-    gtk_widget_set_vexpand(inner_sep, TRUE);
-    gtk_box_append(GTK_BOX(right_with_sep), inner_sep);
-    gtk_box_append(GTK_BOX(right_with_sep), col_end);
-    adw_overlay_split_view_set_sidebar(inner, right_with_sep);
+    adw_overlay_split_view_set_sidebar_position(inner, GTK_PACK_END);
+    adw_overlay_split_view_set_sidebar(inner, col_end);
     adw_overlay_split_view_set_content(inner, col_mid);
     // 固定右侧边栏宽度为 300
     adw_overlay_split_view_set_min_sidebar_width(inner, 300);
     adw_overlay_split_view_set_max_sidebar_width(inner, 300);
-    // 将内层容器方向设为 RTL，使“起始侧”呈现在右侧；同时保持子控件 LTR
-    gtk_widget_set_direction(GTK_WIDGET(inner), GTK_TEXT_DIR_RTL);
-    gtk_widget_set_direction(col_mid, GTK_TEXT_DIR_LTR);
-    gtk_widget_set_direction(col_end, GTK_TEXT_DIR_LTR);
-    // 右栏视觉样式：保留 sidebar 类，移除 background 背景绘制
-    gtk_widget_add_css_class(col_end, "sidebar");
 
     // 外层：左栏-（中+右），左栏可收缩
     AdwOverlaySplitView *outer = ADW_OVERLAY_SPLIT_VIEW(adw_overlay_split_view_new());
@@ -3785,7 +3788,7 @@ on_activate(GApplication *app, gpointer user_data)
     adw_overlay_split_view_set_content(outer, GTK_WIDGET(inner));
     // 左栏较窄，且可通过属性（或触控手势）隐藏/显示
     adw_overlay_split_view_set_sidebar_width_fraction(outer, 0.22);
-    // 固定左栏宽度为 200，使预览图精确按 200x291 呈现
+    // 固定左栏宽度，预览图与说明文字使用相同留白。
     adw_overlay_split_view_set_min_sidebar_width(outer, 200);
     adw_overlay_split_view_set_max_sidebar_width(outer, 200);
     adw_overlay_split_view_set_enable_show_gesture(outer, TRUE);
@@ -3795,7 +3798,7 @@ on_activate(GApplication *app, gpointer user_data)
     GtkWidget *sidebar_toggle = gtk_toggle_button_new();
     GtkWidget *sidebar_icon = gtk_image_new_from_icon_name("sidebar-show-symbolic");
     gtk_button_set_child(GTK_BUTTON(sidebar_toggle), sidebar_icon);
-    gtk_widget_set_tooltip_text(sidebar_toggle, "显示/隐藏左侧栏");
+    ui_language_bind_text(G_OBJECT(sidebar_toggle), "tooltip-text", "卡片预览", "Card Preview");
     // 双向绑定状态，初始值从 outer 的 show-sidebar 同步到按钮
     g_object_bind_property(outer, "show-sidebar",
                            sidebar_toggle, "active",
@@ -3806,47 +3809,61 @@ on_activate(GApplication *app, gpointer user_data)
      * 使用 Adwaita 图标集中的 open-menu-symbolic */
     GtkWidget *app_menu_button = gtk_menu_button_new();
     gtk_menu_button_set_icon_name(GTK_MENU_BUTTON(app_menu_button), "open-menu-symbolic");
-    gtk_widget_set_tooltip_text(app_menu_button, "应用菜单");
+    ui_language_bind_text(G_OBJECT(app_menu_button), "tooltip-text", "主菜单", "Main Menu");
     /* 创建应用菜单，包含先行卡相关菜单项 */
     prerelease_auto_update_enabled = load_prerelease_enabled_state();
-    GMenu *app_menu = g_menu_new();
-    // 有状态动作用布尔 state 表示勾选状态，GTK 会自动显示为复选菜单项
-    GMenuItem *enable_prerelease_item = g_menu_item_new("启用先行卡", "win.enable-prerelease");
-    g_menu_append_item(app_menu, enable_prerelease_item);
-    g_object_unref(enable_prerelease_item);
-    g_menu_append(app_menu, "显示先行卡", "win.show-prerelease");
-    g_menu_append(app_menu, "显示禁限变更", "win.show-forbidden-changes");
-    g_menu_append(app_menu, "个人信息", "win.edit-personal-info");
-    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(app_menu_button), G_MENU_MODEL(app_menu));
-    g_object_unref(app_menu);
 
     adw_header_bar_pack_end(header, app_menu_button);
 
     // 左栏预览：图片(目标尺寸) + 文本（紧贴）
+    GtkWidget *preview_heading = gtk_label_new(NULL);
+    ui_language_bind_text(G_OBJECT(preview_heading), "label", "卡片预览", "Card Preview");
+    gtk_label_set_xalign(GTK_LABEL(preview_heading), 0.0);
+    gtk_widget_add_css_class(preview_heading, "heading");
+    gtk_widget_set_margin_start(preview_heading, 12);
+    gtk_widget_set_margin_end(preview_heading, 12);
+    gtk_widget_set_margin_top(preview_heading, 10);
+    gtk_widget_set_margin_bottom(preview_heading, 10);
+    gtk_box_append(GTK_BOX(col_start), preview_heading);
+
     GtkWidget *left_stack = gtk_stack_new();
     gtk_stack_set_transition_type(GTK_STACK(left_stack), GTK_STACK_TRANSITION_TYPE_CROSSFADE);
     gtk_stack_set_transition_duration(GTK_STACK(left_stack), 150);
     gtk_widget_set_valign(left_stack, GTK_ALIGN_START);
     gtk_widget_set_vexpand(left_stack, FALSE);
-    GtkWidget *left_placeholder = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_set_size_request(left_placeholder, 200, 291);
-    gtk_widget_set_valign(left_placeholder, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(left_stack, 12);
+    gtk_widget_set_margin_end(left_stack, 12);
+    GtkWidget *left_placeholder = gtk_overlay_new();
+    gtk_widget_set_size_request(left_placeholder, 176, 256);
     gtk_widget_set_halign(left_placeholder, GTK_ALIGN_CENTER);
-    gtk_widget_set_margin_bottom(left_placeholder, 0);
+
+    GtkWidget *preview_hint = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
+    gtk_widget_set_valign(preview_hint, GTK_ALIGN_CENTER);
+    gtk_widget_add_css_class(preview_hint, "dim-label");
+    GtkWidget *preview_icon = gtk_image_new_from_icon_name("image-x-generic-symbolic");
+    gtk_image_set_pixel_size(GTK_IMAGE(preview_icon), 32);
+    gtk_box_append(GTK_BOX(preview_hint), preview_icon);
+    GtkWidget *preview_hint_label = gtk_label_new(NULL);
+    ui_language_bind_text(G_OBJECT(preview_hint_label), "label", "将鼠标移到卡片上查看预览", "Hover over a card to preview it");
+    gtk_label_set_wrap(GTK_LABEL(preview_hint_label), TRUE);
+    gtk_label_set_justify(GTK_LABEL(preview_hint_label), GTK_JUSTIFY_CENTER);
+    gtk_box_append(GTK_BOX(preview_hint), preview_hint_label);
+    gtk_overlay_set_child(GTK_OVERLAY(left_placeholder), preview_hint);
+
     GtkWidget *left_spinner = gtk_spinner_new();
     gtk_widget_set_valign(left_spinner, GTK_ALIGN_CENTER);
     gtk_widget_set_halign(left_spinner, GTK_ALIGN_CENTER);
-    // 初始不显示、不启动，避免未搜索时出现加载动画
     gtk_widget_set_visible(left_spinner, FALSE);
-    gtk_box_append(GTK_BOX(left_placeholder), left_spinner);
+    gtk_overlay_add_overlay(GTK_OVERLAY(left_placeholder), left_spinner);
+    g_object_bind_property(left_spinner, "visible", preview_hint, "visible",
+                           G_BINDING_SYNC_CREATE | G_BINDING_INVERT_BOOLEAN);
     gtk_stack_add_named(GTK_STACK(left_stack), left_placeholder, "placeholder");
     GtkWidget *left_picture = gtk_picture_new();
-    gtk_widget_set_size_request(left_picture, 200, 291);
+    gtk_widget_set_size_request(left_picture, 176, 256);
     gtk_picture_set_can_shrink(GTK_PICTURE(left_picture), TRUE);
     gtk_picture_set_content_fit(GTK_PICTURE(left_picture), GTK_CONTENT_FIT_CONTAIN);
     gtk_widget_set_halign(left_picture, GTK_ALIGN_CENTER);
     gtk_widget_set_valign(left_picture, GTK_ALIGN_START);
-    gtk_widget_set_margin_bottom(left_picture, 0);
     gtk_stack_add_named(GTK_STACK(left_stack), left_picture, "picture");
     gtk_stack_set_visible_child_name(GTK_STACK(left_stack), "placeholder");
     // 与下方文本之间留 10px 间距
@@ -3873,9 +3890,9 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_label_set_yalign(GTK_LABEL(left_label), 0.0);
     gtk_widget_set_valign(left_label, GTK_ALIGN_START);
     gtk_widget_set_vexpand(left_label, FALSE);
-    // 固定文字行宽为 180：在左栏宽 200 下，左右各留 10px 边距
-    gtk_widget_set_margin_start(left_label, 10);
-    gtk_widget_set_margin_end(left_label, 10);
+    gtk_widget_set_margin_start(left_label, 12);
+    gtk_widget_set_margin_end(left_label, 12);
+    gtk_widget_set_margin_bottom(left_label, 12);
     gtk_label_set_selectable(GTK_LABEL(left_label), TRUE);
     gtk_box_append(GTK_BOX(left_text_box), left_label);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(left_text_scroller), left_text_box);
@@ -3883,69 +3900,50 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_box_append(GTK_BOX(col_start), left_stack);
     gtk_box_append(GTK_BOX(col_start), left_text_scroller);
 
-    // 中栏：分成上、中、下三个区域
-    // 按钮工具栏区域
+    // 卡组工具栏：文件操作、编辑操作和当前规则。
     GtkWidget *toolbar_section = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_vexpand(toolbar_section, FALSE);
-    gtk_widget_set_margin_start(toolbar_section, 8);
-    gtk_widget_set_margin_end(toolbar_section, 8);
-    gtk_widget_set_margin_top(toolbar_section, 8);
-    gtk_widget_set_margin_bottom(toolbar_section, 4);
-    
-    // 添加五个按钮
-    // 将导入按钮改为菜单按钮（GtkMenuButton），菜单项使用 GMenu + GAction
+    gtk_widget_add_css_class(toolbar_section, "toolbar");
+    gtk_widget_set_margin_start(toolbar_section, 6);
+    gtk_widget_set_margin_end(toolbar_section, 6);
+
     GtkWidget *import_button = gtk_menu_button_new();
-    GtkWidget *import_label = gtk_label_new("导入");
-    // 增加左右内边距，使视觉上与普通 GtkButton 保持一致
-    gtk_widget_set_margin_start(import_label, 6);
-    gtk_widget_set_margin_end(import_label, 6);
-    gtk_widget_set_margin_top(import_label, 2);
-    gtk_widget_set_margin_bottom(import_label, 2);
-    gtk_menu_button_set_child(GTK_MENU_BUTTON(import_button), import_label);
-    // 创建 GMenu 并将菜单模型关联到菜单按钮
-    GMenu *import_menu = g_menu_new();
-    g_menu_append(import_menu, "从文件...", "win.import-from-file");
-    // 占位菜单项（UI 审查）：从 URL...，不执行实际功能
-    g_menu_append(import_menu, "从URL...", "win.import-from-url");
-    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(import_button), G_MENU_MODEL(import_menu));
-    g_object_unref(import_menu);
-    GtkWidget *sort_button = gtk_button_new_with_label("整理");
-    GtkWidget *shuffle_button = gtk_button_new_with_label("打乱");
-    GtkWidget *clear_button = gtk_button_new_with_label("清空");
+    ui_language_bind_text(G_OBJECT(import_button), "label", "导入", "Import");
+
     GtkWidget *export_button = gtk_menu_button_new();
-    GtkWidget *export_label = gtk_label_new("导出");
-    gtk_widget_set_margin_start(export_label, 6);
-    gtk_widget_set_margin_end(export_label, 6);
-    gtk_widget_set_margin_top(export_label, 2);
-    gtk_widget_set_margin_bottom(export_label, 2);
-    gtk_menu_button_set_child(GTK_MENU_BUTTON(export_button), export_label);
-    GMenu *export_menu = g_menu_new();
-    g_menu_append(export_menu, "到文件...", "win.export-to-file");
-    // 占位菜单项（UI 审查）：到 URL...，不执行实际功能
-    g_menu_append(export_menu, "到URL...", "win.export-to-url");
-    g_menu_append(export_menu, "生成卡表", "win.generate-sheet");
-    gtk_menu_button_set_menu_model(GTK_MENU_BUTTON(export_button), G_MENU_MODEL(export_menu));
-    g_object_unref(export_menu);
-    
+    ui_language_bind_text(G_OBJECT(export_button), "label", "导出", "Export");
+
+    GtkWidget *file_spacer = gtk_separator_new(GTK_ORIENTATION_VERTICAL);
+    gtk_widget_add_css_class(file_spacer, "spacer");
+    GtkWidget *sort_button = gtk_button_new();
+    ui_language_bind_text(G_OBJECT(sort_button), "label", "整理", "Sort");
+    gtk_widget_add_css_class(sort_button, "flat");
+    GtkWidget *shuffle_button = gtk_button_new();
+    ui_language_bind_text(G_OBJECT(shuffle_button), "label", "打乱", "Shuffle");
+    gtk_widget_add_css_class(shuffle_button, "flat");
+    GtkWidget *clear_button = gtk_button_new();
+    ui_language_bind_text(G_OBJECT(clear_button), "label", "清空…", "Clear…");
+    gtk_widget_add_css_class(clear_button, "flat");
+
     gtk_box_append(GTK_BOX(toolbar_section), import_button);
+    gtk_box_append(GTK_BOX(toolbar_section), export_button);
+    gtk_box_append(GTK_BOX(toolbar_section), file_spacer);
     gtk_box_append(GTK_BOX(toolbar_section), sort_button);
     gtk_box_append(GTK_BOX(toolbar_section), shuffle_button);
     gtk_box_append(GTK_BOX(toolbar_section), clear_button);
-    gtk_box_append(GTK_BOX(toolbar_section), export_button);
-    
-    // 添加弹性空间，将右侧控件推到右边
+
     GtkWidget *spacer = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
     gtk_widget_set_hexpand(spacer, TRUE);
     gtk_box_append(GTK_BOX(toolbar_section), spacer);
-    
+
     // 创建离线数据开关
     GtkWidget *offline_data_box = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     gtk_widget_set_valign(offline_data_box, GTK_ALIGN_CENTER);
-    GtkWidget *offline_data_label = gtk_label_new("离线数据");
+    GtkWidget *offline_data_label = gtk_label_new(NULL);
+    ui_language_bind_text(G_OBJECT(offline_data_label), "label", "离线数据", "Offline Data");
     gtk_box_append(GTK_BOX(offline_data_box), offline_data_label);
     GtkWidget *offline_data_switch = gtk_switch_new();
     gtk_widget_set_valign(offline_data_switch, GTK_ALIGN_CENTER);
-    gtk_widget_set_tooltip_text(offline_data_switch, "开启后将下载离线卡片数据");
+    ui_language_bind_text(G_OBJECT(offline_data_switch), "tooltip-text", "开启后将下载离线卡片数据", "Download card data for offline searches");
     // 从配置文件加载开关状态，如果配置中开启但数据不存在则关闭
     gboolean config_state = load_offline_data_switch_state();
     gboolean actual_state = config_state && offline_data_exists();
@@ -3962,12 +3960,14 @@ on_activate(GApplication *app, gpointer user_data)
         offline_data_warm_cache_async();
     }
     gtk_box_append(GTK_BOX(offline_data_box), offline_data_switch);
-    gtk_box_append(GTK_BOX(toolbar_section), offline_data_box);
-    
-    // 创建禁限卡表下拉菜单
-    GtkWidget *forbidden_dropdown = gtk_drop_down_new_from_strings((const char *[]){"OCG", "TCG", "亚洲英文", "简体中文", "GENESYS", NULL});
+    GtkWidget *rules_label = gtk_label_new(NULL);
+    ui_language_bind_text(G_OBJECT(rules_label), "label", "禁限卡表", "Banlist");
+    gtk_widget_add_css_class(rules_label, "dim-label");
+    gtk_box_append(GTK_BOX(toolbar_section), rules_label);
+
+    GtkWidget *forbidden_dropdown = gtk_drop_down_new_from_strings((const char *[]){"OCG", "TCG", TR("亚洲英文", "English (Asia)"), TR("简体中文", "Simplified Chinese"), "GENESYS", NULL});
     gtk_drop_down_set_selected(GTK_DROP_DOWN(forbidden_dropdown), 0); // 默认选择OCG
-    gtk_widget_set_tooltip_text(forbidden_dropdown, "选择禁限卡表");
+    ui_language_bind_text(G_OBJECT(forbidden_dropdown), "tooltip-text", "选择禁限卡表", "Choose Banlist");
     gtk_box_append(GTK_BOX(toolbar_section), forbidden_dropdown);
     
     gtk_box_append(GTK_BOX(col_mid), toolbar_section);
@@ -3979,30 +3979,19 @@ on_activate(GApplication *app, gpointer user_data)
     // Main 区域（上）
     GtkWidget *main_section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 8);
     gtk_widget_set_vexpand(main_section, TRUE);
-    GtkWidget *main_title_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_margin_start(main_title_row, 8);
-    gtk_widget_set_margin_end(main_title_row, 8);
-    gtk_widget_set_margin_top(main_title_row, 6);
-    GtkWidget *main_title = gtk_label_new(NULL);
-    gtk_label_set_markup(GTK_LABEL(main_title), "<span size='large'>Main</span>");
-    gtk_label_set_xalign(GTK_LABEL(main_title), 0.0);
-    gtk_widget_add_css_class(main_title, "heading");
-    gtk_box_append(GTK_BOX(main_title_row), main_title);
-    GtkWidget *main_count = gtk_label_new("(0)");
-    gtk_widget_add_css_class(main_count, "dim-label");
-    gtk_box_append(GTK_BOX(main_title_row), main_count);
-    GtkWidget *genesys_score_label = gtk_label_new("总分: 0/100");
+    GtkLabel *main_count;
+    GtkWidget *main_title_row = make_section_header("主卡组", "Main Deck", &main_count);
+    GtkWidget *genesys_score_label = gtk_label_new(TR("总分: 0/100", "Total: 0/100"));
     gtk_widget_add_css_class(genesys_score_label, "dim-label");
     gtk_widget_set_visible(genesys_score_label, FALSE);
     gtk_box_append(GTK_BOX(main_title_row), genesys_score_label);
     gtk_box_append(GTK_BOX(main_section), main_title_row);
-    // 使用 ScrolledWindow 包装，让内容有自然宽度
     GtkWidget *main_placeholder = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
     gtk_widget_set_vexpand(main_placeholder, TRUE);
     gtk_widget_set_hexpand(main_placeholder, TRUE);
-    gtk_widget_set_margin_start(main_placeholder, 8);
-    gtk_widget_set_margin_end(main_placeholder, 8);
-    gtk_widget_set_margin_top(main_placeholder, 14);
+    gtk_widget_set_margin_start(main_placeholder, 12);
+    gtk_widget_set_margin_end(main_placeholder, 12);
+    gtk_widget_set_margin_bottom(main_placeholder, 12);
     // Main 示例：4 行，每行 15 张，占位卡槽 50x73（共60）
     {
         GtkWidget *main_grid = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
@@ -4010,7 +3999,7 @@ on_activate(GApplication *app, gpointer user_data)
         GPtrArray *main_pics = g_ptr_array_new_with_free_func(g_object_unref);
         for (int r = 0; r < 4; ++r) {
             GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-            gtk_widget_set_halign(row, GTK_ALIGN_CENTER);
+            gtk_widget_set_halign(row, GTK_ALIGN_START);
             gtk_widget_set_hexpand(row, FALSE);
             for (int c = 0; c < 15; ++c) {
                 int idx = r * 15 + c + 1;
@@ -4051,22 +4040,23 @@ on_activate(GApplication *app, gpointer user_data)
     // Extra 区域（中）- 固定高度容纳两行 50x73 图片
     GtkWidget *extra_section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_set_vexpand(extra_section, FALSE);
-    GtkWidget *extra_header = make_section_header("Extra");
-    gtk_widget_set_margin_top(extra_header, 10);
+    GtkLabel *extra_count;
+    GtkWidget *extra_header = make_section_header("额外卡组", "Extra Deck", &extra_count);
+    gtk_box_append(GTK_BOX(extra_section), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
     gtk_box_append(GTK_BOX(extra_section), extra_header);
     // 占位容器：固定高度 73px（单行 50x73）
     GtkWidget *extra_placeholder = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_set_hexpand(extra_placeholder, TRUE);
     gtk_widget_set_vexpand(extra_placeholder, FALSE);
     gtk_widget_set_size_request(extra_placeholder, -1, 73);
-    gtk_widget_set_margin_start(extra_placeholder, 8);
-    gtk_widget_set_margin_end(extra_placeholder, 8);
-    gtk_widget_set_margin_top(extra_placeholder, 14);
-    gtk_widget_set_margin_bottom(extra_placeholder, 4);
+    gtk_widget_set_margin_start(extra_placeholder, 12);
+    gtk_widget_set_margin_end(extra_placeholder, 12);
+    gtk_widget_set_margin_top(extra_placeholder, 8);
+    gtk_widget_set_margin_bottom(extra_placeholder, 12);
     // Extra 示例：单行 15 张，占位卡槽 50x73
     {
         GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-        gtk_widget_set_halign(row, GTK_ALIGN_CENTER);
+        gtk_widget_set_halign(row, GTK_ALIGN_START);
         gtk_widget_set_hexpand(row, FALSE);
         GPtrArray *extra_pics = g_ptr_array_new_with_free_func(g_object_unref);
         for (int c = 0; c < 15; ++c) {
@@ -4102,21 +4092,22 @@ on_activate(GApplication *app, gpointer user_data)
     // Side 区域（下）- 固定为单行 50x73 图片
     GtkWidget *side_section = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
     gtk_widget_set_vexpand(side_section, FALSE);
-    GtkWidget *side_header = make_section_header("Side");
-    gtk_widget_set_margin_top(side_header, 10);
+    GtkLabel *side_count;
+    GtkWidget *side_header = make_section_header("副卡组", "Side Deck", &side_count);
+    gtk_box_append(GTK_BOX(side_section), gtk_separator_new(GTK_ORIENTATION_HORIZONTAL));
     gtk_box_append(GTK_BOX(side_section), side_header);
     GtkWidget *side_placeholder = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_widget_set_margin_start(side_placeholder, 8);
-    gtk_widget_set_margin_end(side_placeholder, 8);
-    gtk_widget_set_margin_top(side_placeholder, 14);
-    gtk_widget_set_margin_bottom(side_placeholder, 14);
+    gtk_widget_set_margin_start(side_placeholder, 12);
+    gtk_widget_set_margin_end(side_placeholder, 12);
+    gtk_widget_set_margin_top(side_placeholder, 8);
+    gtk_widget_set_margin_bottom(side_placeholder, 12);
     gtk_widget_set_vexpand(side_placeholder, FALSE);
     gtk_widget_set_hexpand(side_placeholder, TRUE);
     gtk_widget_set_size_request(side_placeholder, -1, 73);
     // Side 示例：单行 15 张，占位卡槽 50x73
     {
         GtkWidget *row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 5);
-        gtk_widget_set_halign(row, GTK_ALIGN_CENTER);
+        gtk_widget_set_halign(row, GTK_ALIGN_START);
         gtk_widget_set_hexpand(row, FALSE);
         GPtrArray *side_pics = g_ptr_array_new_with_free_func(g_object_unref);
         for (int c = 0; c < 15; ++c) {
@@ -4172,6 +4163,9 @@ on_activate(GApplication *app, gpointer user_data)
     
     // 保存下拉菜单引用
     sui->forbidden_dropdown = GTK_DROP_DOWN(forbidden_dropdown);
+    sui->app_menu = GTK_MENU_BUTTON(app_menu_button);
+    sui->import_menu = GTK_MENU_BUTTON(import_button);
+    sui->export_menu = GTK_MENU_BUTTON(export_button);
     
     // 启动后台更新禁限卡表（先下载）
     startup_update_ocg_forbidden();
@@ -4250,29 +4244,46 @@ on_activate(GApplication *app, gpointer user_data)
     g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(export_url_action));
     g_object_unref(export_url_action);
     
+    GtkWidget *search_heading_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    gtk_widget_set_margin_start(search_heading_row, 12);
+    gtk_widget_set_margin_end(search_heading_row, 12);
+    gtk_widget_set_margin_top(search_heading_row, 8);
+    GtkWidget *search_heading = gtk_label_new(NULL);
+    ui_language_bind_text(G_OBJECT(search_heading), "label", "卡片搜索", "Card Search");
+    gtk_widget_add_css_class(search_heading, "heading");
+    gtk_label_set_xalign(GTK_LABEL(search_heading), 0.0);
+    gtk_widget_set_hexpand(search_heading, TRUE);
+    gtk_box_append(GTK_BOX(search_heading_row), search_heading);
+    gtk_box_append(GTK_BOX(search_heading_row), offline_data_box);
+
     GtkWidget *search_bar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
-    gtk_widget_set_margin_start(search_bar, 8);
-    gtk_widget_set_margin_end(search_bar, 8);
+    gtk_widget_set_margin_start(search_bar, 12);
+    gtk_widget_set_margin_end(search_bar, 12);
     gtk_widget_set_margin_top(search_bar, 8);
-    gtk_widget_set_margin_bottom(search_bar, 8);
+    gtk_widget_set_margin_bottom(search_bar, 12);
+
+    GtkWidget *search_controls = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+    gtk_widget_add_css_class(search_controls, "linked");
+    gtk_widget_set_hexpand(search_controls, TRUE);
     sui->entry = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(sui->entry), "搜索卡片名称/效果/ID...");
+    ui_language_bind_text(G_OBJECT(sui->entry), "placeholder-text", "卡名、效果或 ID", "Card name or ID");
+    gtk_editable_set_width_chars(GTK_EDITABLE(sui->entry), 0);
     gtk_widget_set_hexpand(sui->entry, TRUE);
     
     // 使用图标按钮代替文本按钮
     sui->button = gtk_button_new_from_icon_name("edit-find-symbolic");
-    gtk_widget_set_tooltip_text(sui->button, "搜索");
-    gtk_widget_add_css_class(sui->button, "flat");
+    ui_language_bind_text(G_OBJECT(sui->button), "tooltip-text", "搜索", "Search");
     g_signal_connect(sui->button, "clicked", G_CALLBACK(on_search_clicked), sui);
     
     // 为输入框添加回车键支持,触发按钮点击
     g_signal_connect_swapped(sui->entry, "activate", G_CALLBACK(gtk_widget_activate), sui->button);
-    gtk_box_append(GTK_BOX(search_bar), sui->entry);
-    gtk_box_append(GTK_BOX(search_bar), sui->button);
+    gtk_box_append(GTK_BOX(search_controls), sui->entry);
+    gtk_box_append(GTK_BOX(search_controls), sui->button);
+    gtk_box_append(GTK_BOX(search_bar), search_controls);
     
     // 添加筛选选项按钮
     GtkWidget *filter_button = gtk_button_new_from_icon_name("preferences-system-symbolic");
-    gtk_widget_set_tooltip_text(filter_button, "筛选选项");
+    ui_language_bind_text(G_OBJECT(filter_button), "tooltip-text", "筛选选项", "Filters");
     gtk_widget_add_css_class(filter_button, "flat");
     g_signal_connect(filter_button, "clicked", G_CALLBACK(on_filter_button_clicked), win);
     
@@ -4287,10 +4298,16 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     sui->list = gtk_list_box_new();
     gtk_list_box_set_selection_mode(GTK_LIST_BOX(sui->list), GTK_SELECTION_NONE);
+    gtk_widget_add_css_class(sui->list, "boxed-list");
+    gtk_widget_set_valign(sui->list, GTK_ALIGN_START);
+    gtk_widget_set_margin_start(sui->list, 12);
+    gtk_widget_set_margin_end(sui->list, 12);
+    gtk_widget_set_margin_bottom(sui->list, 12);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), sui->list);
     // 异画缓存可能在首次搜索之后才生成；就绪后自动刷新结果
     search_ui_watch_alt_art(sui);
 
+    gtk_box_append(GTK_BOX(col_end), search_heading_row);
     gtk_box_append(GTK_BOX(col_end), search_bar);
     gtk_box_append(GTK_BOX(col_end), scroller);
 
@@ -4303,10 +4320,10 @@ on_activate(GApplication *app, gpointer user_data)
     sui->extra_idx = 0;
     sui->side_idx = 0;
     // 计数标签绑定
-    sui->main_count = GTK_LABEL(main_count);
+    sui->main_count = main_count;
     sui->genesys_score_label = GTK_LABEL(genesys_score_label);
-    sui->extra_count = GTK_LABEL(g_object_get_data(G_OBJECT(extra_header), "count_label"));
-    sui->side_count  = GTK_LABEL(g_object_get_data(G_OBJECT(side_header), "count_label"));
+    sui->extra_count = extra_count;
+    sui->side_count = side_count;
 
     // 为三个卡组区域的槽位接线控制器
     wire_slot_controllers(sui->main_pics, sui);
@@ -4323,6 +4340,11 @@ on_activate(GApplication *app, gpointer user_data)
     adw_application_window_set_content(win, GTK_WIDGET(toast_overlay));
 
     // 注册应用菜单动作
+    GSimpleAction *preferences_action = g_simple_action_new("preferences", NULL);
+    g_signal_connect(preferences_action, "activate", G_CALLBACK(on_preferences), sui);
+    g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(preferences_action));
+    g_object_unref(preferences_action);
+
     GSimpleAction *enable_prerelease_action = g_simple_action_new_stateful(
         "enable-prerelease", NULL, g_variant_new_boolean(prerelease_auto_update_enabled));
     g_signal_connect(enable_prerelease_action, "activate",
@@ -4340,11 +4362,7 @@ on_activate(GApplication *app, gpointer user_data)
     g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(show_forbidden_changes_action));
     g_object_unref(show_forbidden_changes_action);
 
-    GSimpleAction *edit_personal_info_action = g_simple_action_new("edit-personal-info", NULL);
-    g_signal_connect(edit_personal_info_action, "activate", G_CALLBACK(on_action_edit_personal_info), sui);
-    g_action_map_add_action(G_ACTION_MAP(win), G_ACTION(edit_personal_info_action));
-    g_object_unref(edit_personal_info_action);
-
+    refresh_main_language(sui);
     gtk_window_present(GTK_WINDOW(win));
 
     // 启用后每次启动自动检查先行卡更新（ETag 未变化时不会重复下载）
@@ -4381,6 +4399,7 @@ main(int argc, char *argv[])
         g_message("Running in system install mode (using XDG directories)");
     }
     
+    ui_language_init();
     g_autoptr(AdwApplication) app = adw_application_new(
         "com.pai535.YGODeckBuilder", G_APPLICATION_DEFAULT_FLAGS);
 
@@ -4389,9 +4408,6 @@ main(int argc, char *argv[])
 
     // 加载导出目录配置
     load_io_config(&last_export_directory, &last_import_directory, &last_deck_sheet_directory);
-    // 加载个人信息
-    personal_konami_id = load_personal_konami_id();
-
     g_signal_connect(app, "activate", G_CALLBACK(on_activate), NULL);
     int result = g_application_run(G_APPLICATION(app), argc, argv);
 

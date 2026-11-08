@@ -72,6 +72,22 @@ test_set_boolean_preserves_other_keys(void)
     g_key_file_free(keyfile);
 }
 
+static void
+test_string_roundtrip_preserves_other_keys(void)
+{
+    write_existing_config("[Preferences]\nOfflineDataEnabled=true\n"
+                          "[PersonalInfo]\nKonamiId=0123456789\n");
+    g_assert_null(prefs_get_string("Preferences", "InterfaceLanguage"));
+    g_assert_true(prefs_set_string("Preferences", "InterfaceLanguage", "en"));
+    g_assert_true(prefs_set_boolean("Preferences", "PrereleaseEnabled", TRUE));
+
+    g_autofree char *language = prefs_get_string("Preferences", "InterfaceLanguage");
+    g_autofree char *konami_id = prefs_get_string("PersonalInfo", "KonamiId");
+    g_assert_cmpstr(language, ==, "en");
+    g_assert_cmpstr(konami_id, ==, "0123456789");
+    g_assert_true(prefs_get_boolean("Preferences", "OfflineDataEnabled", FALSE));
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -92,6 +108,7 @@ main(int argc, char *argv[])
     g_test_add_func("/prefs/missing-key-uses-default", test_missing_key_uses_default);
     g_test_add_func("/prefs/boolean-roundtrip", test_boolean_roundtrip);
     g_test_add_func("/prefs/preserves-other-keys", test_set_boolean_preserves_other_keys);
+    g_test_add_func("/prefs/string-roundtrip", test_string_roundtrip_preserves_other_keys);
 
     int result = g_test_run();
 

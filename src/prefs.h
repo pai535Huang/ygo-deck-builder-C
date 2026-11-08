@@ -21,4 +21,8 @@ gboolean prefs_get_boolean(const char *group, const char *key, gboolean default_
  */
 gboolean prefs_set_boolean(const char *group, const char *key, gboolean value);
 
+// The returned string is owned by the caller.
+char *prefs_get_string(const char *group, const char *key);
+gboolean prefs_set_string(const char *group, const char *key, const char *value);
+
 #endif // PREFS_H

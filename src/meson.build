@@ -17,6 +17,7 @@ executable(
     'offline_data.c',
     'pixbuf_utils.c',
     'card_info.c',
+    'card_language.c',
     'card_sort.c',
     'card_shuffle.c',
     'deck_slot.c',
@@ -32,7 +33,8 @@ executable(
     'json_utils.c',
     'alt_art_index.c',
     'alt_art.c',
-    'prefs.c'
+    'prefs.c',
+    'ui_language.c'
   ],
   dependencies: deps,
   install: true,
