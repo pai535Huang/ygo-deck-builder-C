@@ -174,6 +174,15 @@ static GKeyFile *parse_official_card(GBytes *body) {
     return card;
 }
 
+static char *escape_effect_text(const char *text) {
+    // The official page can encode line breaks as literal tags, including in cached text.
+    static GRegex *line_breaks;
+    if (!line_breaks)
+        line_breaks = g_regex_new("<br\\s*/?>", G_REGEX_CASELESS | G_REGEX_OPTIMIZE, 0, NULL);
+    g_autofree char *plain_text = g_regex_replace_literal(line_breaks, text, -1, 0, "\n", 0, NULL);
+    return g_markup_escape_text(plain_text, -1);
+}
+
 static gboolean display_official_text(GtkLabel *label, GKeyFile *card, const char *metadata) {
     g_autofree char *name = g_key_file_get_string(card, "Card", "Name", NULL);
     g_autofree char *text = g_key_file_get_string(card, "Card", "Text", NULL);
@@ -189,10 +198,10 @@ static gboolean display_official_text(GtkLabel *label, GKeyFile *card, const cha
         g_string_append(markup, details);
     }
     if (pendulum && *pendulum) {
-        g_autofree char *section = g_markup_printf_escaped("<b>Pendulum Effect</b>\n%s\n\n", pendulum);
-        g_string_append(markup, section);
+        g_autofree char *escaped_pendulum = escape_effect_text(pendulum);
+        g_string_append_printf(markup, "<b>Pendulum Effect</b>\n%s\n\n", escaped_pendulum);
     }
-    g_autofree char *escaped_text = g_markup_escape_text(text, -1);
+    g_autofree char *escaped_text = escape_effect_text(text);
     g_string_append(markup, escaped_text);
     gtk_label_set_markup(label, markup->str);
     return TRUE;

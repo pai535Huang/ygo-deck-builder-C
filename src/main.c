@@ -2663,7 +2663,7 @@ static char *format_card_text(const CardPreview *pv, const char *metadata) {
     char *pdesc = pv->pdesc ? g_markup_escape_text(pv->pdesc, -1) : g_strdup("");
     char *desc  = pv->desc  ? g_markup_escape_text(pv->desc, -1)  : g_strdup("");
     g_string_append_printf(s, "<b>%s</b>\n", name);
-    if (*types) g_string_append_printf(s, "<span size=\"smaller\" color=\"#888\">%s</span>\n\n", types);
+    if (*types) g_string_append_printf(s, "<small>%s</small>\n\n", types);
     if (ui_is_english() && (*pdesc || *desc))
         g_string_append(s, "<small>Original card text</small>\n");
     if (*pdesc) g_string_append_printf(s, "%s\n\n", pdesc);
@@ -3718,8 +3718,9 @@ on_activate(GApplication *app, gpointer user_data)
 
     AdwApplicationWindow *win = ADW_APPLICATION_WINDOW(
         adw_application_window_new(GTK_APPLICATION(app)));
+    gtk_widget_add_css_class(GTK_WIDGET(win), "deck-builder-window");
 
-    // 卡片尺寸和缩略图样式。
+    // 卡片尺寸、缩略图和主界面样式。
     GtkCssProvider *provider = gtk_css_provider_new();
     const char *css =
         ".thumb-fixed {\n"
@@ -3742,6 +3743,18 @@ on_activate(GApplication *app, gpointer user_data)
         "  min-height: 0;\n"
         "  padding: 1px 8px;\n"
         "}\n"
+        // 主窗口和侧栏使用中间卡组区的主题背景色与前景色。
+        ".deck-builder-window,\n"
+        ".deck-builder-layout overlay-split-view > .sidebar-pane,\n"
+        ".deck-builder-layout overlay-split-view > .overlay-pane {\n"
+#if GTK_CHECK_VERSION(4, 16, 0)
+        "  background-color: var(--view-bg-color, @view_bg_color);\n"
+        "  color: var(--view-fg-color, @view_fg_color);\n"
+#else
+        "  background-color: @view_bg_color;\n"
+        "  color: @view_fg_color;\n"
+#endif
+        "}\n"
         ;
     gtk_css_provider_load_from_string(provider, css);
     gtk_style_context_add_provider_for_display(
@@ -3757,7 +3770,8 @@ on_activate(GApplication *app, gpointer user_data)
     adw_header_bar_set_title_widget(header, adw_window_title_new("Yu-Gi-Oh! Deck Builder", NULL));
 
     AdwToolbarView *toolbar_view = ADW_TOOLBAR_VIEW(adw_toolbar_view_new());
-    adw_toolbar_view_set_top_bar_style(toolbar_view, ADW_TOOLBAR_RAISED_BORDER);
+    gtk_widget_add_css_class(GTK_WIDGET(toolbar_view), "deck-builder-layout");
+    adw_toolbar_view_set_top_bar_style(toolbar_view, ADW_TOOLBAR_FLAT);
     adw_toolbar_view_add_top_bar(toolbar_view, GTK_WIDGET(header));
 
     GtkWidget *col_start = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
@@ -4298,7 +4312,8 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(scroller), GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
     sui->list = gtk_list_box_new();
     gtk_list_box_set_selection_mode(GTK_LIST_BOX(sui->list), GTK_SELECTION_NONE);
-    gtk_widget_add_css_class(sui->list, "boxed-list");
+    gtk_list_box_set_show_separators(GTK_LIST_BOX(sui->list), TRUE);
+    gtk_widget_add_css_class(sui->list, "view");
     gtk_widget_set_valign(sui->list, GTK_ALIGN_START);
     gtk_widget_set_margin_start(sui->list, 12);
     gtk_widget_set_margin_end(sui->list, 12);
