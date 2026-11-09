@@ -7,6 +7,7 @@
 #include "alt_art.h"
 #include "app_path.h"
 #include "prefs.h"
+#include <glib/gstdio.h>
 #include <stdio.h>
 #include <string.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
@@ -25,7 +26,7 @@ void export_deck_to_ydk(
 ) {
     if (!filepath) return;
     
-    FILE *f = fopen(filepath, "w");
+    FILE *f = g_fopen(filepath, "w");
     if (!f) {
         g_warning("无法创建文件: %s", filepath);
         return;
@@ -84,7 +85,7 @@ gboolean import_deck_from_ydk(
 ) {
     if (!filepath) return FALSE;
     
-    FILE *f = fopen(filepath, "r");
+    FILE *f = g_fopen(filepath, "r");
     if (!f) {
         g_warning("无法打开文件: %s", filepath);
         return FALSE;

@@ -6,14 +6,9 @@
 #include <json-glib/json-glib.h>
 #include <archive.h>
 #include <archive_entry.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <glib/gstdio.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <dirent.h>
-#include <unistd.h>
 
 // 离线 cards.json 解析缓存：避免每次搜索都重新 parse，尤其是第一次搜索会明显卡顿。
 static GMutex offline_cache_mutex;
@@ -371,10 +366,10 @@ static gboolean clear_directory_contents(const char *path) {
         if (g_file_test(full_path, G_FILE_TEST_IS_DIR)) {
             // 递归删除子目录
             clear_directory_contents(full_path);
-            rmdir(full_path);
+            g_rmdir(full_path);
         } else {
             // 删除文件
-            remove(full_path);
+            g_remove(full_path);
         }
         
         g_free(full_path);
@@ -595,7 +590,7 @@ static gpointer download_offline_data_thread(gpointer data) {
         g_message("Creating cards directory: %s", cards_dir);
         if (!ensure_directory_exists(cards_dir)) {
             g_warning("Failed to create cards directory");
-            remove(zip_path);
+            g_remove(zip_path);
             g_free(zip_path);
             g_free(data_dir);
             g_free(cards_dir);
@@ -612,7 +607,7 @@ static gpointer download_offline_data_thread(gpointer data) {
     g_message("Extracting ZIP archive to %s...", cards_dir);
     if (!extract_zip_file(zip_path, cards_dir)) {
         g_warning("Failed to extract ZIP file");
-        remove(zip_path);
+        g_remove(zip_path);
         g_free(zip_path);
         g_free(data_dir);
         g_free(cards_dir);
@@ -683,7 +678,7 @@ static gpointer download_offline_data_thread(gpointer data) {
     
     // 删除 ZIP 文件
     g_message("Removing ZIP file: %s", zip_path);
-    remove(zip_path);
+    g_remove(zip_path);
     
     // 下载 strings.conf 文件
     g_message("Downloading strings.conf from %s...", STRINGS_CONF_URL);
@@ -810,7 +805,7 @@ gboolean clear_offline_data(void) {
     
     if (success) {
         // 删除空目录
-        if (rmdir(cards_dir) == 0) {
+        if (g_rmdir(cards_dir) == 0) {
             g_message("Offline data cleared successfully");
         } else {
             g_warning("Failed to remove cards directory");
