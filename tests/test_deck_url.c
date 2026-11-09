@@ -119,6 +119,34 @@ static void test_missing_ygotype(void) {
     g_clear_error(&err);
 }
 
+static void test_invalid_deck_query(void) {
+    const char *urls[] = {
+        "https://example.org/?note=ygotype=deck&v=1",
+        "https://example.org/?notygotype=deck&v=1",
+        "https://example.org/#?ygotype=deck&v=1",
+        "https://example.org/?ygotype=deckish&v=1",
+        "https://example.org/?ygotype=deck",
+        "https://example.org/?ygotype=deck&v=2",
+        "https://example.org/?ygotype=deck&ygotype=other&v=1",
+        "https://example.org/?ygotype=deck&v=1&d=AAA&d=AAA",
+        "ygotype=deck&v=1",
+        "https://example.org/?ygotype=deck&v=1&d=AQAqvU0Y",
+        "https://example.org/?ygotype=deck&v=1&d=AQBAAAAA",
+        "https://example.org/?ygotype=deck&v=1&d=AQBqvU0Z",
+    };
+    for (guint i = 0; i < G_N_ELEMENTS(urls); i++) {
+        int *m = NULL, *e = NULL, *s = NULL;
+        int mc = -1, ec = -1, sc = -1;
+        GError *error = NULL;
+        CHECK(!deck_decode_from_url(urls[i], &m, &mc, &e, &ec, &s, &sc, &error), urls[i]);
+        CHECK(error && !m && !e && !s, "invalid link leaves output empty");
+        g_free(m);
+        g_free(e);
+        g_free(s);
+        g_clear_error(&error);
+    }
+}
+
 static void test_invalid_base64(void) {
     // '+' 与 '/' 不是 Base64Url 字符
     int *m = NULL, *e = NULL, *s = NULL;
@@ -237,6 +265,7 @@ int main(void) {
     test_roundtrip_multi_unique();
     test_empty_deck();
     test_missing_ygotype();
+    test_invalid_deck_query();
     test_invalid_base64();
     test_truncated_data();
     test_out_of_range_card_id_skipped();

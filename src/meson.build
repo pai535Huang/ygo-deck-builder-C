@@ -30,6 +30,7 @@ executable(
     'search_filter.c',
     'deck_url.c',
     'archive_path.c',
+    'data_directory.c',
     'json_utils.c',
     'alt_art_index.c',
     'alt_art.c',

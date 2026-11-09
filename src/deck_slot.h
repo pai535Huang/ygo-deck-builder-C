@@ -2,11 +2,17 @@
 #define DECK_SLOT_H
 
 #include <gtk/gtk.h>
+#include <stdint.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
 
 // 槽位缩略图的逻辑尺寸（与 UI 中 thumb-fixed / image_loader 缩略图保持一致）
 #define SLOT_THUMB_W 68
 #define SLOT_THUMB_H 99
+
+enum {
+    SLOT_METADATA_PENDING = 1,
+    SLOT_METADATA_TYPE_UNKNOWN,
+};
 
 /**
  * 从槽位获取图片
@@ -14,6 +20,12 @@
  * @return 槽位中的GdkPixbuf，如果为空返回NULL
  */
 GdkPixbuf* slot_get_pixbuf(GtkWidget *pic);
+int slot_get_img_id(GtkWidget *slot);
+uint32_t slot_get_card_type(GtkWidget *slot);
+const char *slot_get_sheet_name(GtkWidget *slot);
+void slot_set_card_details(GtkWidget *slot, uint32_t type, const char *sheet_name);
+void slot_clear_card(GtkWidget *slot);
+void slot_swap_cards(GtkWidget *first, GtkWidget *second);
 
 /**
  * 设置槽位图片
@@ -48,13 +60,6 @@ const char* slot_get_en_name(GtkWidget *pic);
  * @param en_name 英文名字符串，NULL 表示清空（函数内部会拷贝一份）
  */
 void slot_set_en_name(GtkWidget *pic, const char *en_name);
-/**
- * 查找第一个空槽位
- * @param pics 槽位数组
- * @return 第一个空槽位的索引，如果没有空槽位返回-1
- */
-int array_find_first_empty(GPtrArray *pics);
-
 /**
  * 更新计数标签
  * @param label 要更新的标签

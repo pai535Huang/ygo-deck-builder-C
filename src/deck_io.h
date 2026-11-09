@@ -3,6 +3,7 @@
 
 #include <gtk/gtk.h>
 #include <libsoup/soup.h>
+#include <json-glib/json-glib.h>
 
 /**
  * 导出卡组为YDK文件
@@ -14,11 +15,11 @@
  * @param side_count 副卡组数量
  * @param filepath 要保存的文件路径
  */
-void export_deck_to_ydk(
+gboolean export_deck_to_ydk(
     GPtrArray *main_pics, int main_count,
     GPtrArray *extra_pics, int extra_count,
     GPtrArray *side_pics, int side_count,
-    const char *filepath
+    const char *filepath, GError **error
 );
 
 /**
@@ -43,6 +44,11 @@ gboolean import_deck_from_ydk(
     SoupSession *session,
     const char *filepath
 );
+
+gboolean deck_apply_card_metadata(GtkWidget *slot, JsonObject *card);
+gboolean deck_load_local_card_metadata(GtkWidget *slot);
+void deck_fill_region(GPtrArray *slots, int *count, GtkLabel *label,
+                      const int *ids, int length, gboolean extra, SoupSession *session);
 
 /**
  * 加载导入导出目录配置

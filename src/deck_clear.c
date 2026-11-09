@@ -8,13 +8,7 @@ void clear_deck_region(GPtrArray *pics, int *count, GtkLabel *count_label) {
     // 清空所有槽位
     for (guint i = 0; i < pics->len; i++) {
         GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(pics, i));
-        slot_set_pixbuf(pic, NULL);
-        slot_set_is_extra(pic, FALSE);
-        g_object_set_data(G_OBJECT(pic), "card_id", GINT_TO_POINTER(0));
-        g_object_set_data(G_OBJECT(pic), "img_id", GINT_TO_POINTER(0));
-        // 必须一并清除英文名：GENESYS 总分与禁限角标都以 en_name 为依据，
-        // 残留旧名字会让空槽位按上一副卡组计分（其余清空路径均已清除）
-        slot_set_en_name(pic, NULL);
+        slot_clear_card(pic);
     }
     
     *count = 0;

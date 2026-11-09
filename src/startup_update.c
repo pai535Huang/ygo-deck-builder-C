@@ -1,3 +1,4 @@
+#include "startup_update.h"
 #include <glib.h>
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
@@ -510,25 +511,6 @@ static gboolean save_json_to_file(JsonNode *root, const char *filepath) {
     
     g_object_unref(generator);
     return success;
-}
-
-/**
- * 校验下载响应的 HTTP 状态码。
- * 非 2xx 的错误页/限流页内容不能当作有效卡表数据解析保存，
- * 否则会把无效内容写入禁限表 JSON。
- */
-static gboolean download_status_ok(SoupSession *session, GAsyncResult *result, const char *label) {
-    SoupMessage *msg = soup_session_get_async_result_message(session, result);
-    if (!msg) {
-        g_warning("Failed to download %s: no SoupMessage for result", label);
-        return FALSE;
-    }
-    guint status = soup_message_get_status(msg);
-    if (!SOUP_STATUS_IS_SUCCESSFUL(status)) {
-        g_warning("Failed to download %s: HTTP %u %s", label, status, soup_message_get_reason_phrase(msg));
-        return FALSE;
-    }
-    return TRUE;
 }
 
 // ============================================================
@@ -1135,129 +1117,68 @@ static const DownloadSpec download_specs[] = {
     { SC_FORBIDDEN_URL,      "SC forbidden list changes",  SC_FORBIDDEN_CHANGES_FILENAME,  parse_sc_forbidden_changes_json,  NULL, "sc-forbidden-changes-update" },
 };
 
-typedef enum {
-    SPEC_OCG_FORBIDDEN = 0,
-    SPEC_TCG_FORBIDDEN,
-    SPEC_AE_FORBIDDEN,
-    SPEC_SC_FORBIDDEN,
-    SPEC_GENESYS_FORBIDDEN,
-    SPEC_OCG_CHANGES,
-    SPEC_TCG_CHANGES,
-    SPEC_AE_CHANGES,
-    SPEC_SC_CHANGES,
-    SPEC_COUNT
-} DownloadSpecId;
+typedef struct {
+    const DownloadSpec *spec;
+    GWeakRef owner;
+    StartupBanlistReadyFunc callback;
+} BanlistDownload;
 
-// 下载完成后的统一回调：状态码校验 -> 解析 -> 保存
-static void on_download_complete_spec(SoupSession *session, GAsyncResult *result, gpointer user_data) {
-    const DownloadSpec *spec = (const DownloadSpec*)user_data;
-    GError *error = NULL;
-    GBytes *response_body = soup_session_send_and_read_finish(session, result, &error);
-
-    if (error) {
-        g_warning("Failed to download %s: %s", spec->label, error->message);
-        g_error_free(error);
-        g_object_unref(session);
-        return;
-    }
-
-    if (!download_status_ok(session, result, spec->label)) {
-        g_bytes_unref(response_body);
-        g_object_unref(session);
-        return;
-    }
-
-    gsize size;
-    const char *content = (const char *)g_bytes_get_data(response_body, &size);
-
-    if (content && size > 0) {
-        // 确保配置数据目录存在
-        gchar *data_dir = get_config_data_dir();
-        if (!data_dir || !ensure_directory_exists(data_dir)) {
-            g_free(data_dir);
-            g_bytes_unref(response_body);
-            g_object_unref(session);
-            return;
-        }
-        g_free(data_dir);
-
-        JsonNode *json_root = spec->parse(content);
-        if (json_root) {
-            gchar *output_file = get_output_file_path(spec->filename);
-            if (output_file) {
-                save_json_to_file(json_root, output_file);
-                g_free(output_file);
-            }
-            json_node_free(json_root);
-        } else {
-            g_warning("Failed to parse %s content", spec->label);
-        }
-    } else {
-        g_warning("Received empty response from %s URL", spec->label);
-    }
-
-    g_bytes_unref(response_body);
-    g_object_unref(session);
+static void banlist_download_free(gpointer data) {
+    BanlistDownload *download = data;
+    g_weak_ref_clear(&download->owner);
+    g_free(download);
 }
 
-// 后台线程执行的统一下载任务
-static gpointer download_thread_func_spec(gpointer data) {
-    const DownloadSpec *spec = (const DownloadSpec*)data;
+static gboolean notify_banlist_downloaded(gpointer data) {
+    BanlistDownload *download = data;
+    g_autoptr(GObject) owner = g_weak_ref_get(&download->owner);
+    if (owner) download->callback(owner, download->spec->filename);
+    return G_SOURCE_REMOVE;
+}
 
-    // 创建独立的SoupSession用于后台下载
-    SoupSession *session = soup_session_new();
+static gpointer download_banlist(gpointer data) {
+    BanlistDownload *download = data;
+    const DownloadSpec *spec = download->spec;
+    g_autoptr(SoupSession) session = soup_session_new();
+    soup_session_set_timeout(session, 60);
+    g_autoptr(SoupMessage) message = soup_message_new("GET", spec->url);
+    SoupMessageHeaders *headers = soup_message_get_request_headers(message);
+    soup_message_headers_append(headers, "User-Agent",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
+    if (spec->accept) soup_message_headers_append(headers, "Accept", spec->accept);
 
-    SoupMessage *msg = soup_message_new("GET", spec->url);
-    if (!msg) {
-        g_warning("Failed to create HTTP request for %s", spec->label);
-        g_object_unref(session);
+    g_autoptr(GError) error = NULL;
+    g_autoptr(GBytes) body = soup_session_send_and_read(session, message, NULL, &error);
+    if (!body || !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(message))) {
+        g_warning("Failed to download %s: %s", spec->label,
+                  error ? error->message : soup_message_get_reason_phrase(message));
+        banlist_download_free(download);
         return NULL;
     }
 
-    // 设置User-Agent避免被服务器拒绝
-    SoupMessageHeaders *headers = soup_message_get_request_headers(msg);
-    soup_message_headers_append(headers, "User-Agent",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36");
-    if (spec->accept) {
-        soup_message_headers_append(headers, "Accept", spec->accept);
-    }
-
-    g_message("Starting background download of %s...", spec->label);
-
-    soup_session_send_and_read_async(
-        session,
-        msg,
-        G_PRIORITY_LOW,
-        NULL,
-        (GAsyncReadyCallback)on_download_complete_spec,
-        (gpointer)spec
-    );
-
-    g_object_unref(msg);
+    gsize size;
+    const char *bytes = g_bytes_get_data(body, &size);
+    g_autofree char *content = size ? g_strndup(bytes, size) : NULL;
+    g_autoptr(JsonNode) root = content ? spec->parse(content) : NULL;
+    g_autofree char *data_dir = get_config_data_dir();
+    g_autofree char *path = get_output_file_path(spec->filename);
+    gboolean saved = root && data_dir && path && ensure_directory_exists(data_dir) &&
+                     save_json_to_file(root, path);
+    if (saved)
+        g_idle_add_full(G_PRIORITY_DEFAULT, notify_banlist_downloaded, download,
+                        banlist_download_free);
+    else
+        banlist_download_free(download);
     return NULL;
 }
 
-// 启动指定目标的后台更新
-static void startup_update_spec_run(DownloadSpecId id) {
-    const DownloadSpec *spec = &download_specs[id];
-    GThread *thread = g_thread_new(spec->thread_name, download_thread_func_spec, (gpointer)spec);
-
-    if (thread) {
-        // 分离线程，让它在后台自行运行
+void startup_update_banlists(GObject *owner, StartupBanlistReadyFunc callback) {
+    for (guint i = 0; i < G_N_ELEMENTS(download_specs); i++) {
+        BanlistDownload *download = g_new0(BanlistDownload, 1);
+        download->spec = &download_specs[i];
+        download->callback = callback;
+        g_weak_ref_init(&download->owner, owner);
+        GThread *thread = g_thread_new(download->spec->thread_name, download_banlist, download);
         g_thread_unref(thread);
-        g_message("%s update started in background", spec->label);
-    } else {
-        g_warning("Failed to start %s update thread", spec->label);
     }
 }
-
-void startup_update_ocg_forbidden(void)         { startup_update_spec_run(SPEC_OCG_FORBIDDEN); }
-void startup_update_tcg_forbidden(void)         { startup_update_spec_run(SPEC_TCG_FORBIDDEN); }
-void startup_update_ae_forbidden(void)          { startup_update_spec_run(SPEC_AE_FORBIDDEN); }
-void startup_update_sc_forbidden(void)          { startup_update_spec_run(SPEC_SC_FORBIDDEN); }
-void startup_update_genesys_forbidden(void)     { startup_update_spec_run(SPEC_GENESYS_FORBIDDEN); }
-void startup_update_ocg_forbidden_changes(void) { startup_update_spec_run(SPEC_OCG_CHANGES); }
-void startup_update_tcg_forbidden_changes(void) { startup_update_spec_run(SPEC_TCG_CHANGES); }
-void startup_update_ae_forbidden_changes(void)  { startup_update_spec_run(SPEC_AE_CHANGES); }
-void startup_update_sc_forbidden_changes(void)  { startup_update_spec_run(SPEC_SC_CHANGES); }
-

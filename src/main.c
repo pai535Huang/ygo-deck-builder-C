@@ -73,6 +73,9 @@ void update_genesys_score(SearchUI *ui);
 void update_deck_overlays(SearchUI *ui);
 // 前向声明：清除中间卡组区 hover 预览去重状态
 static void clear_slot_hover_cache(SearchUI *ui);
+static void show_status_toast(SearchUI *ui, const char *message);
+void load_card_image(GtkWidget *slot, int img_id, SoupSession *session);
+void reload_missing_card_images(GPtrArray *slots, int count, SoupSession *session);
 
 // 全局筛选状态（保持默认值）
 // FilterState 定义在 search_filter.h 中
@@ -479,6 +482,7 @@ static void on_slot_clicked(GtkGestureClick *gesture, int n_press, double x, dou
     if (g_strcmp0(region, "main") == 0) {
         if (index < ui->main_idx) {
             shift_delete_slots(ui->main_pics, &ui->main_idx, index);
+            reload_missing_card_images(ui->main_pics, ui->main_idx, ui->session);
             update_count_label(ui->main_count, ui->main_idx);
             update_genesys_score(ui);
             update_deck_overlays(ui);
@@ -487,6 +491,7 @@ static void on_slot_clicked(GtkGestureClick *gesture, int n_press, double x, dou
     } else if (g_strcmp0(region, "extra") == 0) {
         if (index < ui->extra_idx) {
             shift_delete_slots(ui->extra_pics, &ui->extra_idx, index);
+            reload_missing_card_images(ui->extra_pics, ui->extra_idx, ui->session);
             update_count_label(ui->extra_count, ui->extra_idx);
             update_genesys_score(ui);
             update_deck_overlays(ui);
@@ -495,6 +500,7 @@ static void on_slot_clicked(GtkGestureClick *gesture, int n_press, double x, dou
     } else if (g_strcmp0(region, "side") == 0) {
         if (index < ui->side_idx) {
             shift_delete_slots(ui->side_pics, &ui->side_idx, index);
+            reload_missing_card_images(ui->side_pics, ui->side_idx, ui->session);
             update_count_label(ui->side_count, ui->side_idx);
             update_genesys_score(ui);
             update_deck_overlays(ui);
@@ -526,9 +532,10 @@ static gboolean is_allowed_move(const char *from, const char *to) {
     return FALSE; // disallow main<->extra
 }
 
-void perform_move(SearchUI *ui, const char *from_region, int from_index, const char *to_region, int to_index) {
-    if (!is_allowed_move(from_region, to_region)) return;
-    // Get arrays and counts
+gboolean perform_move(SearchUI *ui, const char *from_region, int from_index,
+                      const char *to_region, int to_index) {
+    if (!is_allowed_move(from_region, to_region)) return FALSE;
+
     GPtrArray *from_arr = NULL, *to_arr = NULL;
     int *from_count = NULL, *to_count = NULL;
     GtkLabel *from_label = NULL, *to_label = NULL;
@@ -540,194 +547,64 @@ void perform_move(SearchUI *ui, const char *from_region, int from_index, const c
     else if (g_strcmp0(to_region, "extra") == 0) { to_arr = ui->extra_pics; to_count = &ui->extra_idx; to_label = ui->extra_count; }
     else if (g_strcmp0(to_region, "side") == 0) { to_arr = ui->side_pics; to_count = &ui->side_idx; to_label = ui->side_count; }
 
-    // 区域名与下标来自拖放 payload（任意应用都可提供 G_TYPE_STRING），必须校验：
-    // 未识别的区域名会让数组为 NULL，越界的下标会读越界内存（g_ptr_array_index
-    // 不做边界检查），随后对野指针调用 g_object_get_data 会崩溃。
-    if (!from_arr || !from_count || !to_arr || !to_count) return;
-    if (from_index < 0 || from_index >= *from_count || from_index >= (int)from_arr->len) return;
-    if (to_index < 0 || to_index >= (int)to_arr->len) return;
+    if (!from_arr || !to_arr || from_index < 0 || from_index >= *from_count ||
+        from_index >= (int)from_arr->len || to_index < 0 || to_index >= (int)to_arr->len)
+        return FALSE;
 
-    GtkWidget *from_widget = GTK_WIDGET(g_ptr_array_index(from_arr, from_index));
-    GdkPixbuf *moving_pb = slot_get_pixbuf(from_widget);
-    if (!moving_pb) return;
-    GdkPixbuf *moving_pb_ref = g_object_ref(moving_pb);
-    gboolean moving_is_extra = slot_get_is_extra(from_widget);
-    int moving_card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(from_widget), "card_id"));
-    int moving_img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(from_widget), "img_id"));
-    const char *moving_en_name = slot_get_en_name(from_widget);  // GENESYS 英文名
+    GtkWidget *from = g_ptr_array_index(from_arr, from_index);
+    if (!slot_get_img_id(from)) return FALSE;
 
-    // 规则限制：跨区域移动时
-    // - 额外怪兽不可进入 main
-    // - 非额外卡不可进入 extra
-    if (g_strcmp0(from_region, to_region) != 0) {
-        if (g_strcmp0(to_region, "main") == 0 && moving_is_extra) {
-            g_object_unref(moving_pb_ref);
-            return;
+    // Keep occupied slots contiguous so counters and exports agree.
+    int last = from_arr == to_arr ? *to_count - 1 : *to_count;
+    GtkWidget *to = g_ptr_array_index(to_arr, MIN(to_index, last));
+    if (from == to) return FALSE;
+
+    gboolean occupied = slot_get_img_id(to) != 0;
+    gboolean moving_extra = slot_get_is_extra(from);
+    if (from_arr != to_arr) {
+        GtkWidget *side_card = from_arr == ui->side_pics ? from : (occupied ? to : NULL);
+        if (side_card && GPOINTER_TO_INT(g_object_get_data(G_OBJECT(side_card), "needs-card-metadata")) ==
+                         SLOT_METADATA_TYPE_UNKNOWN) {
+            show_status_toast(ui, TR("无法确认这张副卡的类型",
+                                     "The card type in the Side Deck is unavailable"));
+            return FALSE;
         }
-        if (g_strcmp0(to_region, "extra") == 0 && !moving_is_extra) {
-            g_object_unref(moving_pb_ref);
-            return;
-        }
+        if ((to_arr == ui->main_pics && moving_extra) ||
+            (to_arr == ui->extra_pics && !moving_extra))
+            return FALSE;
+        if (occupied && ((from_arr == ui->main_pics && slot_get_is_extra(to)) ||
+                         (from_arr == ui->extra_pics && !slot_get_is_extra(to))))
+            return FALSE;
     }
 
-    if (from_arr == to_arr) {
-        // Intra-region: if dropping onto filled slot, swap; else move to empty
-        if (to_index == from_index) {
-            g_object_unref(moving_pb_ref);
-            return;
-        }
-        if (to_index < *from_count) {
-            GtkWidget *to_widget = GTK_WIDGET(g_ptr_array_index(from_arr, to_index));
-            GdkPixbuf *dest_pb = slot_get_pixbuf(to_widget);
-            // Take a temporary ref BEFORE overwriting destination to avoid use-after-unref
-            GdkPixbuf *dest_pb_ref = dest_pb ? g_object_ref(dest_pb) : NULL;
-            // swap pixbuf
-            slot_set_pixbuf(to_widget, moving_pb_ref);
-            // swap type flags
-            gboolean dest_is_extra = slot_get_is_extra(to_widget);
-            slot_set_is_extra(to_widget, moving_is_extra);
-            // swap card_id and img_id
-            int from_card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(from_widget), "card_id"));
-            int to_card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(to_widget), "card_id"));
-            int from_img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(from_widget), "img_id"));
-            int to_img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(to_widget), "img_id"));
-            const char *from_en = slot_get_en_name(from_widget);
-            const char *to_en   = slot_get_en_name(to_widget);
-            g_object_set_data(G_OBJECT(to_widget), "card_id", GINT_TO_POINTER(from_card_id));
-            g_object_set_data(G_OBJECT(to_widget), "img_id", GINT_TO_POINTER(from_img_id));
-            slot_set_en_name(to_widget, from_en);
-            if (dest_pb_ref) {
-                slot_set_is_extra(from_widget, dest_is_extra);
-                slot_set_pixbuf(from_widget, dest_pb_ref);
-                g_object_set_data(G_OBJECT(from_widget), "card_id", GINT_TO_POINTER(to_card_id));
-                g_object_set_data(G_OBJECT(from_widget), "img_id", GINT_TO_POINTER(to_img_id));
-                slot_set_en_name(from_widget, to_en);
-                g_object_unref(dest_pb_ref);
-            } else {
-                slot_set_is_extra(from_widget, FALSE);
-                slot_set_pixbuf(from_widget, NULL);
-                g_object_set_data(G_OBJECT(from_widget), "card_id", GINT_TO_POINTER(0));
-                g_object_set_data(G_OBJECT(from_widget), "img_id", GINT_TO_POINTER(0));
-                slot_set_en_name(from_widget, NULL);
-            }
-        } else {
-            // moving to empty slot within region
-            // Clear original source since we're moving to an empty slot
-            slot_set_pixbuf(from_widget, NULL);
-            slot_set_is_extra(from_widget, FALSE);
-            g_object_set_data(G_OBJECT(from_widget), "card_id", GINT_TO_POINTER(0));
-            g_object_set_data(G_OBJECT(from_widget), "img_id", GINT_TO_POINTER(0));
-            slot_set_en_name(from_widget, NULL);
-            int place_index = to_index;
-            // Feature: if target and its previous are empty, place to first truly empty index (scan)
-            if (to_index >= *from_count) {
-                GtkWidget *prev = (to_index > 0) ? GTK_WIDGET(g_ptr_array_index(from_arr, to_index - 1)) : NULL;
-                GtkWidget *to_w_chk = GTK_WIDGET(g_ptr_array_index(from_arr, to_index));
-                gboolean prev_empty = !prev || slot_get_pixbuf(prev) == NULL;
-                gboolean target_empty = slot_get_pixbuf(to_w_chk) == NULL;
-                if (prev_empty && target_empty) {
-                    int first_empty = array_find_first_empty(from_arr);
-                    if (first_empty >= 0) {
-                        place_index = first_empty;
-                    }
-                }
-            }
-            GtkWidget *to_w = GTK_WIDGET(g_ptr_array_index(from_arr, place_index));
-            slot_set_pixbuf(to_w, moving_pb_ref);
-            slot_set_is_extra(to_w, moving_is_extra);
-            g_object_set_data(G_OBJECT(to_w), "card_id", GINT_TO_POINTER(moving_card_id));
-            g_object_set_data(G_OBJECT(to_w), "img_id", GINT_TO_POINTER(moving_img_id));
-            slot_set_en_name(to_w, moving_en_name);
-            // update count if we extended or filled a lower empty slot
-            if (*from_count < place_index + 1) *from_count = place_index + 1;
-        }
+    if (from_arr == to_arr && to_index >= *to_count) {
+        // Rotate the card to the last occupied slot.
+        for (int i = from_index; i < last; i++)
+            slot_swap_cards(g_ptr_array_index(from_arr, i), g_ptr_array_index(from_arr, i + 1));
     } else {
-        // Cross-region: from removes, to inserts
-        GtkWidget *to_widget = GTK_WIDGET(g_ptr_array_index(to_arr, to_index));
-        GdkPixbuf *dest_pb = slot_get_pixbuf(to_widget);
-        // Take a temporary ref BEFORE overwriting destination to avoid use-after-unref
-        GdkPixbuf *dest_pb_ref = dest_pb ? g_object_ref(dest_pb) : NULL;
-        if (to_index < *to_count && dest_pb) {
-            // Destination filled: swap without shifting; counts unchanged
-            slot_set_pixbuf(to_widget, moving_pb_ref);
-            // swap type flags
-            gboolean dest_is_extra = slot_get_is_extra(to_widget);
-            slot_set_is_extra(to_widget, moving_is_extra);
-            // swap card_id and img_id and en_name
-            int to_card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(to_widget), "card_id"));
-            int to_img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(to_widget), "img_id"));
-            const char *to_en_name = slot_get_en_name(to_widget);
-            g_object_set_data(G_OBJECT(to_widget), "card_id", GINT_TO_POINTER(moving_card_id));
-            g_object_set_data(G_OBJECT(to_widget), "img_id", GINT_TO_POINTER(moving_img_id));
-            slot_set_en_name(to_widget, moving_en_name);
-            if (dest_pb_ref) {
-                slot_set_is_extra(from_widget, dest_is_extra);
-                slot_set_pixbuf(from_widget, dest_pb_ref);
-                g_object_set_data(G_OBJECT(from_widget), "card_id", GINT_TO_POINTER(to_card_id));
-                g_object_set_data(G_OBJECT(from_widget), "img_id", GINT_TO_POINTER(to_img_id));
-                slot_set_en_name(from_widget, to_en_name);
-                g_object_unref(dest_pb_ref);
-            } else {
-                slot_set_is_extra(from_widget, FALSE);
-                slot_set_pixbuf(from_widget, NULL);
-                g_object_set_data(G_OBJECT(from_widget), "card_id", GINT_TO_POINTER(0));
-                g_object_set_data(G_OBJECT(from_widget), "img_id", GINT_TO_POINTER(0));
-                slot_set_en_name(from_widget, NULL);
-            }
-        } else {
-            // Destination empty: remove from source, insert into destination, update counts
-            int end_from = *from_count - 1;
-            if (from_index != end_from) {
-                array_shift_left(from_arr, from_index, end_from);
-            } else {
-            }
-            GtkWidget *from_last = GTK_WIDGET(g_ptr_array_index(from_arr, end_from));
-            slot_set_pixbuf(from_last, NULL);
-            slot_set_is_extra(from_last, FALSE);
-            g_object_set_data(G_OBJECT(from_last), "card_id", GINT_TO_POINTER(0));
-            g_object_set_data(G_OBJECT(from_last), "img_id", GINT_TO_POINTER(0));
-            slot_set_en_name(from_last, NULL);
-            *from_count = *from_count - 1;
-
-            // Insert into destination
-            int place_index = to_index;
-            // Feature: if target and its previous are empty, place to first truly empty index (scan)
-            {
-                GtkWidget *prev = (to_index > 0) ? GTK_WIDGET(g_ptr_array_index(to_arr, to_index - 1)) : NULL;
-                GtkWidget *to_w_chk = GTK_WIDGET(g_ptr_array_index(to_arr, to_index));
-                gboolean prev_empty = !prev || slot_get_pixbuf(prev) == NULL;
-                gboolean target_empty = slot_get_pixbuf(to_w_chk) == NULL;
-                if (prev_empty && target_empty) {
-                    int first_empty = array_find_first_empty(to_arr);
-                    if (first_empty >= 0) {
-                        place_index = first_empty;
-                    }
-                }
-            }
-            // 此分支的 place_index 必然指向空槽位（目标槽为空，或扫描到的第一个空槽），
-            // 因此无需右移：此前的 array_shift_right(end = *to_count-1) 会覆盖末张卡、
-            // 使其静默丢失。计数只在扩展到新槽位时增加，填入空洞时不变。
-            GtkWidget *place_w = GTK_WIDGET(g_ptr_array_index(to_arr, place_index));
-            slot_set_pixbuf(place_w, moving_pb_ref);
-            slot_set_is_extra(place_w, moving_is_extra);
-            g_object_set_data(G_OBJECT(place_w), "card_id", GINT_TO_POINTER(moving_card_id));
-            g_object_set_data(G_OBJECT(place_w), "img_id", GINT_TO_POINTER(moving_img_id));
-            slot_set_en_name(place_w, moving_en_name);
-            if (*to_count < place_index + 1) *to_count = place_index + 1;
+        slot_swap_cards(from, to);
+        if (!occupied && from_arr != to_arr) {
+            shift_delete_slots(from_arr, from_count, from_index);
+            (*to_count)++;
         }
     }
+
+    reload_missing_card_images(from_arr, *from_count, ui->session);
+    if (from_arr != to_arr)
+        reload_missing_card_images(to_arr, *to_count, ui->session);
     update_count_label(from_label, *from_count);
     update_count_label(to_label, *to_count);
     update_genesys_score(ui);
     update_deck_overlays(ui);
     clear_slot_hover_cache(ui);
-    g_object_unref(moving_pb_ref);
+    return TRUE;
 }
 
 void free_card_preview(gpointer data) {
     CardPreview *pv = (CardPreview*)data;
     if (!pv) return;
     g_free(pv->original_name);
+    g_free(pv->sheet_name);
     g_free(pv->en_name);
     g_free(pv->types);
     g_free(pv->pdesc);
@@ -889,6 +766,119 @@ typedef struct {
     char *konami_id;
 } SheetExportData;
 
+static void show_status_toast(SearchUI *ui, const char *message) {
+    if (ui->toast_overlay)
+        adw_toast_overlay_add_toast(ui->toast_overlay, adw_toast_new(message));
+}
+
+typedef struct {
+    GWeakRef window;
+    SearchUI *ui;
+    int img_id;
+} DeckMetadataRequest;
+
+static void on_deck_metadata_received(GObject *source, GAsyncResult *result, gpointer user_data);
+
+static void request_deck_metadata(SearchUI *ui, SoupMessage *message, int img_id) {
+    DeckMetadataRequest *request = g_new0(DeckMetadataRequest, 1);
+    g_weak_ref_init(&request->window, G_OBJECT(ui->window));
+    request->ui = ui;
+    request->img_id = img_id;
+    soup_session_send_and_read_async(ui->session, message, G_PRIORITY_DEFAULT, NULL,
+                                     on_deck_metadata_received, request);
+}
+
+static void on_deck_metadata_received(GObject *source, GAsyncResult *result, gpointer user_data) {
+    DeckMetadataRequest *request = user_data;
+    SoupSession *session = SOUP_SESSION(source);
+    g_autoptr(GBytes) body = soup_session_send_and_read_finish(session, result, NULL);
+    SoupMessage *message = soup_session_get_async_result_message(session, result);
+    g_autoptr(GObject) window = g_weak_ref_get(&request->window);
+    SearchUI *ui = request->ui;
+    int response_id = request->img_id;
+    g_weak_ref_clear(&request->window);
+    g_free(request);
+    if (!window || !body || !message ||
+        !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(message)))
+        return;
+
+    gsize length;
+    const char *json = g_bytes_get_data(body, &length);
+    g_autoptr(JsonParser) parser = json_parser_new();
+    if (!json_parser_load_from_data(parser, json, length, NULL)) return;
+    JsonNode *root = json_parser_get_root(parser);
+    if (!root || !JSON_NODE_HOLDS_OBJECT(root)) return;
+
+    JsonObject *cards = json_node_get_object(root);
+    g_autoptr(GHashTable) needs_detail = g_hash_table_new(g_direct_hash, g_direct_equal);
+    gboolean changed = FALSE;
+    GPtrArray *regions[] = {ui->main_pics, ui->extra_pics, ui->side_pics};
+    int counts[] = {ui->main_idx, ui->extra_idx, ui->side_idx};
+    for (guint r = 0; r < G_N_ELEMENTS(regions); r++) {
+        for (int i = 0; i < counts[r]; i++) {
+            GtkWidget *slot = g_ptr_array_index(regions[r], i);
+            if (!g_object_get_data(G_OBJECT(slot), "needs-card-metadata")) continue;
+
+            int img_id = slot_get_img_id(slot);
+            if (response_id) {
+                if (img_id == response_id)
+                    changed |= deck_apply_card_metadata(slot, cards);
+                continue;
+            }
+
+            char key[32];
+            g_snprintf(key, sizeof(key), "%d", img_id);
+            JsonNode *node = json_object_get_member(cards, key);
+            if (!node || !JSON_NODE_HOLDS_OBJECT(node)) continue;
+            JsonObject *card = json_node_get_object(node);
+            if (json_object_has_member(card, "cid") && card_english_name(card) &&
+                deck_apply_card_metadata(slot, card)) {
+                changed = TRUE;
+            } else if (g_hash_table_add(needs_detail, GINT_TO_POINTER(img_id))) {
+                g_autofree char *url = g_strdup_printf("https://ygocdb.com/api/v0/card/%d", img_id);
+                g_autoptr(SoupMessage) detail = soup_message_new("GET", url);
+                request_deck_metadata(ui, detail, img_id);
+            }
+        }
+    }
+    if (changed) {
+        update_genesys_score(ui);
+        update_deck_overlays(ui);
+    }
+}
+
+static void refresh_imported_deck(SearchUI *ui) {
+    clear_slot_hover_cache(ui);
+
+    g_autoptr(GHashTable) seen = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_autoptr(GString) request_body = g_string_new("{\"ids\":[");
+    GPtrArray *regions[] = {ui->main_pics, ui->extra_pics, ui->side_pics};
+    int counts[] = {ui->main_idx, ui->extra_idx, ui->side_idx};
+    for (guint r = 0; r < G_N_ELEMENTS(regions); r++) {
+        for (int i = 0; i < counts[r]; i++) {
+            GtkWidget *slot = g_ptr_array_index(regions[r], i);
+            if (!g_object_get_data(G_OBJECT(slot), "needs-card-metadata") ||
+                deck_load_local_card_metadata(slot))
+                continue;
+            int id = slot_get_img_id(slot);
+            if (g_hash_table_add(seen, GINT_TO_POINTER(id)))
+                g_string_append_printf(request_body, "%s%d",
+                                       g_hash_table_size(seen) > 1 ? "," : "", id);
+        }
+    }
+    update_genesys_score(ui);
+    update_deck_overlays(ui);
+    if (!ui->session || !ui->window || !g_hash_table_size(seen)) return;
+    g_string_append(request_body, "]}");
+
+    g_autoptr(SoupMessage) message =
+        soup_message_new("POST", "https://ygocdb.com/api/v0/cardset");
+    g_autoptr(GBytes) body = g_bytes_new(request_body->str, request_body->len);
+    soup_message_set_request_body_from_bytes(message, "application/json", body);
+
+    request_deck_metadata(ui, message, 0);
+}
+
 // 文件保存对话框回调
 static void on_export_file_save_finish(GObject *source, GAsyncResult *result, gpointer user_data) {
     ExportData *export_data = (ExportData*)user_data;
@@ -897,21 +887,23 @@ static void on_export_file_save_finish(GObject *source, GAsyncResult *result, gp
     
     if (file) {
         char *path = g_file_get_path(file);
-        export_deck_to_ydk(
+        gboolean exported = export_deck_to_ydk(
             export_data->ui->main_pics, export_data->ui->main_idx,
             export_data->ui->extra_pics, export_data->ui->extra_idx,
             export_data->ui->side_pics, export_data->ui->side_idx,
-            path
+            path, &error
         );
-        
-        // 保存目录到缓存
-        char *dir = g_path_get_dirname(path);
-        g_free(last_export_directory);
-        last_export_directory = dir;
-        
-        // 保存到配置文件
-        save_io_config(last_export_directory, last_import_directory, last_deck_sheet_directory);
-        
+        if (exported) {
+            g_free(last_export_directory);
+            last_export_directory = g_path_get_dirname(path);
+            save_io_config(last_export_directory, last_import_directory, last_deck_sheet_directory);
+            show_status_toast(export_data->ui, TR("卡组已导出", "Deck exported"));
+        } else {
+            g_warning("导出失败: %s", error->message);
+            show_status_toast(export_data->ui, TR("无法保存卡组", "Could not save the deck"));
+            g_clear_error(&error);
+        }
+
         g_free(path);
         g_object_unref(file);
     } else if (error) {
@@ -958,7 +950,11 @@ static void on_sheet_save_finish(GObject *source, GAsyncResult *result, gpointer
         } else {
             g_warning("生成卡表失败: %s", gen_error ? gen_error->message : "未知错误");
             if (export_data->ui && export_data->ui->toast_overlay) {
-                AdwToast *toast = adw_toast_new(TR("卡表生成失败", "Could not export the deck list"));
+                const char *message = g_error_matches(gen_error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA)
+                    ? TR("部分卡片资料缺失，无法生成卡表。请等待资料加载或启用离线数据。",
+                         "Some card details are missing. Wait for them to load or enable offline data.")
+                    : TR("卡表生成失败", "Could not export the deck list");
+                AdwToast *toast = adw_toast_new(message);
                 adw_toast_set_timeout(toast, 2);
                 adw_toast_overlay_add_toast(export_data->ui->toast_overlay, toast);
             }
@@ -986,24 +982,20 @@ static void on_import_file_open_finish(GObject *source, GAsyncResult *result, gp
     
     if (file) {
         char *path = g_file_get_path(file);
-        import_deck_from_ydk(
-            import_data->ui->main_pics, &import_data->ui->main_idx, import_data->ui->main_count,
-            import_data->ui->extra_pics, &import_data->ui->extra_idx, import_data->ui->extra_count,
-            import_data->ui->side_pics, &import_data->ui->side_idx, import_data->ui->side_count,
-            import_data->ui->session,
-            path
-        );
-        update_genesys_score(import_data->ui);
-        update_deck_overlays(import_data->ui);
-        
-        // 保存导入目录到缓存
-        char *dir = g_path_get_dirname(path);
-        g_free(last_import_directory);
-        last_import_directory = dir;
-        
-        // 保存到配置文件
-        save_io_config(last_export_directory, last_import_directory, last_deck_sheet_directory);
-        
+        SearchUI *ui = import_data->ui;
+        if (import_deck_from_ydk(ui->main_pics, &ui->main_idx, ui->main_count,
+                                 ui->extra_pics, &ui->extra_idx, ui->extra_count,
+                                 ui->side_pics, &ui->side_idx, ui->side_count,
+                                 ui->session, path)) {
+            refresh_imported_deck(ui);
+            g_free(last_import_directory);
+            last_import_directory = g_path_get_dirname(path);
+            save_io_config(last_export_directory, last_import_directory, last_deck_sheet_directory);
+        } else {
+            show_status_toast(ui, TR("无法导入，文件无效或超出卡组容量",
+                                     "Could not import an invalid or oversized deck"));
+        }
+
         g_free(path);
         g_object_unref(file);
     } else if (error) {
@@ -1347,7 +1339,7 @@ static void on_filter_button_clicked(GtkButton *btn, gpointer user_data) {
     (void)btn;
     GtkWindow *parent_window = GTK_WINDOW(user_data);
     
-    if (!load_offline_data_switch_state() || !offline_data_exists()) {
+    if (!load_offline_data_switch_state() || !offline_data_is_ready()) {
         AdwDialog *alert_dialog = ADW_DIALOG(adw_alert_dialog_new(TR("筛选功能", "Card Filters"), TR("请先启用并下载离线数据。", "Enable and download offline data to use filters.")));
         adw_alert_dialog_add_response(ADW_ALERT_DIALOG(alert_dialog), "ok", TR("确定", "OK"));
         adw_alert_dialog_set_default_response(ADW_ALERT_DIALOG(alert_dialog), "ok");
@@ -1756,243 +1748,18 @@ typedef struct {
     SearchUI *ui;
 } ImportUrlDialogData;
 
-// 异步加载先行卡图片的任务数据
-typedef struct {
-    GtkWidget *slot;
-    int img_id;
-    gchar *local_path;
-} PreleaseLoadTask;
-
-// 异步加载先行卡图片的工作线程
-static void prerelease_load_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
-    (void)source_object;
-    (void)cancellable;
-    
-    PreleaseLoadTask *data = (PreleaseLoadTask*)task_data;
-    if (!data || !data->local_path) {
-        g_task_return_pointer(task, NULL, NULL);
-        return;
-    }
-    
-    GError *error = NULL;
-    GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(data->local_path, &error);
-    
-    if (error) {
-        g_warning("加载先行卡图片失败: %s", error->message);
-        g_error_free(error);
-        g_task_return_pointer(task, NULL, NULL);
-    } else {
-        g_task_return_pointer(task, pixbuf, (GDestroyNotify)g_object_unref);
-    }
-}
-
-// 先行卡图片加载完成回调
-static void prerelease_load_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
-    (void)source;
-    PreleaseLoadTask *data = (PreleaseLoadTask*)user_data;
-    
-    if (!data) return;
-    
-    GTask *task = G_TASK(res);
-    GError *err = NULL;
-    GdkPixbuf *pixbuf = (GdkPixbuf*)g_task_propagate_pointer(task, &err);
-    
-    if (err) {
-        g_error_free(err);
-    }
-    
-    // 检查slot是否仍然有效
-    if (pixbuf && data->slot && GTK_IS_WIDGET(data->slot)) {
-        slot_set_pixbuf(data->slot, pixbuf);
-    }
-    
-    // 清理
-    if (pixbuf) g_object_unref(pixbuf);
-    if (data->slot) g_object_remove_weak_pointer(G_OBJECT(data->slot), (gpointer*)&data->slot);
-    g_free(data->local_path);
-    g_free(data);
-}
-
-// 磁盘缓存异步加载任务：悬停预览/点击加卡路径禁止在主线程做磁盘 IO。
-// 加载在工作线程进行，命中后在主线程设置图片；未命中时按原语义回退到网络加载。
-typedef struct {
-    GtkWidget *target;   // 弱引用：GtkDrawingArea（槽位）或 GtkPicture（预览）
-    GtkStack *stack;     // 弱引用：可空，命中后切到 picture 页
-    SoupSession *session;
-    int card_id;
-    gboolean scale_to_thumb;    // 网络回退 ImageLoadCtx 参数
-    gboolean add_to_thumb_cache;
-    void (*on_miss)(gpointer user_data);  // 未命中、发起网络回退前的准备（主线程调用）
-    gpointer user_data;
-} DiskCacheLoadTask;
-
-static void disk_cache_load_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
-    (void)source_object;
-    (void)cancellable;
-    DiskCacheLoadTask *d = (DiskCacheLoadTask*)task_data;
-    GdkPixbuf *pixbuf = d ? load_from_disk_cache(d->card_id) : NULL;
-    if (pixbuf) {
-        g_task_return_pointer(task, pixbuf, (GDestroyNotify)g_object_unref);
-    } else {
-        g_task_return_pointer(task, NULL, NULL);
-    }
-}
-
-static void disk_cache_load_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
-    (void)source;
-    (void)user_data;
-    GTask *task = G_TASK(res);
-    DiskCacheLoadTask *d = (DiskCacheLoadTask*)g_task_get_task_data(task);
-    GError *err = NULL;
-    GdkPixbuf *pixbuf = (GdkPixbuf*)g_task_propagate_pointer(task, &err);
-    if (err) g_error_free(err);
-
-    GtkWidget *target = d->target;
-    GtkStack *stack = d->stack;
-
-    // 目标身份校验：槽位当前 img_id 仍是请求的卡，避免槽位内容变化后旧图错写
-    gboolean still_valid = target && GTK_IS_WIDGET(target) &&
-        GPOINTER_TO_INT(g_object_get_data(G_OBJECT(target), "img_id")) == d->card_id;
-
-    if (pixbuf && still_valid) {
-        if (GTK_IS_DRAWING_AREA(target)) {
-            slot_set_pixbuf(target, pixbuf);
-            if (stack && GTK_IS_STACK(stack)) {
-                gtk_stack_set_visible_child_name(stack, "picture");
-            }
-        } else if (GTK_IS_PICTURE(target)) {
-            GdkTexture *tex = pixbuf_utils_texture_from_pixbuf(pixbuf);
-            if (tex) {
-                gtk_picture_set_paintable(GTK_PICTURE(target), GDK_PAINTABLE(tex));
-                g_object_unref(tex);
-            }
-            if (stack && GTK_IS_STACK(stack)) {
-                gtk_stack_set_visible_child_name(stack, "picture");
-            }
-        }
-    }
-
-    // 先 detach 弱指针再释放任务数据，避免悬空弱指针
-    if (d->target && G_IS_OBJECT(d->target)) {
-        g_object_remove_weak_pointer(G_OBJECT(d->target), (gpointer*)&d->target);
-    }
-    if (d->stack && G_IS_OBJECT(d->stack)) {
-        g_object_remove_weak_pointer(G_OBJECT(d->stack), (gpointer*)&d->stack);
-    }
-    SoupSession *session = d->session;
-    int card_id = d->card_id;
-    gboolean scale_to_thumb = d->scale_to_thumb;
-    gboolean add_to_thumb_cache = d->add_to_thumb_cache;
-    void (*on_miss)(gpointer) = d->on_miss;
-    gpointer miss_user_data = d->user_data;
-    g_free(d);
-
-    // 缓存未命中且目标仍需要这张卡（身份校验通过）：与原同步路径一致，回退到网络加载
-    if (!pixbuf && still_valid && session) {
-        if (on_miss) on_miss(miss_user_data);
-        char url[128];
-        g_snprintf(url, sizeof url, "https://cdn.233.momobako.com/ygoimg/jp/%d.webp", card_id);
-        ImageLoadCtx *ctx = g_new0(ImageLoadCtx, 1);
-        ctx->stack = (stack && GTK_IS_STACK(stack)) ? stack : NULL;
-        ctx->target = target;
-        // 注意：不要在此外加弱指针。load_image_async 会为 ctx->target / ctx->stack
-        // 注册弱指针（每个位置一次），而 free_image_load_ctx 只移除一次；
-        // 若此处重复注册，剩余的弱指针条目会指向已释放的 ctx，控件销毁时
-        // GObject 会通过该条目向已释放内存写入 NULL（use-after-free）。
-        ctx->scale_to_thumb = scale_to_thumb;
-        ctx->cache_id = card_id;
-        ctx->add_to_thumb_cache = add_to_thumb_cache;
-        ctx->url = g_strdup(url);
-        ctx->cancel_generation = get_cancel_generation();
-        load_image_async(session, url, ctx);
-    }
-
-    if (pixbuf) g_object_unref(pixbuf);
-}
-
-// 发起磁盘缓存异步加载；target/stack 由弱引用保护，session 不转移所有权
-static void start_disk_cache_load(GtkWidget *target, GtkStack *stack, SoupSession *session,
-                                  int card_id, gboolean scale_to_thumb, gboolean add_to_thumb_cache,
-                                  void (*on_miss)(gpointer), gpointer user_data) {
-    if (!target || !session || card_id <= 0) return;
-    DiskCacheLoadTask *t = g_new0(DiskCacheLoadTask, 1);
-    t->target = target;
-    t->stack = stack;
-    t->session = session;
-    t->card_id = card_id;
-    t->scale_to_thumb = scale_to_thumb;
-    t->add_to_thumb_cache = add_to_thumb_cache;
-    t->on_miss = on_miss;
-    t->user_data = user_data;
-    g_object_add_weak_pointer(G_OBJECT(t->target), (gpointer*)&t->target);
-    if (t->stack) {
-        g_object_add_weak_pointer(G_OBJECT(t->stack), (gpointer*)&t->stack);
-    }
-    GTask *task = g_task_new(NULL, NULL, disk_cache_load_finished, NULL);
-    g_task_set_task_data(task, t, NULL);
-    g_task_run_in_thread(task, disk_cache_load_thread);
-    g_object_unref(task);
-}
-
-// 预览图磁盘缓存未命中时的准备：切到占位页并启动 spinner
-static void preview_prepare_placeholder(gpointer user_data) {
-    SearchUI *ui = (SearchUI*)user_data;
-    if (!ui) return;
-    gtk_stack_set_visible_child_name(ui->left_stack, "placeholder");
-    if (ui->left_spinner) {
-        gtk_widget_set_visible(GTK_WIDGET(ui->left_spinner), TRUE);
-        gtk_spinner_start(ui->left_spinner);
-    }
-}
-
-// 辅助函数：为槽位加载卡片图片（完全异步加载）。
-// dnd_manager.c 的拖放入卡路径也复用此函数。
 void load_card_image(GtkWidget *slot, int img_id, SoupSession *session) {
     if (img_id <= 0 || !session || !slot) return;
-    
-    // 检查是否是先行卡（优先通过ID位数判断，9位数=先行卡）
-    gboolean is_prerelease = is_prerelease_id(img_id);
-    
-    // 如果不是9位数，再检查本地先行卡数据（向后兼容）
-    if (!is_prerelease) {
-        JsonObject *prerelease_card = find_prerelease_card_by_id(img_id);
-        is_prerelease = (prerelease_card != NULL);
-        if (prerelease_card) {
-            json_object_unref(prerelease_card);  // 重要：释放引用
-        }
-    }
-    
-    if (is_prerelease) {
-        // 先行卡：异步从本地加载（避免IO阻塞）
-        gchar *local_path = get_prerelease_card_image_path(img_id);
-        if (local_path && g_file_test(local_path, G_FILE_TEST_EXISTS)) {
-            PreleaseLoadTask *task_data = g_new0(PreleaseLoadTask, 1);
-            task_data->slot = slot;
-            task_data->img_id = img_id;
-            task_data->local_path = local_path;  // 转移所有权
-            
-            // 添加弱引用防止slot被销毁后访问
-            g_object_add_weak_pointer(G_OBJECT(slot), (gpointer*)&task_data->slot);
-            
-            GTask *task = g_task_new(NULL, NULL, prerelease_load_finished, task_data);
-            g_task_set_task_data(task, task_data, NULL);
-            g_task_run_in_thread(task, prerelease_load_thread);
-            g_object_unref(task);
-        } else {
-            g_free(local_path);
-        }
-    } else {
-        // 普通卡：先检查内存缓存（快速路径）
-        GdkPixbuf *cached = get_thumb_from_cache(img_id);
-        if (cached) {
-            // 内存缓存命中，直接设置（无需unref，缓存持有引用）
-            slot_set_pixbuf(slot, cached);
-            return;
-        }
-        
-        // 内存缓存未命中：异步检查磁盘缓存（避免主线程 IO），
-        // 未命中时由加载回调按原语义回退到网络加载
-        start_disk_cache_load(slot, NULL, session, img_id, TRUE, TRUE, NULL, NULL);
+    g_autofree char *local_path = get_prerelease_card_image_path(img_id);
+    gboolean local_only = local_path != NULL || is_prerelease_id(img_id);
+    load_card_picture_async(session, slot, NULL, img_id, TRUE, local_only, local_path);
+}
+
+void reload_missing_card_images(GPtrArray *slots, int count, SoupSession *session) {
+    for (int i = 0; i < count; i++) {
+        GtkWidget *slot = g_ptr_array_index(slots, i);
+        if (slot_get_img_id(slot) && !slot_get_pixbuf(slot))
+            load_card_image(slot, slot_get_img_id(slot), session);
     }
 }
 
@@ -2291,75 +2058,35 @@ static void on_import_url_clicked(GtkButton *btn, gpointer user_data) {
     
     SearchUI *ui = data->ui;
     
-    // 清空当前卡组
-    clear_all_deck_regions(
-        ui->main_pics, &ui->main_idx, ui->main_count,
-        ui->extra_pics, &ui->extra_idx, ui->extra_count,
-        ui->side_pics, &ui->side_idx, ui->side_count
-    );
-    
-    // 导入主卡组
-    for (int i = 0; i < main_count && ui->main_idx < (int)ui->main_pics->len; i++) {
-        GtkWidget *slot = GTK_WIDGET(g_ptr_array_index(ui->main_pics, ui->main_idx));
-        if (!slot) continue;
-        
-        int img_id = main_cards[i];
-        g_object_set_data(G_OBJECT(slot), "img_id", GINT_TO_POINTER(img_id));
-        g_object_set_data(G_OBJECT(slot), "card_id", GINT_TO_POINTER(img_id));
-        slot_set_is_extra(slot, FALSE);
-        
-        // 加载卡片图片
-        if (img_id > 0 && ui->session) {
-            load_card_image(slot, img_id, ui->session);
-        }
-        
-        ui->main_idx++;
+    const int *cards[] = {main_cards, extra_cards, side_cards};
+    int counts[] = {main_count, extra_count, side_count};
+    guint capacities[] = {ui->main_pics->len, ui->extra_pics->len, ui->side_pics->len};
+    gboolean valid = TRUE;
+    for (guint r = 0; r < G_N_ELEMENTS(cards); r++) {
+        if ((guint)counts[r] > capacities[r]) valid = FALSE;
+        for (int i = 0; i < counts[r]; i++)
+            if (cards[r][i] <= 0) valid = FALSE;
     }
-    
-    // 导入额外卡组
-    for (int i = 0; i < extra_count && ui->extra_idx < (int)ui->extra_pics->len; i++) {
-        GtkWidget *slot = GTK_WIDGET(g_ptr_array_index(ui->extra_pics, ui->extra_idx));
-        if (!slot) continue;
-        
-        int img_id = extra_cards[i];
-        g_object_set_data(G_OBJECT(slot), "img_id", GINT_TO_POINTER(img_id));
-        g_object_set_data(G_OBJECT(slot), "card_id", GINT_TO_POINTER(img_id));
-        slot_set_is_extra(slot, TRUE);
-        
-        // 加载卡片图片
-        if (img_id > 0 && ui->session) {
-            load_card_image(slot, img_id, ui->session);
-        }
-        
-        ui->extra_idx++;
+    if (!valid) {
+        show_status_toast(ui, TR("链接含有无效卡片或超出卡组容量",
+                                 "The deck link contains invalid cards or exceeds capacity"));
+        g_free(main_cards);
+        g_free(extra_cards);
+        g_free(side_cards);
+        return;
     }
-    
-    // 导入副卡组
-    for (int i = 0; i < side_count && ui->side_idx < (int)ui->side_pics->len; i++) {
-        GtkWidget *slot = GTK_WIDGET(g_ptr_array_index(ui->side_pics, ui->side_idx));
-        if (!slot) continue;
-        
-        int img_id = side_cards[i];
-        g_object_set_data(G_OBJECT(slot), "img_id", GINT_TO_POINTER(img_id));
-        g_object_set_data(G_OBJECT(slot), "card_id", GINT_TO_POINTER(img_id));
-        slot_set_is_extra(slot, FALSE);
-        
-        // 加载卡片图片
-        if (img_id > 0 && ui->session) {
-            load_card_image(slot, img_id, ui->session);
-        }
-        
-        ui->side_idx++;
-    }
-    
-    // 更新计数标签
-    update_count_label(ui->main_count, ui->main_idx);
-    update_count_label(ui->extra_count, ui->extra_idx);
-    update_count_label(ui->side_count, ui->side_idx);
-    update_genesys_score(ui);
-    clear_slot_hover_cache(ui);
-    update_deck_overlays(ui);
-    
+
+    clear_all_deck_regions(ui->main_pics, &ui->main_idx, ui->main_count,
+                           ui->extra_pics, &ui->extra_idx, ui->extra_count,
+                           ui->side_pics, &ui->side_idx, ui->side_count);
+    deck_fill_region(ui->main_pics, &ui->main_idx, ui->main_count,
+                     main_cards, main_count, FALSE, ui->session);
+    deck_fill_region(ui->extra_pics, &ui->extra_idx, ui->extra_count,
+                     extra_cards, extra_count, TRUE, ui->session);
+    deck_fill_region(ui->side_pics, &ui->side_idx, ui->side_count,
+                     side_cards, side_count, FALSE, ui->session);
+    refresh_imported_deck(ui);
+
     // 清理
     g_free(main_cards);
     g_free(extra_cards);
@@ -2530,16 +2257,19 @@ static void on_sort_clicked(GtkButton *btn, gpointer user_data) {
     // 对Main区域排序
     if (ui->main_pics && ui->main_idx > 0) {
         sort_deck_region(ui->main_pics, &ui->main_idx, ui->main_count);
+        reload_missing_card_images(ui->main_pics, ui->main_idx, ui->session);
     }
     
     // 对Extra区域排序（按融合-同调-超量-连接，同类按level降序）
     if (ui->extra_pics && ui->extra_idx > 0) {
         sort_extra_region(ui->extra_pics, &ui->extra_idx, ui->extra_count);
+        reload_missing_card_images(ui->extra_pics, ui->extra_idx, ui->session);
     }
     
     // 对Side区域排序
     if (ui->side_pics && ui->side_idx > 0) {
         sort_deck_region(ui->side_pics, &ui->side_idx, ui->side_count);
+        reload_missing_card_images(ui->side_pics, ui->side_idx, ui->session);
     }
 
     // 整理后重新计算角标，确保禁限图标跟随卡片新位置
@@ -2557,6 +2287,7 @@ static void on_shuffle_clicked(GtkButton *btn, gpointer user_data) {
     // 只对Main区域打乱
     if (ui->main_pics && ui->main_idx > 0) {
         shuffle_deck_region(ui->main_pics, &ui->main_idx, ui->main_count);
+        reload_missing_card_images(ui->main_pics, ui->main_idx, ui->session);
     }
 
     // 打乱后重新计算角标，确保禁限图标跟随卡片新位置
@@ -2673,70 +2404,6 @@ static char *format_card_text(const CardPreview *pv, const char *metadata) {
 }
 
 // 先行卡预览图加载任务数据
-typedef struct {
-    GtkPicture *picture;
-    GtkStack *stack;
-    int card_id;
-    gchar *local_path;
-} PreviewLoadTask;
-
-// 异步加载预览图的工作线程
-static void preview_load_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
-    (void)source_object;
-    (void)cancellable;
-    
-    PreviewLoadTask *data = (PreviewLoadTask*)task_data;
-    if (!data || !data->local_path) {
-        g_task_return_pointer(task, NULL, NULL);
-        return;
-    }
-    
-    GError *error = NULL;
-    GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(data->local_path, &error);
-    
-    if (error) {
-        g_warning("Failed to load prerelease image: %s", error->message);
-        g_error_free(error);
-        g_task_return_pointer(task, NULL, NULL);
-    } else {
-        g_task_return_pointer(task, pixbuf, (GDestroyNotify)g_object_unref);
-    }
-}
-
-// 预览图加载完成回调
-static void preview_load_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
-    (void)source;
-    PreviewLoadTask *data = (PreviewLoadTask*)user_data;
-    
-    if (!data) return;
-    
-    GTask *task = G_TASK(res);
-    GError *err = NULL;
-    GdkPixbuf *pixbuf = (GdkPixbuf*)g_task_propagate_pointer(task, &err);
-    
-    if (err) {
-        g_error_free(err);
-    }
-    
-    // 检查picture和stack是否仍然有效
-    if (pixbuf && data->picture && GTK_IS_PICTURE(data->picture) && 
-        data->stack && GTK_IS_STACK(data->stack)) {
-        GdkTexture *tex = pixbuf_utils_texture_from_pixbuf(pixbuf);
-        if (tex) {
-            gtk_picture_set_paintable(data->picture, GDK_PAINTABLE(tex));
-            g_object_unref(tex);
-        }
-        gtk_stack_set_visible_child_name(data->stack, "picture");
-    }
-    
-    // 清理
-    if (pixbuf) g_object_unref(pixbuf);
-    if (data->picture) g_object_remove_weak_pointer(G_OBJECT(data->picture), (gpointer*)&data->picture);
-    if (data->stack) g_object_remove_weak_pointer(G_OBJECT(data->stack), (gpointer*)&data->stack);
-    g_free(data->local_path);
-    g_free(data);
-}
-
 static void refresh_card_preview_text(SearchUI *ui) {
     const CardPreview *pv = g_object_get_data(G_OBJECT(ui->left_label), "current-card");
     if (!pv)
@@ -2755,43 +2422,28 @@ static void show_card_preview(SearchUI *ui, const CardPreview *pv) {
     CardPreview *current = g_new(CardPreview, 1);
     *current = *pv;
     current->original_name = g_strdup(pv->original_name);
+    current->sheet_name = g_strdup(pv->sheet_name);
     current->en_name = g_strdup(pv->en_name);
     current->types = g_strdup(pv->types);
     current->pdesc = g_strdup(pv->pdesc);
     current->desc = g_strdup(pv->desc);
     g_object_set_data_full(G_OBJECT(ui->left_label), "current-card", current, free_card_preview);
     refresh_card_preview_text(ui);
-    // 图片
-    if (pv->id > 0) {
-        if (pv->is_prerelease) {
-            // 先行卡：异步从本地加载图片（避免IO阻塞）
-            gchar *local_path = get_prerelease_card_image_path(pv->id);
-            if (local_path && g_file_test(local_path, G_FILE_TEST_EXISTS)) {
-                PreviewLoadTask *task_data = g_new0(PreviewLoadTask, 1);
-                task_data->picture = ui->left_picture;
-                task_data->stack = ui->left_stack;
-                task_data->card_id = pv->id;
-                task_data->local_path = local_path;  // 转移所有权
-                
-                // 添加弱引用
-                g_object_add_weak_pointer(G_OBJECT(task_data->picture), (gpointer*)&task_data->picture);
-                g_object_add_weak_pointer(G_OBJECT(task_data->stack), (gpointer*)&task_data->stack);
-                
-                GTask *task = g_task_new(NULL, NULL, preview_load_finished, task_data);
-                g_task_set_task_data(task, task_data, NULL);
-                g_task_run_in_thread(task, preview_load_thread);
-                g_object_unref(task);
-            } else {
-                g_free(local_path);
-            }
-        } else {
-            // 普通卡：异步从磁盘缓存加载（悬停路径，避免主线程 IO）；
-            // 记录当前预览的卡 ID，加载回调据此丢弃过期结果
-            g_object_set_data(G_OBJECT(ui->left_picture), "img_id", GINT_TO_POINTER(pv->id));
-            start_disk_cache_load(GTK_WIDGET(ui->left_picture), ui->left_stack, ui->session,
-                                  pv->id, FALSE, FALSE, preview_prepare_placeholder, ui);
-        }
+    GtkWidget *picture = GTK_WIDGET(ui->left_picture);
+    g_object_set_data(G_OBJECT(picture), "img_id", GINT_TO_POINTER(pv->id));
+    if (pv->id > 0 &&
+        GPOINTER_TO_INT(g_object_get_data(G_OBJECT(picture), "displayed-image-id")) == pv->id) {
+        gtk_stack_set_visible_child_name(ui->left_stack, "picture");
+        return;
     }
+
+    gtk_stack_set_visible_child_name(ui->left_stack, "placeholder");
+    if (pv->id > 0) {
+        g_autofree char *path = pv->is_prerelease ? get_prerelease_card_image_path(pv->id) : NULL;
+        load_card_picture_async(ui->session, picture, ui->left_stack,
+                                 pv->id, FALSE, pv->is_prerelease, path);
+    }
+
 }
 
 // 右栏行：记录按下位置用于区分拖拽
@@ -2865,29 +2517,11 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
     CardPreview *pv = (CardPreview*)g_object_get_data(G_OBJECT(row), "preview");
     if (!pv) return;
     
-    // 检查禁限卡限制
-    if (pv->cid > 0) {
-        int limit = get_card_limit(ui, pv->cid);
-        if (limit == 0) return;  // 禁止卡，不能加入
-    }
-    
-    gboolean is_monster = FALSE, is_extra_type = FALSE;
-    if (pv->type > 0) {
-        if (pv->type & 0x1) is_monster = TRUE;  // TYPE_MONSTER
-        if ((pv->type & 0x40) || (pv->type & 0x2000) ||
-            (pv->type & 0x800000) || (pv->type & 0x4000000)) {  // FUSION, SYNCHRO, XYZ, LINK
-            is_extra_type = TRUE;
-        }
-    }
-    
-    // 检查当前数量是否已达到限制
-    if (pv->cid > 0) {
-        int limit = get_card_limit(ui, pv->cid);
-        gboolean is_extra_card = is_monster && is_extra_type;
-        int current_count = count_card_in_deck(ui, pv->cid, is_extra_card);
-        if (current_count >= limit) return;  // 已达到上限
-    }
-    
+    gboolean is_extra_card = card_type_is_extra(pv->type);
+    int limit = get_card_limit(ui, pv->cid, pv->type);
+    if (limit == 0 || count_card_in_deck(ui, pv->cid, is_extra_card) >= limit)
+        return;
+
     // 根据鼠标按钮决定目标区域
     // 左键（按钮1）：按卡片类型自动选择主卡组/额外卡组，满了则溢出到副卡组
     // 右键（按钮3）：直接加入副卡组
@@ -2906,7 +2540,7 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
     } else {
         // 左键点击（默认）：原有逻辑
         enum { REGION_MAIN, REGION_EXTRA, REGION_SIDE } region = REGION_MAIN;
-        if (is_monster && is_extra_type) region = REGION_EXTRA;
+        if (is_extra_card) region = REGION_EXTRA;
         
         if (region == REGION_MAIN) {
             if (ui->main_idx < (int)ui->main_pics->len) {
@@ -2947,7 +2581,6 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
         }
     }
     if (!target_pic) return;
-    gboolean is_extra_card = is_monster && is_extra_type;
     slot_set_is_extra(target_pic, is_extra_card);
     // 存储 card_id 用于统计
     if (pv->cid > 0) {
@@ -2959,6 +2592,7 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
     }
     // 存储英文卡名（GENESYS 分值查找用）
     slot_set_en_name(target_pic, pv->en_name);
+    slot_set_card_details(target_pic, pv->type, pv->sheet_name);
     if (pv->id > 0) {
         // 优先尝试从右栏行中获取已加载的缩略图（零延迟）
         GdkPixbuf *right_pixbuf = NULL;
@@ -2970,7 +2604,7 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
                     GtkWidget *picture = gtk_stack_get_child_by_name(GTK_STACK(thumb_stack), "picture");
                     if (picture && GTK_IS_DRAWING_AREA(picture)) {
                         GdkPixbuf *pb = slot_get_pixbuf(picture);
-                        if (pb) {
+                        if (pb && slot_get_img_id(picture) == pv->id) {
                             right_pixbuf = g_object_ref(pb);  // 增加引用计数
                         }
                     }
@@ -2994,20 +2628,8 @@ void on_result_row_released(GtkGestureClick *gesture, int n_press, double x, dou
             // 直接复用右栏的缩略图，立即显示（最快）
             slot_set_pixbuf(target_pic, right_pixbuf);
             g_object_unref(right_pixbuf);  // 释放我们增加的引用
-        } else if (pv->is_prerelease) {
-            // 先行卡：异步从本地加载（优化：避免IO阻塞）
-            load_card_image(target_pic, pv->id, ui->session);
         } else {
-            // 尝试从内存缓存加载
-            GdkPixbuf *cached = get_thumb_from_cache(pv->id);
-            if (cached) {
-                slot_set_pixbuf(target_pic, cached);
-                // 注意：get_thumb_from_cache返回缓存持有的引用，不需要unref
-            } else {
-                // 异步检查磁盘缓存（点击路径，避免主线程 IO），
-                // 未命中时由加载回调按原语义回退到网络加载
-                start_disk_cache_load(target_pic, NULL, ui->session, pv->id, TRUE, TRUE, NULL, NULL);
-            }
+            load_card_image(target_pic, pv->id, ui->session);
         }
     }
     update_genesys_score(ui);
@@ -3191,7 +2813,7 @@ static void on_slot_enter(GtkEventControllerMotion *controller, double x, double
         return;
     }
 
-    if (ui_is_english() && load_offline_data_switch_state() && offline_data_exists()) {
+    if (ui_is_english() && load_offline_data_switch_state() && offline_data_is_ready()) {
         int cid = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "card_id"));
         JsonObject *card = get_card_by_id_offline(cid);
         if (!card)
@@ -3224,7 +2846,8 @@ static void on_slot_enter(GtkEventControllerMotion *controller, double x, double
 
 // 用于存储下载通知数据
 typedef struct {
-    AdwToastOverlay *toast_overlay;
+    GWeakRef toggle;
+    SearchUI *ui;
 } DownloadDialogData;
 
 // 先行卡更新通知数据
@@ -3242,7 +2865,6 @@ static void on_prerelease_update_complete(PrereleaseUpdateResult result, gpointe
 
     // 更新期间用户取消了“启用先行卡”：不要把刚下载的数据重新留下
     if (!prerelease_auto_update_enabled) {
-        clear_prerelease_data();
         g_free(data);
         return;
     }
@@ -3324,84 +2946,47 @@ static void on_enable_prerelease_action(GSimpleAction *action, GVariant *paramet
 }
 
 // 下载离线数据完成后的回调
-static gboolean on_download_offline_data_complete(gpointer user_data) {
-    DownloadDialogData *data = (DownloadDialogData*)user_data;
-    AdwToastOverlay *toast_overlay = data->toast_overlay;
-    
-    // 显示结果
-    if (offline_data_exists()) {
-        // 使用 toast 显示成功消息
-        if (toast_overlay) {
-            AdwToast *toast = adw_toast_new(TR("下载成功", "Offline card data downloaded"));
-            adw_toast_set_timeout(toast, 2);
-            adw_toast_overlay_add_toast(toast_overlay, toast);
+static void on_download_offline_data_complete(gboolean success, gpointer user_data) {
+    DownloadDialogData *data = user_data;
+    g_autoptr(GObject) toggle = g_weak_ref_get(&data->toggle);
+    if (toggle && g_object_get_data(toggle, "offline-download") == data) {
+        g_object_set_data(toggle, "offline-download", NULL);
+        if (success) {
+            refresh_imported_deck(data->ui);
+            refresh_search_result_rules(data->ui);
         }
-        g_message("Offline data downloaded and extracted successfully");
-    } else {
-        // 使用 toast 显示失败消息
-        if (toast_overlay) {
-            AdwToast *toast = adw_toast_new(TR("下载失败", "Could not download offline card data"));
-            adw_toast_set_timeout(toast, 2);
-            adw_toast_overlay_add_toast(toast_overlay, toast);
-        }
-        g_warning("Failed to download offline data");
+        show_status_toast(data->ui, success
+            ? TR("下载成功", "Offline card data downloaded")
+            : TR("下载失败", "Could not download offline card data"));
     }
-    
-    // 释放数据结构
+    g_weak_ref_clear(&data->toggle);
     g_free(data);
-    
-    return G_SOURCE_REMOVE;
 }
 
-// 离线数据 Switch 状态改变回调
 static void on_offline_data_switch_changed(GtkSwitch *switch_widget, GParamSpec *pspec, gpointer user_data) {
     (void)pspec;
-    SearchUI *ui = (SearchUI*)user_data;
-    
-    if (!ui) return;
-    
+    SearchUI *ui = user_data;
     gboolean active = gtk_switch_get_active(switch_widget);
-
-    // 无论离线数据当前是否存在，开关状态变化都应立即持久化
+    gboolean exists = offline_data_exists();
     save_offline_data_switch_state(active);
-    if (!active) {
-        reset_filter_state();
-    }
-    
-    if (active && !offline_data_exists()) {
-        // 从关闭改为开启：下载离线数据
-        g_message("Starting offline data download...");
-        
-        // 创建数据结构，仅传递 toast_overlay 引用
-        DownloadDialogData *data = g_new(DownloadDialogData, 1);
-        data->toast_overlay = ui->toast_overlay;
-        
-        // 启动后台下载
-        download_offline_data(on_download_offline_data_complete, data);
-        
-    } else if (!active && offline_data_exists()) {
-        // 从开启改为关闭：清理离线数据
-        g_message("Clearing offline data...");
-        
-        if (clear_offline_data()) {
-            // 显示清理成功的 toast
-            if (ui->toast_overlay) {
-                AdwToast *toast = adw_toast_new(TR("已清理离线数据", "Offline data cleared"));
-                adw_toast_set_timeout(toast, 2);
-                adw_toast_overlay_add_toast(ui->toast_overlay, toast);
-            }
-            g_message("Offline data cleared successfully");
-            
-        } else {
-            // 清理失败，恢复开关状态
-            gtk_switch_set_active(switch_widget, TRUE);
-            if (ui->toast_overlay) {
-                AdwToast *toast = adw_toast_new(TR("清理失败", "Could not clear offline data"));
-                adw_toast_set_timeout(toast, 2);
-                adw_toast_overlay_add_toast(ui->toast_overlay, toast);
-            }
-            g_warning("Failed to clear offline data");
+    if (active) {
+        if (!exists) {
+            DownloadDialogData *data = g_new0(DownloadDialogData, 1);
+            data->ui = ui;
+            g_weak_ref_init(&data->toggle, G_OBJECT(switch_widget));
+            g_object_set_data(G_OBJECT(switch_widget), "offline-download", data);
+            download_offline_data(on_download_offline_data_complete, data);
         }
+        return;
+    }
+
+    g_object_set_data(G_OBJECT(switch_widget), "offline-download", NULL);
+    reset_filter_state();
+    if (clear_offline_data()) {
+        if (exists) show_status_toast(ui, TR("已清理离线数据", "Offline data cleared"));
+    } else {
+        gtk_switch_set_active(switch_widget, TRUE);
+        show_status_toast(ui, TR("清理失败", "Could not clear offline data"));
     }
 }
 
@@ -3426,15 +3011,6 @@ static void on_show_prerelease_action(GSimpleAction *action, GVariant *parameter
     list_clear(GTK_LIST_BOX(ui->list));
     
     // 清理旧的图片加载队列和定时器
-    if (ui->search_image_loader_id > 0) {
-        g_source_remove(ui->search_image_loader_id);
-        ui->search_image_loader_id = 0;
-    }
-    if (ui->search_image_queue) {
-        g_ptr_array_free(ui->search_image_queue, TRUE);
-        ui->search_image_queue = NULL;
-    }
-    ui->search_image_queue_pos = 0;
     if (ui->pending_results) {
         g_ptr_array_free(ui->pending_results, TRUE);
         ui->pending_results = NULL;
@@ -3481,15 +3057,6 @@ static void on_show_forbidden_changes_action(GSimpleAction *action, GVariant *pa
     // 先清空当前结果和图片加载队列；同时推进搜索代次作废在飞行中的搜索
     ui->search_generation++;
     list_clear(GTK_LIST_BOX(ui->list));
-    if (ui->search_image_loader_id > 0) {
-        g_source_remove(ui->search_image_loader_id);
-        ui->search_image_loader_id = 0;
-    }
-    if (ui->search_image_queue) {
-        g_ptr_array_free(ui->search_image_queue, TRUE);
-        ui->search_image_queue = NULL;
-    }
-    ui->search_image_queue_pos = 0;
     if (ui->pending_results) {
         g_ptr_array_free(ui->pending_results, TRUE);
         ui->pending_results = NULL;
@@ -3696,8 +3263,37 @@ static void refresh_main_language(SearchUI *ui) {
     refresh_card_preview_text(ui);
 }
 
+static void on_banlist_saved(GObject *window, const char *filename) {
+    SearchUI *ui = g_object_get_data(window, "search-ui");
+    const char *files[] = {
+        "ocg_forbidden.json", "tcg_forbidden.json", "ae_forbidden.json",
+        "sc_forbidden.json", "genesys_forbidden.json"
+    };
+    GHashTable **tables[] = {
+        &ui->ocg_forbidden, &ui->tcg_forbidden, &ui->ae_forbidden,
+        &ui->sc_forbidden, &ui->genesys_forbidden
+    };
+
+    for (guint i = 0; i < G_N_ELEMENTS(files); i++) {
+        if (!g_str_equal(files[i], filename)) continue;
+
+        g_autofree char *path = get_forbidden_list_path(filename);
+        GHashTable *table = path ? load_forbidden_list(path) : NULL;
+        if (!table) return;
+
+        g_clear_pointer(tables[i], g_hash_table_unref);
+        *tables[i] = table;
+        if (gtk_drop_down_get_selected(ui->forbidden_dropdown) == i) {
+            update_genesys_score(ui);
+            update_deck_overlays(ui);
+            refresh_search_result_rules(ui);
+        }
+        return;
+    }
+}
+
 static void
-on_activate(GApplication *app, gpointer user_data)
+create_main_window(GApplication *app, gpointer user_data)
 {
     (void)user_data;
     
@@ -3869,6 +3465,7 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_widget_set_halign(left_spinner, GTK_ALIGN_CENTER);
     gtk_widget_set_visible(left_spinner, FALSE);
     gtk_overlay_add_overlay(GTK_OVERLAY(left_placeholder), left_spinner);
+    g_object_set_data(G_OBJECT(left_stack), "image-spinner", left_spinner);
     g_object_bind_property(left_spinner, "visible", preview_hint, "visible",
                            G_BINDING_SYNC_CREATE | G_BINDING_INVERT_BOOLEAN);
     gtk_stack_add_named(GTK_STACK(left_stack), left_placeholder, "placeholder");
@@ -3969,9 +3566,7 @@ on_activate(GApplication *app, gpointer user_data)
     // 如果开关是开启状态，启动时检查更新
     if (actual_state) {
         g_message("Offline data switch is ON, checking for updates...");
-        check_offline_data_update(NULL, NULL);
-        // 预热离线数据解析缓存（后台线程），减少第一次搜索卡顿
-        offline_data_warm_cache_async();
+        check_offline_data_update();
     }
     gtk_box_append(GTK_BOX(offline_data_box), offline_data_switch);
     GtkWidget *rules_label = gtk_label_new(NULL);
@@ -4160,12 +3755,6 @@ on_activate(GApplication *app, gpointer user_data)
     sui->left_stack = GTK_STACK(left_stack);
     sui->left_picture = GTK_PICTURE(left_picture);
     sui->left_label = GTK_LABEL(left_label);
-    sui->left_spinner = GTK_SPINNER(left_spinner);
-    
-    // 初始化图片加载队列
-    sui->search_image_queue = NULL;
-    sui->search_image_queue_pos = 0;
-    sui->search_image_loader_id = 0;
     
     // 初始化批量渲染队列
     sui->pending_results = NULL;
@@ -4180,17 +3769,6 @@ on_activate(GApplication *app, gpointer user_data)
     sui->app_menu = GTK_MENU_BUTTON(app_menu_button);
     sui->import_menu = GTK_MENU_BUTTON(import_button);
     sui->export_menu = GTK_MENU_BUTTON(export_button);
-    
-    // 启动后台更新禁限卡表（先下载）
-    startup_update_ocg_forbidden();
-    startup_update_tcg_forbidden();
-    startup_update_ae_forbidden();
-    startup_update_sc_forbidden();
-    startup_update_genesys_forbidden();
-    startup_update_ocg_forbidden_changes();
-    startup_update_tcg_forbidden_changes();
-    startup_update_ae_forbidden_changes();
-    startup_update_sc_forbidden_changes();
     
     // 加载禁限卡表（从配置目录）
     gchar *ocg_path = get_forbidden_list_path("ocg_forbidden.json");
@@ -4319,6 +3897,7 @@ on_activate(GApplication *app, gpointer user_data)
     gtk_widget_set_margin_end(sui->list, 12);
     gtk_widget_set_margin_bottom(sui->list, 12);
     gtk_scrolled_window_set_child(GTK_SCROLLED_WINDOW(scroller), sui->list);
+    search_ui_watch_viewport(sui, gtk_scrolled_window_get_vadjustment(GTK_SCROLLED_WINDOW(scroller)));
     // 异画缓存可能在首次搜索之后才生成；就绪后自动刷新结果
     search_ui_watch_alt_art(sui);
 
@@ -4379,12 +3958,36 @@ on_activate(GApplication *app, gpointer user_data)
 
     refresh_main_language(sui);
     gtk_window_present(GTK_WINDOW(win));
+    g_object_set_data(G_OBJECT(win), "search-ui", sui);
+    startup_update_banlists(G_OBJECT(win), on_banlist_saved);
 
     // 启用后每次启动自动检查先行卡更新（ETag 未变化时不会重复下载）
     if (prerelease_auto_update_enabled) {
         g_message("Pre-release auto-update is enabled, checking for updates...");
         start_prerelease_update(sui, FALSE);
     }
+}
+
+static void on_offline_cache_prepared(GObject *source, GAsyncResult *result, gpointer user_data) {
+    (void)user_data;
+    GApplication *app = G_APPLICATION(source);
+    g_task_propagate_boolean(G_TASK(result), NULL);
+    g_object_set_data(source, "preparing-offline-cache", NULL);
+    create_main_window(app, NULL);
+    g_application_release(app);
+}
+
+static void on_activate(GApplication *app, gpointer user_data) {
+    (void)user_data;
+    if (gtk_application_get_active_window(GTK_APPLICATION(app))) {
+        create_main_window(app, NULL);
+        return;
+    }
+    if (g_object_get_data(G_OBJECT(app), "preparing-offline-cache")) return;
+
+    g_object_set_data(G_OBJECT(app), "preparing-offline-cache", GINT_TO_POINTER(1));
+    g_application_hold(app);
+    offline_data_warm_cache_async(G_OBJECT(app), on_offline_cache_prepared);
 }
 
 int

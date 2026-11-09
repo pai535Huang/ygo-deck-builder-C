@@ -42,6 +42,12 @@ const char *card_original_name(JsonObject *card) {
     return card_english_name(card);
 }
 
+const char *card_deck_sheet_name(JsonObject *card) {
+    const char *name = card_string(card, "jp_name");
+    if (!name) name = card_string(card, "cn_name");
+    return name ? name : card_original_name(card);
+}
+
 const char *card_name_for_language(const char *original, const char *english) {
     return ui_is_english() && english ? english : original;
 }

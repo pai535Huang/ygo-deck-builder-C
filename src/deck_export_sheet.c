@@ -1,12 +1,15 @@
 #include "deck_export_sheet.h"
 
 #include "offline_data.h"
+#include "card_language.h"
+#include "deck_slot.h"
 #include "pixbuf_utils.h"
 #include <cairo-pdf.h>
 #include <pango/pangocairo.h>
 #include <ctype.h>
 #include <string.h>
 
+#define TYPE_MONSTER 0x1u
 #define TYPE_SPELL 0x2u
 #define TYPE_TRAP  0x4u
 
@@ -68,27 +71,6 @@ static int compare_deck_card_count(gconstpointer a, gconstpointer b) {
     return left->card_id - right->card_id;
 }
 
-static char* pick_card_name_from_card(JsonObject *card_obj) {
-    if (!card_obj) return NULL;
-
-    if (json_object_has_member(card_obj, "jp_name")) {
-        const char *name_text = json_object_get_string_member(card_obj, "jp_name");
-        if (name_text && *name_text) return g_strdup(name_text);
-    }
-
-    if (json_object_has_member(card_obj, "cn_name")) {
-        const char *cn = json_object_get_string_member(card_obj, "cn_name");
-        if (cn && *cn) return g_strdup(cn);
-    }
-
-    if (json_object_has_member(card_obj, "en_name")) {
-        const char *en = json_object_get_string_member(card_obj, "en_name");
-        if (en && *en) return g_strdup(en);
-    }
-
-    return NULL;
-}
-
 static uint32_t pick_type_from_card(JsonObject *card_obj) {
     if (!card_obj) return 0;
 
@@ -106,27 +88,25 @@ static uint32_t pick_type_from_card(JsonObject *card_obj) {
     return 0;
 }
 
-static gboolean lookup_card_meta(int card_id, int img_id, char **out_card_name, uint32_t *out_type) {
-    JsonObject *card_obj = NULL;
+static char *lookup_card_meta(GtkWidget *slot, int card_id, int img_id, uint32_t *type) {
+    const char *name = slot_get_sheet_name(slot);
+    if (type) *type = slot_get_card_type(slot);
+    if (name && (!type || *type)) return g_strdup(name);
 
-    if (card_id > 0) {
-        card_obj = get_card_by_id_offline(card_id);
-    }
+    g_autoptr(JsonObject) card = get_card_by_id_offline(card_id);
+    if (!card && img_id != card_id)
+        card = get_card_by_id_offline(img_id);
 
-    if (!card_obj && img_id > 0 && img_id != card_id) {
-        card_obj = get_card_by_id_offline(img_id);
-    }
+    if (type && !*type) *type = pick_type_from_card(card);
+    if (!name) name = card_deck_sheet_name(card);
+    if (!name) name = slot_get_en_name(slot);
+    return g_strdup(name);
+}
 
-    if (!card_obj) {
-        *out_card_name = NULL;
-        *out_type = 0;
-        return FALSE;
-    }
-
-    *out_card_name = pick_card_name_from_card(card_obj);
-    *out_type = pick_type_from_card(card_obj);
-    json_object_unref(card_obj);
-    return TRUE;
+static gboolean missing_card_details(GError **error, int id) {
+    g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                "Deck sheet card details unavailable for %d", id);
+    return FALSE;
 }
 
 static void add_card_count_entry(GHashTable *map, GPtrArray *array, int card_id, const char *card_name) {
@@ -144,7 +124,7 @@ static void add_card_count_entry(GHashTable *map, GPtrArray *array, int card_id,
     g_ptr_array_add(array, entry);
 }
 
-static void collect_main_cards(
+static gboolean collect_main_cards(
     GPtrArray *main_pics,
     int main_count,
     GPtrArray *monster,
@@ -152,72 +132,61 @@ static void collect_main_cards(
     GPtrArray *trap,
     GHashTable *monster_map,
     GHashTable *spell_map,
-    GHashTable *trap_map
+    GHashTable *trap_map,
+    GError **error
 ) {
-    if (!main_pics) return;
+    if (!main_pics) return TRUE;
 
     int max = MIN(main_count, (int)main_pics->len);
     for (int i = 0; i < max; i++) {
-        GtkWidget *slot = GTK_WIDGET(g_ptr_array_index(main_pics, i));
+        GtkWidget *slot = g_ptr_array_index(main_pics, i);
         if (!slot) continue;
 
-        int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(slot), "img_id"));
+        int img_id = slot_get_img_id(slot);
         int card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(slot), "card_id"));
         if (img_id <= 0 && card_id <= 0) continue;
 
         int lookup_id = card_id > 0 ? card_id : img_id;
-        char *card_name = NULL;
-        uint32_t type = 0;
-        lookup_card_meta(lookup_id, img_id, &card_name, &type);
+        uint32_t type;
+        g_autofree char *name = lookup_card_meta(slot, lookup_id, img_id, &type);
+        if (!name || !*name || !(type & (TYPE_MONSTER | TYPE_SPELL | TYPE_TRAP)))
+            return missing_card_details(error, img_id > 0 ? img_id : lookup_id);
 
-        if (!card_name || !*card_name) {
-            g_free(card_name);
-            card_name = g_strdup_printf("%d", img_id > 0 ? img_id : lookup_id);
-        }
-
-        if (type & TYPE_SPELL) {
-            add_card_count_entry(spell_map, spell, lookup_id, card_name);
-        } else if (type & TYPE_TRAP) {
-            add_card_count_entry(trap_map, trap, lookup_id, card_name);
-        } else {
-            add_card_count_entry(monster_map, monster, lookup_id, card_name);
-        }
-
-        g_free(card_name);
+        if (type & TYPE_SPELL)
+            add_card_count_entry(spell_map, spell, lookup_id, name);
+        else if (type & TYPE_TRAP)
+            add_card_count_entry(trap_map, trap, lookup_id, name);
+        else
+            add_card_count_entry(monster_map, monster, lookup_id, name);
     }
+    return TRUE;
 }
 
-static void collect_generic_cards(
+static gboolean collect_generic_cards(
     GPtrArray *pics,
     int count,
     GPtrArray *target,
-    GHashTable *target_map
+    GHashTable *target_map,
+    GError **error
 ) {
-    if (!pics) return;
+    if (!pics) return TRUE;
 
     int max = MIN(count, (int)pics->len);
     for (int i = 0; i < max; i++) {
-        GtkWidget *slot = GTK_WIDGET(g_ptr_array_index(pics, i));
+        GtkWidget *slot = g_ptr_array_index(pics, i);
         if (!slot) continue;
 
-        int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(slot), "img_id"));
+        int img_id = slot_get_img_id(slot);
         int card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(slot), "card_id"));
         if (img_id <= 0 && card_id <= 0) continue;
 
         int lookup_id = card_id > 0 ? card_id : img_id;
-        char *card_name = NULL;
-        uint32_t type = 0;
-        lookup_card_meta(lookup_id, img_id, &card_name, &type);
-        (void)type;
-
-        if (!card_name || !*card_name) {
-            g_free(card_name);
-            card_name = g_strdup_printf("%d", img_id > 0 ? img_id : lookup_id);
-        }
-
-        add_card_count_entry(target_map, target, lookup_id, card_name);
-        g_free(card_name);
+        g_autofree char *name = lookup_card_meta(slot, lookup_id, img_id, NULL);
+        if (!name || !*name)
+            return missing_card_details(error, img_id > 0 ? img_id : lookup_id);
+        add_card_count_entry(target_map, target, lookup_id, name);
     }
+    return TRUE;
 }
 
 static void draw_name_cell(cairo_t *cr, const char *text, double x, double baseline_y, double max_width) {
@@ -292,6 +261,20 @@ static void draw_single_column_entries(
 
         draw_name_cell(cr, entry->card_name, name_x, baseline_y, 140.0);
         draw_qty_cell(cr, entry->count, qty_cell_left, qty_cell_right, qty_center_y);
+    }
+}
+
+static void draw_overflow_column(cairo_t *cr, GPtrArray *entries, const char *heading,
+                                 double name_x, double qty_left, double qty_right) {
+    if (entries->len <= 32) return;
+
+    cairo_move_to(cr, name_x, 65);
+    cairo_show_text(cr, heading);
+    for (guint i = 32; i < entries->len; i++) {
+        DeckCardCount *entry = g_ptr_array_index(entries, i);
+        double baseline = 85 + (i - 32) * 17;
+        draw_name_cell(cr, entry->card_name, name_x, baseline, 140);
+        draw_qty_cell(cr, entry->count, qty_left, qty_right, baseline - 3);
     }
 }
 
@@ -372,21 +355,23 @@ gboolean generate_deck_sheet_pdf(
         return FALSE;
     }
 
-    GPtrArray *monster = g_ptr_array_new_with_free_func(deck_card_count_free);
-    GPtrArray *spell = g_ptr_array_new_with_free_func(deck_card_count_free);
-    GPtrArray *trap = g_ptr_array_new_with_free_func(deck_card_count_free);
-    GPtrArray *extra = g_ptr_array_new_with_free_func(deck_card_count_free);
-    GPtrArray *side = g_ptr_array_new_with_free_func(deck_card_count_free);
+    g_autoptr(GPtrArray) monster = g_ptr_array_new_with_free_func(deck_card_count_free);
+    g_autoptr(GPtrArray) spell = g_ptr_array_new_with_free_func(deck_card_count_free);
+    g_autoptr(GPtrArray) trap = g_ptr_array_new_with_free_func(deck_card_count_free);
+    g_autoptr(GPtrArray) extra = g_ptr_array_new_with_free_func(deck_card_count_free);
+    g_autoptr(GPtrArray) side = g_ptr_array_new_with_free_func(deck_card_count_free);
 
-    GHashTable *monster_map = g_hash_table_new(g_direct_hash, g_direct_equal);
-    GHashTable *spell_map = g_hash_table_new(g_direct_hash, g_direct_equal);
-    GHashTable *trap_map = g_hash_table_new(g_direct_hash, g_direct_equal);
-    GHashTable *extra_map = g_hash_table_new(g_direct_hash, g_direct_equal);
-    GHashTable *side_map = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_autoptr(GHashTable) monster_map = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_autoptr(GHashTable) spell_map = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_autoptr(GHashTable) trap_map = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_autoptr(GHashTable) extra_map = g_hash_table_new(g_direct_hash, g_direct_equal);
+    g_autoptr(GHashTable) side_map = g_hash_table_new(g_direct_hash, g_direct_equal);
 
-    collect_main_cards(main_pics, main_count, monster, spell, trap, monster_map, spell_map, trap_map);
-    collect_generic_cards(extra_pics, extra_count, extra, extra_map);
-    collect_generic_cards(side_pics, side_count, side, side_map);
+    if (!collect_main_cards(main_pics, main_count, monster, spell, trap,
+                            monster_map, spell_map, trap_map, error) ||
+        !collect_generic_cards(extra_pics, extra_count, extra, extra_map, error) ||
+        !collect_generic_cards(side_pics, side_count, side, side_map, error))
+        return FALSE;
 
     g_ptr_array_sort(monster, compare_deck_card_count);
     g_ptr_array_sort(spell, compare_deck_card_count);
@@ -406,16 +391,6 @@ gboolean generate_deck_sheet_pdf(
                     "创建 PDF 失败: %s",
                     cairo_status_to_string(surface_status));
         cairo_surface_destroy(surface);
-        g_hash_table_destroy(monster_map);
-        g_hash_table_destroy(spell_map);
-        g_hash_table_destroy(trap_map);
-        g_hash_table_destroy(extra_map);
-        g_hash_table_destroy(side_map);
-        g_ptr_array_unref(monster);
-        g_ptr_array_unref(spell);
-        g_ptr_array_unref(trap);
-        g_ptr_array_unref(extra);
-        g_ptr_array_unref(side);
         return FALSE;
     }
 
@@ -423,16 +398,6 @@ gboolean generate_deck_sheet_pdf(
     if (!load_and_draw_template(cr, error)) {
         cairo_destroy(cr);
         cairo_surface_destroy(surface);
-        g_hash_table_destroy(monster_map);
-        g_hash_table_destroy(spell_map);
-        g_hash_table_destroy(trap_map);
-        g_hash_table_destroy(extra_map);
-        g_hash_table_destroy(side_map);
-        g_ptr_array_unref(monster);
-        g_ptr_array_unref(spell);
-        g_ptr_array_unref(trap);
-        g_ptr_array_unref(extra);
-        g_ptr_array_unref(side);
         return FALSE;
     }
 
@@ -519,22 +484,22 @@ gboolean generate_deck_sheet_pdf(
     cairo_show_text(cr, stat_buf);
 
     cairo_show_page(cr);
+    if (monster->len > 32 || spell->len > 32 || trap->len > 32) {
+        cairo_set_font_size(cr, 13);
+        cairo_move_to(cr, MONSTER_NAME_X, 42);
+        cairo_show_text(cr, "Main Deck (continued)");
+        cairo_set_font_size(cr, 8.8);
+        draw_overflow_column(cr, monster, "Monsters", MONSTER_NAME_X, 161.3, 187.2);
+        draw_overflow_column(cr, spell, "Spells", SPELL_NAME_X, 331.7, 357.6);
+        draw_overflow_column(cr, trap, "Traps", TRAP_NAME_X, 501.6, 527.0);
+        cairo_show_page(cr);
+    }
     cairo_destroy(cr);
 
     cairo_surface_finish(surface);
     cairo_status_t final_status = cairo_surface_status(surface);
     cairo_surface_destroy(surface);
 
-    g_hash_table_destroy(monster_map);
-    g_hash_table_destroy(spell_map);
-    g_hash_table_destroy(trap_map);
-    g_hash_table_destroy(extra_map);
-    g_hash_table_destroy(side_map);
-    g_ptr_array_unref(monster);
-    g_ptr_array_unref(spell);
-    g_ptr_array_unref(trap);
-    g_ptr_array_unref(extra);
-    g_ptr_array_unref(side);
 
     if (final_status != CAIRO_STATUS_SUCCESS) {
         g_set_error(error,

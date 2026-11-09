@@ -54,14 +54,64 @@ void slot_set_en_name(GtkWidget *pic, const char *en_name) {
                            en_name ? (GDestroyNotify)g_free : NULL);
 }
 
-// 查找第一个空槽位
-int array_find_first_empty(GPtrArray *pics) {
-    if (!pics) return -1;
-    for (guint i = 0; i < pics->len; ++i) {
-        GtkWidget *w = GTK_WIDGET(g_ptr_array_index(pics, i));
-        if (w && slot_get_pixbuf(w) == NULL) return (int)i;
-    }
-    return -1;
+int slot_get_img_id(GtkWidget *slot) {
+    return GPOINTER_TO_INT(g_object_get_data(G_OBJECT(slot), "img_id"));
+}
+
+uint32_t slot_get_card_type(GtkWidget *slot) {
+    return GPOINTER_TO_UINT(g_object_get_data(G_OBJECT(slot), "card-type"));
+}
+
+const char *slot_get_sheet_name(GtkWidget *slot) {
+    return g_object_get_data(G_OBJECT(slot), "sheet-name");
+}
+
+void slot_set_card_details(GtkWidget *slot, uint32_t type, const char *sheet_name) {
+    g_object_set_data(G_OBJECT(slot), "card-type", GUINT_TO_POINTER(type));
+    g_object_set_data_full(G_OBJECT(slot), "sheet-name",
+                           sheet_name && *sheet_name ? g_strdup(sheet_name) : NULL, g_free);
+}
+
+static void slot_set_card(GtkWidget *slot, int img_id, gpointer card_id,
+                          gboolean is_extra, const char *name, GdkPixbuf *pixbuf,
+                          gpointer needs_metadata) {
+    g_object_set_data(G_OBJECT(slot), "img_id", GINT_TO_POINTER(img_id));
+    g_object_set_data(G_OBJECT(slot), "card_id", card_id);
+    slot_set_is_extra(slot, is_extra);
+    slot_set_en_name(slot, name);
+    slot_set_pixbuf(slot, pixbuf);
+    g_object_set_data(G_OBJECT(slot), "needs-card-metadata", needs_metadata);
+}
+
+void slot_clear_card(GtkWidget *slot) {
+    slot_set_card(slot, 0, NULL, FALSE, NULL, NULL, NULL);
+    slot_set_card_details(slot, 0, NULL);
+}
+
+static void slot_copy_card(GtkWidget *target, GtkWidget *source) {
+    slot_set_card(target, slot_get_img_id(source),
+                  g_object_get_data(G_OBJECT(source), "card_id"),
+                  slot_get_is_extra(source), slot_get_en_name(source),
+                  slot_get_pixbuf(source),
+                  g_object_get_data(G_OBJECT(source), "needs-card-metadata"));
+    slot_set_card_details(target, slot_get_card_type(source), slot_get_sheet_name(source));
+}
+
+void slot_swap_cards(GtkWidget *first, GtkWidget *second) {
+    if (first == second) return;
+    int img_id = slot_get_img_id(first);
+    gpointer card_id = g_object_get_data(G_OBJECT(first), "card_id");
+    gboolean is_extra = slot_get_is_extra(first);
+    g_autofree char *name = g_strdup(slot_get_en_name(first));
+    g_autoptr(GdkPixbuf) pixbuf = slot_get_pixbuf(first);
+    if (pixbuf) g_object_ref(pixbuf);
+
+    gpointer needs_metadata = g_object_get_data(G_OBJECT(first), "needs-card-metadata");
+    uint32_t type = slot_get_card_type(first);
+    g_autofree char *sheet_name = g_strdup(slot_get_sheet_name(first));
+    slot_copy_card(first, second);
+    slot_set_card(second, img_id, card_id, is_extra, name, pixbuf, needs_metadata);
+    slot_set_card_details(second, type, sheet_name);
 }
 
 // 更新计数标签
@@ -77,27 +127,8 @@ void shift_delete_slots(GPtrArray *pics, int *count_ptr, int del_index) {
     if (!pics || !count_ptr) return;
     int count = *count_ptr;
     if (del_index < 0 || del_index >= count) return;
-    for (int i = del_index; i < count - 1; ++i) {
-        GtkWidget *dst = GTK_WIDGET(g_ptr_array_index(pics, i));
-        GtkWidget *src = GTK_WIDGET(g_ptr_array_index(pics, i + 1));
-        GdkPixbuf *pb = slot_get_pixbuf(src);
-        slot_set_pixbuf(dst, pb);
-        slot_set_is_extra(dst, slot_get_is_extra(src));
-        int card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(src), "card_id"));
-        g_object_set_data(G_OBJECT(dst), "card_id", GINT_TO_POINTER(card_id));
-        int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(src), "img_id"));
-        g_object_set_data(G_OBJECT(dst), "img_id", GINT_TO_POINTER(img_id));
-        slot_set_en_name(dst, slot_get_en_name(src));
-    }
-    // 清空最后一个原已填槽
-    if (count > 0) {
-        GtkWidget *last = GTK_WIDGET(g_ptr_array_index(pics, count - 1));
-        slot_set_pixbuf(last, NULL);
-        slot_set_is_extra(last, FALSE);
-        g_object_set_data(G_OBJECT(last), "card_id", GINT_TO_POINTER(0));
-        g_object_set_data(G_OBJECT(last), "img_id", GINT_TO_POINTER(0));
-        slot_set_en_name(last, NULL);
-    }
+    array_shift_left(pics, del_index, count - 1);
+    slot_clear_card(g_ptr_array_index(pics, count - 1));
     *count_ptr = count - 1;
 }
 
@@ -111,14 +142,7 @@ void array_shift_right(GPtrArray *pics, int start, int end) {
     for (int i = end; i > start; --i) {
         GtkWidget *dst = GTK_WIDGET(g_ptr_array_index(pics, i));
         GtkWidget *src = GTK_WIDGET(g_ptr_array_index(pics, i - 1));
-        GdkPixbuf *pb = slot_get_pixbuf(src);
-        slot_set_pixbuf(dst, pb);
-        slot_set_is_extra(dst, slot_get_is_extra(src));
-        int card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(src), "card_id"));
-        g_object_set_data(G_OBJECT(dst), "card_id", GINT_TO_POINTER(card_id));
-        int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(src), "img_id"));
-        g_object_set_data(G_OBJECT(dst), "img_id", GINT_TO_POINTER(img_id));
-        slot_set_en_name(dst, slot_get_en_name(src));
+        slot_copy_card(dst, src);
     }
 }
 
@@ -132,13 +156,6 @@ void array_shift_left(GPtrArray *pics, int start, int end) {
     for (int i = start; i < end; ++i) {
         GtkWidget *dst = GTK_WIDGET(g_ptr_array_index(pics, i));
         GtkWidget *src = GTK_WIDGET(g_ptr_array_index(pics, i + 1));
-        GdkPixbuf *pb = slot_get_pixbuf(src);
-        slot_set_pixbuf(dst, pb);
-        slot_set_is_extra(dst, slot_get_is_extra(src));
-        int card_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(src), "card_id"));
-        g_object_set_data(G_OBJECT(dst), "card_id", GINT_TO_POINTER(card_id));
-        int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(src), "img_id"));
-        g_object_set_data(G_OBJECT(dst), "img_id", GINT_TO_POINTER(img_id));
-        slot_set_en_name(dst, slot_get_en_name(src));
+        slot_copy_card(dst, src);
     }
 }

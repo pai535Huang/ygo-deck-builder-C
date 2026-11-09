@@ -7,6 +7,8 @@
 #include "alt_art.h"
 #include "app_path.h"
 #include "prefs.h"
+#include "card_language.h"
+#include "card_info.h"
 #include <glib/gstdio.h>
 #include <stdio.h>
 #include <string.h>
@@ -17,65 +19,97 @@
 // main.c：为槽位异步加载卡图（含先行卡本地异步读、内存/磁盘缓存、网络回退）
 extern void load_card_image(GtkWidget *slot, int img_id, SoupSession *session);
 
-// 导出卡组为YDK文件
-void export_deck_to_ydk(
+static void append_ydk_region(GString *deck, const char *section,
+                              GPtrArray *slots, int count) {
+    g_string_append(deck, section);
+    for (int i = 0; slots && i < count && i < (int)slots->len; i++) {
+        int id = slot_get_img_id(g_ptr_array_index(slots, i));
+        if (id > 0) g_string_append_printf(deck, "%d\n", id);
+    }
+}
+
+gboolean export_deck_to_ydk(
     GPtrArray *main_pics, int main_count,
     GPtrArray *extra_pics, int extra_count,
     GPtrArray *side_pics, int side_count,
-    const char *filepath
+    const char *filepath, GError **error
 ) {
-    if (!filepath) return;
-    
-    FILE *f = g_fopen(filepath, "w");
-    if (!f) {
-        g_warning("无法创建文件: %s", filepath);
-        return;
+    if (!filepath || !*filepath ||
+        (g_file_test(filepath, G_FILE_TEST_EXISTS) &&
+         !g_file_test(filepath, G_FILE_TEST_IS_REGULAR))) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT,
+                            "The export destination must be a regular file");
+        return FALSE;
     }
-    
-    // 写入文件头
-    fprintf(f, "#created by ygo-deck-builder\n");
-    
-    // 写入Main卡组
-    fprintf(f, "#main\n");
-    if (main_pics) {
-        for (int i = 0; i < main_count && i < (int)main_pics->len; i++) {
-            GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(main_pics, i));
-            int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "img_id"));
-            if (img_id > 0) {
-                fprintf(f, "%d\n", img_id);
-            }
-        }
-    }
-    
-    // 写入Extra卡组
-    fprintf(f, "#extra\n");
-    if (extra_pics) {
-        for (int i = 0; i < extra_count && i < (int)extra_pics->len; i++) {
-            GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(extra_pics, i));
-            int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "img_id"));
-            if (img_id > 0) {
-                fprintf(f, "%d\n", img_id);
-            }
-        }
-    }
-    
-    // 写入Side卡组
-    fprintf(f, "!side\n");
-    if (side_pics) {
-        for (int i = 0; i < side_count && i < (int)side_pics->len; i++) {
-            GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(side_pics, i));
-            int img_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "img_id"));
-            if (img_id > 0) {
-                fprintf(f, "%d\n", img_id);
-            }
-        }
-    }
-    
-    fclose(f);
-    g_print("卡组已导出到: %s\n", filepath);
+
+    g_autoptr(GString) deck = g_string_new("#created by ygo-deck-builder\n");
+    append_ydk_region(deck, "#main\n", main_pics, main_count);
+    append_ydk_region(deck, "#extra\n", extra_pics, extra_count);
+    append_ydk_region(deck, "!side\n", side_pics, side_count);
+    return g_file_set_contents_full(filepath, deck->str, deck->len,
+                                    G_FILE_SET_CONTENTS_CONSISTENT |
+                                    G_FILE_SET_CONTENTS_DURABLE, 0666, error);
 }
 
-// 从YDK文件导入卡组
+gboolean deck_apply_card_metadata(GtkWidget *slot, JsonObject *card) {
+    if (!card) return FALSE;
+    JsonNode *type_node = json_object_get_member(card, "type");
+    if (!type_node) {
+        JsonNode *data = json_object_get_member(card, "data");
+        if (data && JSON_NODE_HOLDS_OBJECT(data))
+            type_node = json_object_get_member(json_node_get_object(data), "type");
+    }
+    if (!type_node || json_node_get_value_type(type_node) != G_TYPE_INT64) return FALSE;
+    guint32 type = json_node_get_int(type_node);
+    if (!type) return FALSE;
+
+    JsonNode *cid_node = json_object_get_member(card, "cid");
+    if (cid_node && json_node_get_value_type(cid_node) == G_TYPE_INT64) {
+        gint64 cid = json_node_get_int(cid_node);
+        if (cid > 0 && cid <= G_MAXINT)
+            g_object_set_data(G_OBJECT(slot), "card_id", GINT_TO_POINTER((int)cid));
+    }
+    slot_set_en_name(slot, card_english_name(card));
+    slot_set_is_extra(slot, card_type_is_extra(type));
+    slot_set_card_details(slot, type, card_deck_sheet_name(card));
+    g_object_set_data(G_OBJECT(slot), "needs-card-metadata", NULL);
+    return TRUE;
+}
+
+gboolean deck_load_local_card_metadata(GtkWidget *slot) {
+    int img_id = slot_get_img_id(slot);
+    JsonObject *card = find_prerelease_card_by_id(img_id);
+    if (!card) {
+        int cid = offline_get_cid_by_img_id(img_id);
+        if (!cid) cid = offline_get_cid_by_img_id(alt_art_get_base_id(img_id));
+        card = get_card_by_id_offline(cid);
+    }
+    gboolean resolved = deck_apply_card_metadata(slot, card);
+    if (card) json_object_unref(card);
+    return resolved;
+}
+
+void deck_fill_region(GPtrArray *slots, int *count, GtkLabel *label,
+                      const int *ids, int length, gboolean extra, SoupSession *session) {
+    for (int i = 0; i < length; i++) {
+        GtkWidget *slot = g_ptr_array_index(slots, i);
+        int img_id = ids[i];
+        g_object_set_data(G_OBJECT(slot), "img_id", GINT_TO_POINTER(img_id));
+        g_object_set_data(G_OBJECT(slot), "card_id", GINT_TO_POINTER(img_id));
+        slot_set_is_extra(slot, extra);
+
+        if (!deck_load_local_card_metadata(slot)) {
+            const char *region = g_object_get_data(G_OBJECT(slot), "slot_region");
+            int metadata = g_strcmp0(region, "side") == 0
+                ? SLOT_METADATA_TYPE_UNKNOWN : SLOT_METADATA_PENDING;
+            g_object_set_data(G_OBJECT(slot), "needs-card-metadata", GINT_TO_POINTER(metadata));
+        }
+        if (session) load_card_image(slot, img_id, session);
+    }
+    *count = length;
+    update_count_label(label, length);
+}
+
 gboolean import_deck_from_ydk(
     GPtrArray *main_pics, int *main_idx, GtkLabel *main_count,
     GPtrArray *extra_pics, int *extra_idx, GtkLabel *extra_count,
@@ -83,131 +117,62 @@ gboolean import_deck_from_ydk(
     SoupSession *session,
     const char *filepath
 ) {
-    if (!filepath) return FALSE;
-    
-    FILE *f = g_fopen(filepath, "r");
-    if (!f) {
-        g_warning("无法打开文件: %s", filepath);
-        return FALSE;
-    }
-    
-    // 清空当前卡组
-    clear_all_deck_regions(
-        main_pics, main_idx, main_count,
-        extra_pics, extra_idx, extra_count,
-        side_pics, side_idx, side_count
-    );
-    
+    if (!filepath || !g_file_test(filepath, G_FILE_TEST_IS_REGULAR)) return FALSE;
+
+    FILE *file = g_fopen(filepath, "r");
+    if (!file) return FALSE;
+
+    g_autoptr(GArray) main_ids = g_array_new(FALSE, FALSE, sizeof(int));
+    g_autoptr(GArray) extra_ids = g_array_new(FALSE, FALSE, sizeof(int));
+    g_autoptr(GArray) side_ids = g_array_new(FALSE, FALSE, sizeof(int));
+    GArray *section = NULL;
+    guint capacity = 0;
+    gboolean valid = TRUE;
+    gboolean first = TRUE;
     char line[256];
-    enum { SECTION_NONE, SECTION_MAIN, SECTION_EXTRA, SECTION_SIDE } current_section = SECTION_NONE;
-    
-    while (fgets(line, sizeof(line), f)) {
-        // 去除换行符
-        line[strcspn(line, "\r\n")] = 0;
-        
-        // 跳过注释和空行
-        if (line[0] == '#' && strstr(line, "#main") == line) {
-            current_section = SECTION_MAIN;
-            continue;
-        } else if (line[0] == '#' && strstr(line, "#extra") == line) {
-            current_section = SECTION_EXTRA;
-            continue;
-        } else if (line[0] == '!' && strstr(line, "!side") == line) {
-            current_section = SECTION_SIDE;
-            continue;
-        } else if (line[0] == '#' || line[0] == '\0') {
-            continue;
+
+    while (fgets(line, sizeof(line), file)) {
+        if (!strchr(line, '\n') && !feof(file)) {
+            valid = FALSE;
+            break;
         }
-        
-        // 解析卡片ID
-        int img_id = atoi(line);
-        if (img_id <= 0) continue;
-        
-        // 根据当前section添加到相应区域
-        GPtrArray *target_pics = NULL;
-        int *target_idx = NULL;
-        GtkLabel *target_count_label = NULL;
-        gboolean is_extra = FALSE;
-        
-        switch (current_section) {
-            case SECTION_MAIN:
-                if (main_idx && *main_idx < (int)main_pics->len) {
-                    target_pics = main_pics;
-                    target_idx = main_idx;
-                    target_count_label = main_count;
-                } else if (side_idx && *side_idx < (int)side_pics->len) {
-                    // Main满了，放到Side
-                    target_pics = side_pics;
-                    target_idx = side_idx;
-                    target_count_label = side_count;
-                }
+
+        char *entry = line;
+        if (first && g_str_has_prefix(entry, "\xef\xbb\xbf")) entry += 3;
+        first = FALSE;
+        g_strstrip(entry);
+        if (g_str_equal(entry, "#main")) {
+            section = main_ids;
+            capacity = main_pics->len;
+        } else if (g_str_equal(entry, "#extra")) {
+            section = extra_ids;
+            capacity = extra_pics->len;
+        } else if (g_str_equal(entry, "!side")) {
+            section = side_ids;
+            capacity = side_pics->len;
+        } else if (*entry && *entry != '#') {
+            gint64 id;
+            if (!section || section->len >= capacity ||
+                !g_ascii_string_to_signed(entry, 10, 1, G_MAXINT, &id, NULL)) {
+                valid = FALSE;
                 break;
-            case SECTION_EXTRA:
-                if (extra_idx && *extra_idx < (int)extra_pics->len) {
-                    target_pics = extra_pics;
-                    target_idx = extra_idx;
-                    target_count_label = extra_count;
-                    is_extra = TRUE;
-                } else if (side_idx && *side_idx < (int)side_pics->len) {
-                    // Extra满了，放到Side
-                    target_pics = side_pics;
-                    target_idx = side_idx;
-                    target_count_label = side_count;
-                    is_extra = TRUE;
-                }
-                break;
-            case SECTION_SIDE:
-                if (side_idx && *side_idx < (int)side_pics->len) {
-                    target_pics = side_pics;
-                    target_idx = side_idx;
-                    target_count_label = side_count;
-                }
-                break;
-            default:
-                continue;
-        }
-        
-        if (!target_pics || !target_idx) continue;
-        
-        GtkWidget *target_pic = GTK_WIDGET(g_ptr_array_index(target_pics, *target_idx));
-        if (!target_pic || !GTK_IS_WIDGET(target_pic)) continue;
-        
-        slot_set_is_extra(target_pic, is_extra);
-        g_object_set_data(G_OBJECT(target_pic), "img_id", GINT_TO_POINTER(img_id));
-        /* YDK 存的是八位 Konami 码（img_id），要移拿到禁限卡表里需要的短 cid。
-         * 从离线数据库做反向查找，同时获取英文卡名以支持 GENESYS 模式角标。 */
-        int card_cid = offline_get_cid_by_img_id(img_id);
-        if (card_cid <= 0) {
-            // 异画在 ydk 里是独立的密码；映射回本体 cid 才能正确审核同名卡数量
-            int base_img_id = alt_art_get_base_id(img_id);
-            if (base_img_id > 0 && base_img_id != img_id) {
-                card_cid = offline_get_cid_by_img_id(base_img_id);
             }
+            int card_id = id;
+            g_array_append_val(section, card_id);
         }
-        if (card_cid > 0) {
-            g_object_set_data(G_OBJECT(target_pic), "card_id", GINT_TO_POINTER(card_cid));
-            gchar *en_name = offline_get_en_name_by_id(card_cid);
-            if (en_name) {
-                slot_set_en_name(target_pic, en_name);
-                g_free(en_name);
-            }
-        } else {
-            /* 离线库未提供时回落到 img_id（正常卡片不应此路径） */
-            g_object_set_data(G_OBJECT(target_pic), "card_id", GINT_TO_POINTER(img_id));
-        }
-        
-        // 加载卡片图片：统一走 main.c 的完全异步路径。
-        // 此前这里在主线程同步读先行卡本地文件和磁盘缓存，大型卡组导入会卡顿。
-        if (img_id > 0 && session) {
-            load_card_image(target_pic, img_id, session);
-        }
-        
-        (*target_idx)++;
-        update_count_label(target_count_label, *target_idx);
     }
-    
-    fclose(f);
-    g_print("卡组已导入: %s\n", filepath);
+    valid = valid && section && !ferror(file);
+    if (fclose(file) != 0) valid = FALSE;
+    if (!valid) return FALSE;
+
+    clear_all_deck_regions(main_pics, main_idx, main_count, extra_pics, extra_idx,
+                           extra_count, side_pics, side_idx, side_count);
+    deck_fill_region(main_pics, main_idx, main_count, (int *)main_ids->data,
+                     main_ids->len, FALSE, session);
+    deck_fill_region(extra_pics, extra_idx, extra_count, (int *)extra_ids->data,
+                     extra_ids->len, TRUE, session);
+    deck_fill_region(side_pics, side_idx, side_count, (int *)side_ids->data,
+                     side_ids->len, FALSE, session);
     return TRUE;
 }
 

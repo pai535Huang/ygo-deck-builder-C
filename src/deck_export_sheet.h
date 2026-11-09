@@ -6,7 +6,7 @@
 /**
  * 生成官方卡表 PDF。
  * - 使用编译时内嵌资源 /com/pai535/YGODeckBuilder/deck_ja_template.png 作为背景模板
- * - 卡名使用离线数据库中的 jp_name
+ * - 优先使用卡片资料中的日文名；缺少必要资料时返回错误
  * - 填写卡名、数量、各区域统计数以及 Konami ID
  */
 gboolean generate_deck_sheet_pdf(

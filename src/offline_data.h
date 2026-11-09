@@ -1,7 +1,7 @@
 #ifndef OFFLINE_DATA_H
 #define OFFLINE_DATA_H
 
-#include <glib.h>
+#include <gio/gio.h>
 #include <json-glib/json-glib.h>
 
 /**
@@ -13,13 +13,15 @@
  * @param callback 完成后的回调函数，在主线程中调用
  * @param user_data 传递给回调函数的用户数据
  */
-void download_offline_data(GSourceFunc callback, gpointer user_data);
+typedef void (*OfflineDownloadCallback)(gboolean success, gpointer user_data);
+void download_offline_data(OfflineDownloadCallback callback, gpointer user_data);
 
 /**
  * 检查离线数据是否存在
  * @return TRUE如果数据已下载，否则FALSE
  */
 gboolean offline_data_exists(void);
+gboolean offline_data_is_ready(void);
 
 /**
  * 清理离线数据（删除 cards 目录下的所有文件）
@@ -32,10 +34,8 @@ gboolean clear_offline_data(void);
  * 如果本地数据存在，会检查远程 MD5 是否与本地 MD5 不同
  * 如果不同则自动下载更新
  * 此函数会在后台线程中执行，不会阻塞主线程
- * @param callback 完成后的回调函数，在主线程中调用（可选）
- * @param user_data 传递给回调函数的用户数据
  */
-void check_offline_data_update(GSourceFunc callback, gpointer user_data);
+void check_offline_data_update(void);
 
 /**
  * 获取所有离线卡片数据
@@ -54,7 +54,7 @@ guint offline_foreach_card(const char *query,
 						   guint max_results);
 
 // 预热离线 JSON 解析缓存（后台线程）：减少第一次搜索的卡顿。
-void offline_data_warm_cache_async(void);
+void offline_data_warm_cache_async(GObject *owner, GAsyncReadyCallback callback);
 
 // 清空离线 JSON 解析缓存（例如清理/更新离线数据后）。
 void offline_data_clear_cache(void);

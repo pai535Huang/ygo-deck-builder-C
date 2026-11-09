@@ -1,183 +1,173 @@
+#define _POSIX_C_SOURCE 200809L
+
 #include "offline_data.h"
 #include "alt_art.h"
 #include "app_path.h"
-#include "archive_path.h"
+#include "data_directory.h"
+#include <errno.h>
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
-#include <archive.h>
-#include <archive_entry.h>
 #include <stdlib.h>
 #include <string.h>
 #include <glib/gstdio.h>
 
-// 离线 cards.json 解析缓存：避免每次搜索都重新 parse，尤其是第一次搜索会明显卡顿。
+typedef struct {
+    JsonParser *parser;
+    JsonObject *root;
+    GStatBuf file;
+    GHashTable *img_to_cid;
+    GHashTable *name_to_cid;
+    GHashTable *effective_cid;
+} OfflineCardCache;
+
 static GMutex offline_cache_mutex;
-static JsonParser *offline_cards_parser = NULL;
-static JsonObject *offline_cards_root = NULL; // owned by parser->root
-static gchar *offline_cards_json_path = NULL;
-static gint64 offline_cards_json_mtime = 0;
-// img_id（Konami 八位码）→ cid（ygocdb 短 ID）反向索引缓存
-static GHashTable *offline_img_to_cid = NULL;  // key: g_strdup(img_id), value: GINT_TO_POINTER(cid)
-static GHashTable *offline_name_to_cid = NULL; // key: normalized card name, value: GINT_TO_POINTER(cid)
-static GHashTable *offline_effective_cid = NULL; // key: GINT_TO_POINTER(input id), value: GINT_TO_POINTER(effective cid)
+static GMutex offline_load_mutex;
+static OfflineCardCache *offline_cache;
+static guint offline_cache_revision;
 
 static gchar *get_cards_dir(void);
 
 static gchar *get_cards_json_path(void) {
-    gchar *cards_dir = get_cards_dir();
-    if (!cards_dir) return NULL;
-    gchar *json_path = g_build_filename(cards_dir, "cards.json", NULL);
-    g_free(cards_dir);
-    return json_path;
+    g_autofree char *cards_dir = get_cards_dir();
+    return g_build_filename(cards_dir, "cards.json", NULL);
 }
 
-static gint64 stat_mtime_us(const char *path) {
-    if (!path) return 0;
-    GStatBuf st;
-    if (g_stat(path, &st) != 0) return 0;
-#if defined(G_OS_UNIX)
-    // st_mtime is seconds; convert to microseconds for a stable integer
-    return (gint64)st.st_mtime * 1000000;
-#else
-    return (gint64)st.st_mtime * 1000000;
-#endif
+static void offline_card_cache_free(OfflineCardCache *cache) {
+    if (!cache) return;
+    g_object_unref(cache->parser);
+    g_hash_table_unref(cache->img_to_cid);
+    g_hash_table_unref(cache->name_to_cid);
+    g_hash_table_unref(cache->effective_cid);
+    g_free(cache);
+}
+
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(OfflineCardCache, offline_card_cache_free)
+
+static OfflineCardCache *offline_cache_replace_locked(OfflineCardCache *replacement) {
+    OfflineCardCache *old = offline_cache;
+    offline_cache = replacement;
+    offline_cache_revision++;
+    return old;
 }
 
 void offline_data_clear_cache(void) {
     g_mutex_lock(&offline_cache_mutex);
-    if (offline_cards_parser) {
-        g_object_unref(offline_cards_parser);
-        offline_cards_parser = NULL;
-    }
-    offline_cards_root = NULL;
-    g_clear_pointer(&offline_cards_json_path, g_free);
-    offline_cards_json_mtime = 0;
-    if (offline_img_to_cid) {
-        g_hash_table_unref(offline_img_to_cid);
-        offline_img_to_cid = NULL;
-    }
-    if (offline_name_to_cid) {
-        g_hash_table_unref(offline_name_to_cid);
-        offline_name_to_cid = NULL;
-    }
-    if (offline_effective_cid) {
-        g_hash_table_unref(offline_effective_cid);
-        offline_effective_cid = NULL;
-    }
+    OfflineCardCache *old = offline_cache_replace_locked(NULL);
     g_mutex_unlock(&offline_cache_mutex);
+    offline_card_cache_free(old);
 }
 
-static void offline_add_name_to_cid_locked(const char *name, int cid) {
-    if (!offline_name_to_cid || !name || !*name || cid <= 0) return;
-
-    gchar *stripped = g_strdup(name);
-    if (!stripped) return;
-    g_strstrip(stripped);
-    if (*stripped) {
-        gpointer existing = g_hash_table_lookup(offline_name_to_cid, stripped);
-        if (!existing) {
-            g_hash_table_insert(offline_name_to_cid, stripped, GINT_TO_POINTER(cid));
-            return;
-        }
-    }
-    g_free(stripped);
+static gboolean same_card_file(const GStatBuf *first, const GStatBuf *second) {
+    return first->st_dev == second->st_dev && first->st_ino == second->st_ino &&
+           first->st_size == second->st_size && first->st_mtim.tv_sec == second->st_mtim.tv_sec &&
+           first->st_mtim.tv_nsec == second->st_mtim.tv_nsec;
 }
 
-static gboolean offline_cache_ensure_loaded_locked(void) {
-    gchar *json_path = get_cards_json_path();
-    if (!json_path) return FALSE;
-    if (!g_file_test(json_path, G_FILE_TEST_EXISTS)) {
-        g_free(json_path);
-        return FALSE;
+static OfflineCardCache *offline_load_cache(const char *path, GError **error) {
+    GStatBuf file;
+    if (g_stat(path, &file) != 0) {
+        g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno),
+                    "Cannot read %s: %s", path, g_strerror(errno));
+        return NULL;
     }
-
-    gint64 mtime = stat_mtime_us(json_path);
-    gboolean need_reload = (offline_cards_parser == NULL) ||
-                           (offline_cards_root == NULL) ||
-                           (offline_cards_json_path == NULL) ||
-                           (g_strcmp0(offline_cards_json_path, json_path) != 0) ||
-                           (offline_cards_json_mtime != mtime);
-
-    if (!need_reload) {
-        g_free(json_path);
-        return TRUE;
-    }
-
-    // reload
-    if (offline_cards_parser) {
-        g_object_unref(offline_cards_parser);
-        offline_cards_parser = NULL;
-    }
-    offline_cards_root = NULL;
-    g_clear_pointer(&offline_cards_json_path, g_free);
-    offline_cards_json_mtime = 0;
-
-    JsonParser *parser = json_parser_new();
-    GError *error = NULL;
-    if (!json_parser_load_from_file(parser, json_path, &error)) {
-        g_warning("Failed to parse cards.json: %s", error ? error->message : "unknown error");
-        if (error) g_error_free(error);
-        g_object_unref(parser);
-        g_free(json_path);
-        return FALSE;
-    }
+    g_autoptr(JsonParser) parser = json_parser_new();
+    if (!json_parser_load_from_file(parser, path, error)) return NULL;
 
     JsonNode *root = json_parser_get_root(parser);
     if (!root || !JSON_NODE_HOLDS_OBJECT(root)) {
-        g_warning("Invalid JSON structure in cards.json");
-        g_object_unref(parser);
-        g_free(json_path);
-        return FALSE;
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "Offline card database must contain a JSON object");
+        return NULL;
     }
 
-    offline_cards_parser = parser;
-    offline_cards_root = json_node_get_object(root);
-    offline_cards_json_path = json_path; // take ownership
-    offline_cards_json_mtime = mtime;
-    // 重建 img_id → cid 反向索引
-    if (offline_img_to_cid) {
-        g_hash_table_unref(offline_img_to_cid);
-    }
-    if (offline_name_to_cid) {
-        g_hash_table_unref(offline_name_to_cid);
-    }
-    if (offline_effective_cid) {
-        g_hash_table_unref(offline_effective_cid);
-    }
-    offline_img_to_cid = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-    offline_name_to_cid = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-    offline_effective_cid = g_hash_table_new(g_direct_hash, g_direct_equal);
-    GList *members_for_idx = json_object_get_members(offline_cards_root);
-    for (GList *l = members_for_idx; l != NULL; l = l->next) {
-        const char *cid_key = (const char *)l->data;
-        JsonNode *cn = json_object_get_member(offline_cards_root, cid_key);
-        if (!cn || !JSON_NODE_HOLDS_OBJECT(cn)) continue;
-        JsonObject *co = json_node_get_object(cn);
-        int cid_val = atoi(cid_key);
-        if (cid_val > 0) {
-            if (json_object_has_member(co, "id")) {
-                gint64 raw_id = json_object_get_int_member(co, "id");
-                if (raw_id > 0) {
-                    char img_id_str[32];
-                    g_snprintf(img_id_str, sizeof(img_id_str), "%" G_GINT64_FORMAT, raw_id);
-                    g_hash_table_insert(offline_img_to_cid,
-                                        g_strdup(img_id_str),
-                                        GINT_TO_POINTER(cid_val));
-                }
-            }
+    OfflineCardCache *cache = g_new0(OfflineCardCache, 1);
+    cache->root = json_node_get_object(root);
+    cache->parser = g_steal_pointer(&parser);
+    cache->file = file;
+    cache->img_to_cid = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    cache->name_to_cid = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+    cache->effective_cid = g_hash_table_new(g_direct_hash, g_direct_equal);
 
-            const char *name_fields[] = {
-                "cn_name", "sc_name", "md_name", "jp_name", "en_name", "nwbbs_n", "cnocg_n", NULL
-            };
-            for (int i = 0; name_fields[i] != NULL; i++) {
-                if (json_object_has_member(co, name_fields[i])) {
-                    offline_add_name_to_cid_locked(json_object_get_string_member(co, name_fields[i]), cid_val);
-                }
-            }
+    const char *name_fields[] = {
+        "cn_name", "sc_name", "md_name", "jp_name", "en_name", "nwbbs_n", "cnocg_n"
+    };
+    JsonObjectIter iter;
+    json_object_iter_init(&iter, cache->root);
+    const char *key;
+    JsonNode *node;
+    while (json_object_iter_next(&iter, &key, &node)) {
+        gint64 cid;
+        if (!node || !JSON_NODE_HOLDS_OBJECT(node) ||
+            !g_ascii_string_to_signed(key, 10, 1, G_MAXINT, &cid, NULL))
+            continue;
+
+        gpointer cid_value = GINT_TO_POINTER((int)cid);
+        JsonObject *card = json_node_get_object(node);
+        JsonNode *id_node = json_object_get_member(card, "id");
+        if (id_node && json_node_get_value_type(id_node) == G_TYPE_INT64) {
+            gint64 id = json_node_get_int(id_node);
+            if (id > 0)
+                g_hash_table_insert(cache->img_to_cid, g_strdup_printf("%" G_GINT64_FORMAT, id), cid_value);
+        }
+
+        for (guint i = 0; i < G_N_ELEMENTS(name_fields); i++) {
+            JsonNode *name_node = json_object_get_member(card, name_fields[i]);
+            if (!name_node || json_node_get_value_type(name_node) != G_TYPE_STRING) continue;
+            g_autofree char *name = g_strdup(json_node_get_string(name_node));
+            if (name && *g_strstrip(name) && !g_hash_table_contains(cache->name_to_cid, name))
+                g_hash_table_insert(cache->name_to_cid, g_steal_pointer(&name), cid_value);
         }
     }
-    g_list_free(members_for_idx);
-    return TRUE;
+    if (g_hash_table_size(cache->img_to_cid) == 0) {
+        g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                            "Offline card database contains no cards");
+        offline_card_cache_free(cache);
+        return NULL;
+    }
+    return cache;
+}
+
+gboolean offline_data_is_ready(void) {
+    g_mutex_lock(&offline_cache_mutex);
+    gboolean ready = offline_cache != NULL;
+    g_mutex_unlock(&offline_cache_mutex);
+    return ready;
+}
+
+static gboolean offline_cache_ensure_loaded_locked(void) {
+    // UI consumers use the preloaded snapshot. Workers parse replacements without
+    // holding the lookup mutex, then publish the complete snapshot together.
+    if (g_main_context_is_owner(g_main_context_default()))
+        return offline_cache != NULL;
+
+    g_autofree char *path = get_cards_json_path();
+    GStatBuf file;
+    if (g_stat(path, &file) != 0) return FALSE;
+    if (offline_cache && same_card_file(&offline_cache->file, &file)) return TRUE;
+
+    g_mutex_unlock(&offline_cache_mutex);
+    g_mutex_lock(&offline_load_mutex);
+    g_mutex_lock(&offline_cache_mutex);
+    if (g_stat(path, &file) == 0 &&
+        (!offline_cache || !same_card_file(&offline_cache->file, &file))) {
+        guint revision = offline_cache_revision;
+        g_mutex_unlock(&offline_cache_mutex);
+
+        g_autoptr(GError) error = NULL;
+        g_autoptr(OfflineCardCache) loaded = offline_load_cache(path, &error);
+        g_autoptr(OfflineCardCache) old = NULL;
+        if (error) g_warning("Failed to parse cards.json: %s", error->message);
+        g_mutex_lock(&offline_cache_mutex);
+        if (loaded && revision == offline_cache_revision &&
+            g_stat(path, &file) == 0 && same_card_file(&loaded->file, &file))
+            old = offline_cache_replace_locked(g_steal_pointer(&loaded));
+        g_mutex_unlock(&offline_cache_mutex);
+        g_clear_pointer(&old, offline_card_cache_free);
+        g_clear_pointer(&loaded, offline_card_cache_free);
+        g_mutex_lock(&offline_cache_mutex);
+    }
+    g_mutex_unlock(&offline_load_mutex);
+    return offline_cache != NULL;
 }
 
 static gboolean card_matches_query(JsonObject *card, const gchar *query_lower) {
@@ -234,9 +224,9 @@ guint offline_foreach_card(const char *query,
     JsonObject *root_obj = NULL;
     g_mutex_lock(&offline_cache_mutex);
     gboolean ok = offline_cache_ensure_loaded_locked();
-    if (ok && offline_cards_parser && offline_cards_root) {
-        parser_ref = g_object_ref(offline_cards_parser);
-        root_obj = offline_cards_root;
+    if (ok && offline_cache->parser && offline_cache->root) {
+        parser_ref = g_object_ref(offline_cache->parser);
+        root_obj = offline_cache->root;
     }
     g_mutex_unlock(&offline_cache_mutex);
 
@@ -276,28 +266,19 @@ guint offline_foreach_card(const char *query,
     return accepted;
 }
 
-typedef struct {
-    gboolean done;
-} OfflineWarmCtx;
-
-static gpointer offline_warm_thread(gpointer data) {
-    OfflineWarmCtx *ctx = (OfflineWarmCtx*)data;
+static void offline_warm_thread(GTask *task, gpointer source, gpointer data, GCancellable *cancellable) {
+    (void)source;
+    (void)data;
+    (void)cancellable;
     g_mutex_lock(&offline_cache_mutex);
-    (void)offline_cache_ensure_loaded_locked();
+    gboolean loaded = offline_cache_ensure_loaded_locked();
     g_mutex_unlock(&offline_cache_mutex);
-    if (ctx) {
-        ctx->done = TRUE;
-        g_free(ctx);
-    }
-    return NULL;
+    g_task_return_boolean(task, loaded);
 }
 
-void offline_data_warm_cache_async(void) {
-    // 仅在离线数据存在时预热；失败也不影响主流程。
-    if (!offline_data_exists()) return;
-    OfflineWarmCtx *ctx = g_new0(OfflineWarmCtx, 1);
-    GThread *t = g_thread_new("offline-warm-cache", offline_warm_thread, ctx);
-    g_thread_unref(t);
+void offline_data_warm_cache_async(GObject *owner, GAsyncReadyCallback callback) {
+    g_autoptr(GTask) task = g_task_new(owner, NULL, callback, NULL);
+    g_task_run_in_thread(task, offline_warm_thread);
 }
 
 #define OFFLINE_DATA_URL "https://ygocdb.com/api/v0/cards.zip"
@@ -350,417 +331,145 @@ static gboolean ensure_directory_exists(const char *path) {
     return TRUE;
 }
 
-/**
- * 递归删除目录内容（保留目录本身）
- */
-static gboolean clear_directory_contents(const char *path) {
-    GDir *dir = g_dir_open(path, 0, NULL);
-    if (!dir) {
-        return FALSE;
-    }
-    
-    const gchar *name;
-    while ((name = g_dir_read_name(dir)) != NULL) {
-        gchar *full_path = g_build_filename(path, name, NULL);
-        
-        if (g_file_test(full_path, G_FILE_TEST_IS_DIR)) {
-            // 递归删除子目录
-            clear_directory_contents(full_path);
-            g_rmdir(full_path);
-        } else {
-            // 删除文件
-            g_remove(full_path);
-        }
-        
-        g_free(full_path);
-    }
-    
-    g_dir_close(dir);
-    return TRUE;
-}
+static GMutex offline_install_mutex;
+static GMutex offline_download_mutex;
+static guint offline_install_generation;
 
-/**
- * 解压ZIP文件到指定目录
- */
-static gboolean extract_zip_file(const char *zip_path, const char *dest_dir) {
-    struct archive *a;
-    struct archive *ext;
-    struct archive_entry *entry;
-    int r;
-    
-    a = archive_read_new();
-    archive_read_support_format_zip(a);
-    ext = archive_write_disk_new();
-    // SECURE_NODOTDOT 拒绝 ".."；SECURE_SYMLINKS 阻止「先写入指向外部的符号链接，
-    // 再通过该链接写入」的绕过——仅靠条目名检查无法防住这种写穿符号链接
-    archive_write_disk_set_options(ext, ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM |
-                                        ARCHIVE_EXTRACT_SECURE_NODOTDOT |
-                                        ARCHIVE_EXTRACT_SECURE_SYMLINKS);
-    
-    if ((r = archive_read_open_filename(a, zip_path, 10240))) {
-        g_warning("Failed to open archive: %s", archive_error_string(a));
-        archive_read_free(a);
-        archive_write_free(ext);
-        return FALSE;
-    }
-    
-    while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
-        const char *current_file = archive_entry_pathname(entry);
-        
-        // Zip Slip 防护：cards.zip 来自网络下载，条目名可能是 "../x" 或绝对路径，
-        // 直接拼接会写到目标目录之外
-        if (!archive_entry_path_is_safe(current_file)) {
-            g_warning("跳过不安全的压缩包条目: %s", current_file ? current_file : "(null)");
-            archive_read_data_skip(a);
-            continue;
-        }
-        
-        // 构建输出路径
-        gchar *output_path = g_build_filename(dest_dir, current_file, NULL);
-        archive_entry_set_pathname(entry, output_path);
-        
-        // 确保父目录存在
-        gchar *parent_dir = g_path_get_dirname(output_path);
-        ensure_directory_exists(parent_dir);
-        g_free(parent_dir);
-        
-        // 写入文件
-        r = archive_write_header(ext, entry);
-        if (r == ARCHIVE_OK) {
-            const void *buff;
-            size_t size;
-            la_int64_t offset;
-            
-            while ((r = archive_read_data_block(a, &buff, &size, &offset)) == ARCHIVE_OK) {
-                if (archive_write_data_block(ext, buff, size, offset) != ARCHIVE_OK) {
-                    g_warning("Error writing data: %s", archive_error_string(ext));
-                    break;
-                }
-            }
-            if (r != ARCHIVE_EOF) {
-                g_warning("Error reading data: %s", archive_error_string(a));
-            }
-            
-            archive_write_finish_entry(ext);
-        }
-        
-        g_free(output_path);
-    }
-    
-    archive_read_close(a);
-    archive_read_free(a);
-    archive_write_close(ext);
-    archive_write_free(ext);
-    
-    return TRUE;
-}
-
-/**
- * 下载上下文结构
- */
 typedef struct {
-    GSourceFunc callback;
+    OfflineDownloadCallback callback;
     gpointer user_data;
-    gboolean success;
+    guint generation;
+    gboolean installed;
 } DownloadContext;
 
-/**
- * 后台线程执行下载和处理
- */
-static gpointer download_offline_data_thread(gpointer data) {
-    DownloadContext *ctx = (DownloadContext*)data;
-    
-    // 获取数据目录和 cards 目录
-    gchar *data_dir = get_offline_data_dir();
-    gchar *cards_dir = get_cards_dir();
-    
-    if (!data_dir || !cards_dir) {
-        g_warning("Failed to get directories");
-        g_free(data_dir);
-        g_free(cards_dir);
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
-    }
-    
-    // 确保数据目录存在
-    if (!ensure_directory_exists(data_dir)) {
-        g_warning("Failed to create data directory");
-        g_free(data_dir);
-        g_free(cards_dir);
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
-    }
-    
-    // 构建 ZIP 文件路径
-    gchar *zip_path = g_build_filename(data_dir, "cards.zip", NULL);
-    
-    // 下载文件
-    g_message("Downloading offline data from %s...", OFFLINE_DATA_URL);
-    
-    SoupSession *session = soup_session_new();
-    SoupMessage *msg = soup_message_new("GET", OFFLINE_DATA_URL);
-    GError *error = NULL;
-    
-    GInputStream *input = soup_session_send(session, msg, NULL, &error);
-    // 非 2xx（404/500/限流页）的错误页不能当作 cards.zip 保存，转成 GError 走既有失败分支
-    if (!error && !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(msg))) {
-        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "HTTP %u %s",
-                            soup_message_get_status(msg), soup_message_get_reason_phrase(msg));
-    }
-    g_object_unref(msg);  // soup_session_send 内部另持引用，这里释放调用方引用
-    
-    if (error) {
-        g_warning("Failed to download offline data: %s", error->message);
-        g_error_free(error);
-        if (input) g_object_unref(input);  // HTTP 失败时 send 仍会返回非空流
-        g_object_unref(session);
-        g_free(zip_path);
-        g_free(data_dir);
-        g_free(cards_dir);
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
-    }
-    
-    // 保存到文件
-    GFile *file = g_file_new_for_path(zip_path);
-    GOutputStream *output = (GOutputStream *)g_file_replace(file, NULL, FALSE, G_FILE_CREATE_NONE, NULL, &error);
-    
-    if (error) {
-        g_warning("Failed to create output file: %s", error->message);
-        g_error_free(error);
-        g_object_unref(input);
-        g_object_unref(file);
-        g_object_unref(session);
-        g_free(zip_path);
-        g_free(data_dir);
-        g_free(cards_dir);
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
-    }
-    
-    // 复制数据
-    g_output_stream_splice(output, input, G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE | G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET, NULL, &error);
-    
-    if (error) {
-        g_warning("Failed to save file: %s", error->message);
-        g_error_free(error);
-        g_object_unref(input);
-        g_object_unref(output);
-        g_object_unref(file);
-        g_object_unref(session);
-        g_free(zip_path);
-        g_free(data_dir);
-        g_free(cards_dir);
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
-    }
-    
-    g_object_unref(input);
-    g_object_unref(output);
-    g_object_unref(file);
-    g_object_unref(session);
-    
-    g_message("Offline data downloaded successfully");
-    
-    // 确保 cards 目录存在，如果存在则清空
-    if (g_file_test(cards_dir, G_FILE_TEST_IS_DIR)) {
-        g_message("Clearing existing cards directory: %s", cards_dir);
-        clear_directory_contents(cards_dir);
-    } else {
-        g_message("Creating cards directory: %s", cards_dir);
-        if (!ensure_directory_exists(cards_dir)) {
-            g_warning("Failed to create cards directory");
-            g_remove(zip_path);
-            g_free(zip_path);
-            g_free(data_dir);
-            g_free(cards_dir);
-            ctx->success = FALSE;
-            if (ctx->callback) {
-                g_idle_add(ctx->callback, ctx->user_data);
-            }
-            g_free(ctx);
-            return NULL;
-        }
-    }
-    
-    // 解压文件到 cards 目录
-    g_message("Extracting ZIP archive to %s...", cards_dir);
-    if (!extract_zip_file(zip_path, cards_dir)) {
-        g_warning("Failed to extract ZIP file");
-        g_remove(zip_path);
-        g_free(zip_path);
-        g_free(data_dir);
-        g_free(cards_dir);
-        ctx->success = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
-    }
-    
-    g_message("ZIP archive extracted successfully");
-    
-    // 下载 MD5 文件
-    g_message("Downloading MD5 checksum from %s...", OFFLINE_DATA_MD5_URL);
-    
-    SoupSession *md5_session = soup_session_new();
-    SoupMessage *md5_msg = soup_message_new("GET", OFFLINE_DATA_MD5_URL);
-    GError *md5_error = NULL;
-    
-    GInputStream *md5_input = soup_session_send(md5_session, md5_msg, NULL, &md5_error);
-    // 错误页不可当作 MD5 保存
-    if (!md5_error && !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(md5_msg))) {
-        md5_error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "HTTP %u %s",
-                                soup_message_get_status(md5_msg), soup_message_get_reason_phrase(md5_msg));
-    }
-    g_object_unref(md5_msg);  // 释放调用方引用
-    
-    if (md5_error) {
-        g_warning("Failed to download MD5 file: %s", md5_error->message);
-        g_error_free(md5_error);
-        if (md5_input) g_object_unref(md5_input);  // HTTP 失败时 send 仍会返回非空流
-        g_object_unref(md5_session);
-        // MD5 下载失败不影响主流程，继续执行
-    } else {
-        // 保存 MD5 文件到 cards 目录
-        gchar *md5_path = g_build_filename(cards_dir, "cards.zip.md5", NULL);
-        GFile *md5_file = g_file_new_for_path(md5_path);
-        GOutputStream *md5_output = (GOutputStream *)g_file_replace(md5_file, NULL, FALSE, G_FILE_CREATE_NONE, NULL, &md5_error);
-        
-        if (md5_error) {
-            g_warning("Failed to create MD5 output file: %s", md5_error->message);
-            g_error_free(md5_error);
-            g_object_unref(md5_input);
-            g_object_unref(md5_file);
-            // md5_session 与 md5_path 由本分支末尾统一释放
-            // MD5 保存失败不影响主流程
-        } else {
-            // 复制数据
-            g_output_stream_splice(md5_output, md5_input, G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE | G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET, NULL, &md5_error);
-            
-            if (md5_error) {
-                g_warning("Failed to save MD5 file: %s", md5_error->message);
-                g_error_free(md5_error);
-                // MD5 保存失败不影响主流程
-            } else {
-                g_message("MD5 checksum saved to %s", md5_path);
-            }
-            
-            g_object_unref(md5_input);
-            g_object_unref(md5_output);
-            g_object_unref(md5_file);
-        }
-        
-        g_object_unref(md5_session);
-        g_free(md5_path);
-    }
-    
-    // 删除 ZIP 文件
-    g_message("Removing ZIP file: %s", zip_path);
-    g_remove(zip_path);
-    
-    // 下载 strings.conf 文件
-    g_message("Downloading strings.conf from %s...", STRINGS_CONF_URL);
-    
-    SoupSession *strings_session = soup_session_new();
-    SoupMessage *strings_msg = soup_message_new("GET", STRINGS_CONF_URL);
-    GError *strings_error = NULL;
-    
-    GInputStream *strings_input = soup_session_send(strings_session, strings_msg, NULL, &strings_error);
-    // 错误页不可当作 strings.conf 保存
-    if (!strings_error && !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(strings_msg))) {
-        strings_error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "HTTP %u %s",
-                                    soup_message_get_status(strings_msg), soup_message_get_reason_phrase(strings_msg));
-    }
-    g_object_unref(strings_msg);  // 释放调用方引用
-    
-    if (strings_error) {
-        g_warning("Failed to download strings.conf: %s", strings_error->message);
-        g_error_free(strings_error);
-        if (strings_input) g_object_unref(strings_input);  // HTTP 失败时 send 仍会返回非空流
-        g_object_unref(strings_session);
-        // strings.conf 下载失败不影响主流程，继续执行
-    } else {
-        // 保存 strings.conf 文件到 cards 目录
-        gchar *strings_path = g_build_filename(cards_dir, "strings.conf", NULL);
-        GFile *strings_file = g_file_new_for_path(strings_path);
-        GOutputStream *strings_output = (GOutputStream *)g_file_replace(strings_file, NULL, FALSE, G_FILE_CREATE_NONE, NULL, &strings_error);
-        
-        if (strings_error) {
-            g_warning("Failed to create strings.conf output file: %s", strings_error->message);
-            g_error_free(strings_error);
-            g_object_unref(strings_input);
-            g_object_unref(strings_file);
-            // strings_session 与 strings_path 由本分支末尾统一释放
-            // strings.conf 保存失败不影响主流程
-        } else {
-            // 复制数据
-            g_output_stream_splice(strings_output, strings_input, G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE | G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET, NULL, &strings_error);
-            
-            if (strings_error) {
-                g_warning("Failed to save strings.conf: %s", strings_error->message);
-                g_error_free(strings_error);
-                // strings.conf 保存失败不影响主流程
-            } else {
-                g_message("strings.conf saved to %s", strings_path);
-            }
-            
-            g_object_unref(strings_input);
-            g_object_unref(strings_output);
-            g_object_unref(strings_file);
-        }
-        
-        g_object_unref(strings_session);
-        g_free(strings_path);
-    }
-    
-    g_free(zip_path);
-    g_free(data_dir);
-    g_free(cards_dir);
+static gboolean notify_offline_download(gpointer data) {
+    DownloadContext *ctx = data;
+    ctx->callback(ctx->installed, ctx->user_data);
+    return G_SOURCE_REMOVE;
+}
 
-    // 离线数据更新后，清理解析缓存，避免读取旧文件。
-    offline_data_clear_cache();
-    // 卡片数据变了，异画映射也可能变化：后台重建缓存。
-    alt_art_rebuild_cache_async();
-    
-    ctx->success = TRUE;
-    if (ctx->callback) {
-        g_idle_add(ctx->callback, ctx->user_data);
+static guint get_install_generation(void) {
+    g_mutex_lock(&offline_install_mutex);
+    guint generation = offline_install_generation;
+    g_mutex_unlock(&offline_install_mutex);
+    return generation;
+}
+
+static gboolean download_file(SoupSession *session, const char *url,
+                              const char *path, GError **error) {
+    g_autoptr(SoupMessage) message = soup_message_new("GET", url);
+    g_autoptr(GInputStream) input = soup_session_send(session, message, NULL, error);
+    if (!input) return FALSE;
+    if (!SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(message))) {
+        g_set_error(error, G_IO_ERROR, G_IO_ERROR_FAILED, "HTTP %u %s",
+                    soup_message_get_status(message), soup_message_get_reason_phrase(message));
+        return FALSE;
     }
-    g_free(ctx);
-    
+
+    g_autoptr(GFile) file = g_file_new_for_path(path);
+    g_autoptr(GFileOutputStream) output =
+        g_file_replace(file, NULL, FALSE, G_FILE_CREATE_NONE, NULL, error);
+    return output &&
+        g_output_stream_splice(G_OUTPUT_STREAM(output), input,
+            G_OUTPUT_STREAM_SPLICE_CLOSE_SOURCE | G_OUTPUT_STREAM_SPLICE_CLOSE_TARGET,
+            NULL, error) >= 0;
+}
+
+static void download_optional_file(SoupSession *session, const char *url,
+                                   const char *stage, const char *filename) {
+    g_autofree char *path = g_build_filename(stage, filename, NULL);
+    g_autoptr(GError) error = NULL;
+    if (!download_file(session, url, path, &error)) {
+        g_warning("Failed to download %s: %s", filename, error ? error->message : "empty response");
+        g_remove(path);
+    }
+}
+
+static gpointer download_offline_data_thread(gpointer data) {
+    g_autofree DownloadContext *ctx = data;
+    g_autofree char *data_dir = get_offline_data_dir();
+    g_autofree char *cards_dir = get_cards_dir();
+    g_autofree char *stage = NULL;
+    g_autofree char *backup = NULL;
+    g_autoptr(GError) error = NULL;
+    gboolean installed = FALSE;
+
+    g_autofree char *zip_path = NULL;
+    g_autofree char *replacement = NULL;
+    g_autofree char *json_path = NULL;
+    g_autofree char *strings_path = NULL;
+    g_autoptr(SoupSession) session = NULL;
+    g_autoptr(OfflineCardCache) prepared = NULL;
+    g_autoptr(OfflineCardCache) old = NULL;
+
+    g_mutex_lock(&offline_download_mutex);
+    if (ctx->generation != get_install_generation()) goto done;
+    if (!data_dir || !cards_dir || !ensure_directory_exists(data_dir)) goto done;
+
+    stage = g_build_filename(data_dir, ".cards-update-XXXXXX", NULL);
+    if (!g_mkdtemp(stage)) {
+        g_warning("Failed to create offline update directory: %s", g_strerror(errno));
+        g_clear_pointer(&stage, g_free);
+        goto done;
+    }
+
+    zip_path = g_build_filename(stage, "cards.zip", NULL);
+    replacement = g_build_filename(stage, "cards", NULL);
+    backup = g_build_filename(stage, "previous", NULL);
+    json_path = g_build_filename(replacement, "cards.json", NULL);
+    if (!ensure_directory_exists(replacement)) goto done;
+
+    session = soup_session_new();
+    soup_session_set_timeout(session, 60);
+    if (!download_file(session, OFFLINE_DATA_URL, zip_path, &error) ||
+        !data_directory_extract_zip(zip_path, replacement, NULL, &error))
+        goto done;
+
+    prepared = offline_load_cache(json_path, &error);
+    if (!prepared) goto done;
+    download_optional_file(session, OFFLINE_DATA_MD5_URL, replacement, "cards.zip.md5");
+    download_optional_file(session, STRINGS_CONF_URL, replacement, "strings.conf");
+    strings_path = g_build_filename(replacement, "strings.conf", NULL);
+    if (!g_file_test(strings_path, G_FILE_TEST_IS_REGULAR)) {
+        g_autofree char *old_strings = g_build_filename(cards_dir, "strings.conf", NULL);
+        g_autoptr(GFile) source = g_file_new_for_path(old_strings);
+        g_autoptr(GFile) target = g_file_new_for_path(strings_path);
+        g_file_copy(source, target, G_FILE_COPY_NONE, NULL, NULL, NULL, NULL);
+    }
+
+    g_mutex_lock(&offline_install_mutex);
+    if (ctx->generation == offline_install_generation) {
+        g_mutex_lock(&offline_cache_mutex);
+        installed = data_directory_replace(cards_dir, replacement, backup, &error);
+        if (installed)
+            old = offline_cache_replace_locked(g_steal_pointer(&prepared));
+        g_mutex_unlock(&offline_cache_mutex);
+    }
+    g_mutex_unlock(&offline_install_mutex);
+    if (installed) alt_art_rebuild_cache_async();
+
+done:
+    if (error) g_warning("Failed to update offline data: %s", error->message);
+    if (stage && (installed || !backup ||
+                  !g_file_test(backup, G_FILE_TEST_EXISTS | G_FILE_TEST_IS_SYMLINK)))
+        data_directory_remove(stage);
+    g_mutex_unlock(&offline_download_mutex);
+    if (ctx->callback) {
+        ctx->installed = installed;
+        g_idle_add_full(G_PRIORITY_DEFAULT, notify_offline_download,
+                        g_steal_pointer(&ctx), g_free);
+    }
     return NULL;
 }
 
 /**
  * 下载并处理离线卡片数据（公共接口）
  */
-void download_offline_data(GSourceFunc callback, gpointer user_data) {
-    DownloadContext *ctx = g_new(DownloadContext, 1);
+void download_offline_data(OfflineDownloadCallback callback, gpointer user_data) {
+    DownloadContext *ctx = g_new0(DownloadContext, 1);
     ctx->callback = callback;
     ctx->user_data = user_data;
-    ctx->success = FALSE;
+    ctx->generation = get_install_generation();
     
     // 在新线程中执行下载
     GThread *thread = g_thread_new("download-offline-data", download_offline_data_thread, ctx);
@@ -786,40 +495,13 @@ gboolean offline_data_exists(void) {
  * 清理离线数据（删除 cards 目录下的所有文件）
  */
 gboolean clear_offline_data(void) {
-    gchar *cards_dir = get_cards_dir();
-    if (!cards_dir) {
-        g_warning("Failed to get cards directory");
-        return FALSE;
-    }
-    
-    // 检查目录是否存在
-    if (!g_file_test(cards_dir, G_FILE_TEST_IS_DIR)) {
-        g_free(cards_dir);
-        return TRUE; // 目录不存在，视为已清理
-    }
-    
-    g_message("Clearing offline data from: %s", cards_dir);
-    
-    // 清空目录内容
-    gboolean success = clear_directory_contents(cards_dir);
-    
-    if (success) {
-        // 删除空目录
-        if (g_rmdir(cards_dir) == 0) {
-            g_message("Offline data cleared successfully");
-        } else {
-            g_warning("Failed to remove cards directory");
-            success = FALSE;
-        }
-    } else {
-        g_warning("Failed to clear offline data");
-    }
-    
-    g_free(cards_dir);
-
-    // 清理离线数据后，清空解析缓存
+    g_autofree char *cards_dir = get_cards_dir();
+    g_mutex_lock(&offline_install_mutex);
+    offline_install_generation++;
+    gboolean removed = data_directory_remove(cards_dir);
     offline_data_clear_cache();
-    return success;
+    g_mutex_unlock(&offline_install_mutex);
+    return removed;
 }
 
 /**
@@ -918,100 +600,24 @@ static gchar *download_remote_md5(void) {
 /**
  * 检查更新的上下文结构
  */
-typedef struct {
-    GSourceFunc callback;
-    gpointer user_data;
-    gboolean needs_update;
-} CheckUpdateContext;
-
-/**
- * 后台线程执行检查和更新
- */
 static gpointer check_offline_data_update_thread(gpointer data) {
-    CheckUpdateContext *ctx = (CheckUpdateContext*)data;
-    
-    g_message("Checking offline data for updates...");
-    
-    // 检查本地数据是否存在
-    if (!offline_data_exists()) {
-        g_message("Offline data does not exist, no update needed");
-        ctx->needs_update = FALSE;
-        if (ctx->callback) {
-            g_idle_add(ctx->callback, ctx->user_data);
-        }
-        g_free(ctx);
-        return NULL;
+    guint generation = GPOINTER_TO_UINT(data);
+    if (!offline_data_exists() || generation != get_install_generation()) return NULL;
+
+    g_autofree char *local_md5 = offline_data_is_ready() ? read_local_md5() : NULL;
+    if (local_md5) {
+        g_autofree char *remote_md5 = download_remote_md5();
+        if (!remote_md5 || g_str_equal(local_md5, remote_md5)) return NULL;
     }
-    
-    // 读取本地 MD5
-    gchar *local_md5 = read_local_md5();
-    if (!local_md5) {
-        g_message("Local MD5 not found, will update");
-        ctx->needs_update = TRUE;
-    } else {
-        // 下载远程 MD5
-        gchar *remote_md5 = download_remote_md5();
-        if (!remote_md5) {
-            g_warning("Failed to download remote MD5, skipping update");
-            g_free(local_md5);
-            ctx->needs_update = FALSE;
-            if (ctx->callback) {
-                g_idle_add(ctx->callback, ctx->user_data);
-            }
-            g_free(ctx);
-            return NULL;
-        }
-        
-        // 比较 MD5
-        if (g_strcmp0(local_md5, remote_md5) == 0) {
-            g_message("Offline data is up to date");
-            ctx->needs_update = FALSE;
-            g_free(local_md5);
-            g_free(remote_md5);
-            if (ctx->callback) {
-                g_idle_add(ctx->callback, ctx->user_data);
-            }
-            g_free(ctx);
-            return NULL;
-        }
-        
-        g_message("Offline data needs update (local: %s, remote: %s)", local_md5, remote_md5);
-        g_free(local_md5);
-        g_free(remote_md5);
-        ctx->needs_update = TRUE;
-    }
-    
-    // 需要更新，先清理旧数据
-    if (ctx->needs_update) {
-        g_message("Updating offline data...");
-        clear_offline_data();
-        
-        // 创建下载上下文
-        DownloadContext *download_ctx = g_new(DownloadContext, 1);
-        download_ctx->callback = ctx->callback;
-        download_ctx->user_data = ctx->user_data;
-        download_ctx->success = FALSE;
-        
-        // 直接在当前线程执行下载
-        g_free(ctx);
-        return download_offline_data_thread(download_ctx);
-    }
-    
-    g_free(ctx);
-    return NULL;
+
+    DownloadContext *download = g_new0(DownloadContext, 1);
+    download->generation = generation;
+    return download_offline_data_thread(download);
 }
 
-/**
- * 检查离线数据更新（公共接口）
- */
-void check_offline_data_update(GSourceFunc callback, gpointer user_data) {
-    CheckUpdateContext *ctx = g_new(CheckUpdateContext, 1);
-    ctx->callback = callback;
-    ctx->user_data = user_data;
-    ctx->needs_update = FALSE;
-    
-    // 在新线程中执行检查
-    GThread *thread = g_thread_new("check-offline-data-update", check_offline_data_update_thread, ctx);
+void check_offline_data_update(void) {
+    GThread *thread = g_thread_new("check-offline-data-update", check_offline_data_update_thread,
+                                   GUINT_TO_POINTER(get_install_generation()));
     g_thread_unref(thread);
 }
 
@@ -1031,8 +637,8 @@ JsonObject* get_card_by_id_offline(int card_id) {
     g_snprintf(card_id_str, sizeof(card_id_str), "%d", card_id);
 
     JsonObject *result = NULL;
-    if (json_object_has_member(offline_cards_root, card_id_str)) {
-        JsonNode *card_node = json_object_get_member(offline_cards_root, card_id_str);
+    if (json_object_has_member(offline_cache->root, card_id_str)) {
+        JsonNode *card_node = json_object_get_member(offline_cache->root, card_id_str);
         if (card_node && JSON_NODE_HOLDS_OBJECT(card_node)) {
             result = json_object_ref(json_node_get_object(card_node));
         }
@@ -1058,8 +664,8 @@ gchar* offline_get_en_name_by_id(int card_id) {
     g_snprintf(id_str, sizeof(id_str), "%d", card_id);
 
     gchar *result = NULL;
-    if (json_object_has_member(offline_cards_root, id_str)) {
-        JsonNode *card_node = json_object_get_member(offline_cards_root, id_str);
+    if (json_object_has_member(offline_cache->root, id_str)) {
+        JsonNode *card_node = json_object_get_member(offline_cache->root, id_str);
         if (card_node && JSON_NODE_HOLDS_OBJECT(card_node)) {
             JsonObject *card_obj = json_node_get_object(card_node);
             if (json_object_has_member(card_obj, "en_name")) {
@@ -1088,8 +694,8 @@ int offline_get_cid_by_img_id(int img_id) {
     char img_str[32];
     g_snprintf(img_str, sizeof(img_str), "%d", img_id);
     int cid = 0;
-    if (offline_img_to_cid) {
-        gpointer val = g_hash_table_lookup(offline_img_to_cid, img_str);
+    if (offline_cache->img_to_cid) {
+        gpointer val = g_hash_table_lookup(offline_cache->img_to_cid, img_str);
         if (val) cid = GPOINTER_TO_INT(val);
     }
     g_mutex_unlock(&offline_cache_mutex);
@@ -1097,33 +703,33 @@ int offline_get_cid_by_img_id(int img_id) {
 }
 
 static JsonObject *offline_get_card_object_by_cid_locked(int cid) {
-    if (!offline_cards_root || cid <= 0) return NULL;
+    if (!offline_cache->root || cid <= 0) return NULL;
 
     char cid_str[32];
     g_snprintf(cid_str, sizeof(cid_str), "%d", cid);
-    JsonNode *card_node = json_object_get_member(offline_cards_root, cid_str);
+    JsonNode *card_node = json_object_get_member(offline_cache->root, cid_str);
     if (!card_node || !JSON_NODE_HOLDS_OBJECT(card_node)) return NULL;
     return json_node_get_object(card_node);
 }
 
 static int offline_lookup_cid_by_img_id_locked(gint64 img_id) {
-    if (!offline_img_to_cid || img_id <= 0) return 0;
+    if (!offline_cache->img_to_cid || img_id <= 0) return 0;
 
     char img_str[32];
     g_snprintf(img_str, sizeof(img_str), "%" G_GINT64_FORMAT, img_id);
-    gpointer val = g_hash_table_lookup(offline_img_to_cid, img_str);
+    gpointer val = g_hash_table_lookup(offline_cache->img_to_cid, img_str);
     return val ? GPOINTER_TO_INT(val) : 0;
 }
 
 static int offline_lookup_cid_by_name_locked(const char *name) {
-    if (!offline_name_to_cid || !name || !*name) return 0;
+    if (!offline_cache->name_to_cid || !name || !*name) return 0;
 
     gchar *stripped = g_strdup(name);
     if (!stripped) return 0;
     g_strstrip(stripped);
     int cid = 0;
     if (*stripped) {
-        gpointer val = g_hash_table_lookup(offline_name_to_cid, stripped);
+        gpointer val = g_hash_table_lookup(offline_cache->name_to_cid, stripped);
         if (val) cid = GPOINTER_TO_INT(val);
     }
     g_free(stripped);
@@ -1274,8 +880,8 @@ static int offline_resolve_effective_card_id_locked(int card_id, int depth) {
     if (card_id <= 0) return 0;
     if (depth > 8) return card_id;
 
-    if (offline_effective_cid) {
-        gpointer cached = g_hash_table_lookup(offline_effective_cid, GINT_TO_POINTER(card_id));
+    if (offline_cache->effective_cid) {
+        gpointer cached = g_hash_table_lookup(offline_cache->effective_cid, GINT_TO_POINTER(card_id));
         if (cached) return GPOINTER_TO_INT(cached);
     }
 
@@ -1309,12 +915,12 @@ static int offline_resolve_effective_card_id_locked(int card_id, int depth) {
         }
     }
 
-    if (offline_effective_cid && effective_cid > 0) {
-        g_hash_table_insert(offline_effective_cid,
+    if (offline_cache->effective_cid && effective_cid > 0) {
+        g_hash_table_insert(offline_cache->effective_cid,
                             GINT_TO_POINTER(card_id),
                             GINT_TO_POINTER(effective_cid));
         if (source_cid != card_id) {
-            g_hash_table_insert(offline_effective_cid,
+            g_hash_table_insert(offline_cache->effective_cid,
                                 GINT_TO_POINTER(source_cid),
                                 GINT_TO_POINTER(effective_cid));
         }
@@ -1348,11 +954,11 @@ JsonArray* get_all_offline_cards(void) {
     JsonObject *root_obj = NULL;
     g_mutex_lock(&offline_cache_mutex);
     gboolean ok = offline_cache_ensure_loaded_locked();
-    if (ok && offline_cards_parser && offline_cards_root) {
+    if (ok && offline_cache->parser && offline_cache->root) {
         // 遍历期间必须持有解析器引用：并发的 reload/clear 会释放共享根对象，
         // 否则下面无锁遍历 root_obj 会读到已释放内存
-        parser_ref = g_object_ref(offline_cards_parser);
-        root_obj = offline_cards_root;
+        parser_ref = g_object_ref(offline_cache->parser);
+        root_obj = offline_cache->root;
     }
     g_mutex_unlock(&offline_cache_mutex);
 

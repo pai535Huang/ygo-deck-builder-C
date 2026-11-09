@@ -1,5 +1,6 @@
 #include "dnd_manager.h"
 #include "deck_slot.h"
+#include "card_info.h"
 #include "image_loader.h"
 #include "offline_data.h"
 #include "pixbuf_utils.h"
@@ -11,14 +12,12 @@
 #define DRAG_ICON_H 79
 
 // 外部函数声明
-extern void perform_move(SearchUI *ui, const char *from_region, int from_index, const char *to_region, int to_index);
+extern gboolean perform_move(SearchUI *ui, const char *from_region, int from_index, const char *to_region, int to_index);
 extern void update_count_label(GtkLabel *label, int count);
-extern int array_find_first_empty(GPtrArray *arr);
-extern void array_shift_right(GPtrArray *arr, int start, int end);
 extern void update_genesys_score(SearchUI *ui);  // GENESYS 总分更新
 extern void apply_overlay_to_widget(GtkWidget *w, SearchUI *ui);  // 设置卡图角标
 extern void update_deck_overlays(SearchUI *ui);  // 批量更新卡组角标
-extern void load_card_image(GtkWidget *slot, int img_id, SoupSession *session);  // 异步加载卡图（含先行卡/磁盘缓存/网络回退）
+extern void reload_missing_card_images(GPtrArray *slots, int count, SoupSession *session);
 
 // DnD: drag setup
 GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, double y, gpointer user_data) {
@@ -44,27 +43,14 @@ GdkContentProvider* on_drag_prepare(GtkDragSource *source, double x, double y, g
         
         CardPreview *pv = (CardPreview*)g_object_get_data(G_OBJECT(pic), "preview");
         if (!pv || pv->id <= 0) return NULL;
-        gboolean is_monster = FALSE, is_extra_type = FALSE;
-        if (pv->type > 0) {
-            if (pv->type & 0x1) is_monster = TRUE;  // TYPE_MONSTER
-            if ((pv->type & 0x40) || (pv->type & 0x2000) ||
-                (pv->type & 0x800000) || (pv->type & 0x4000000)) {  // FUSION, SYNCHRO, XYZ, LINK
-                is_extra_type = TRUE;
-            }
-        }
-        gboolean is_extra_card = is_monster && is_extra_type;
-        // payload 格式: search:<cid>:<id>:<isExtra>:<isPrerelease>:<en_name>
-        char *payload = g_strdup_printf("search:%d:%d:%d:%d:%s",
-            pv->cid, pv->id, is_extra_card ? 1 : 0, pv->is_prerelease ? 1 : 0,
-            pv->en_name ? pv->en_name : "");
-        // gdk_content_provider_new_typed 通过 GValue 复制字符串，不接管所有权
-        GdkContentProvider *provider = gdk_content_provider_new_typed(G_TYPE_STRING, payload);
-        g_free(payload);
-        return provider;
+        g_autoptr(GVariant) card = g_variant_ref_sink(g_variant_new("(iiuss)",
+            pv->cid, pv->id, pv->type, pv->en_name ? pv->en_name : "",
+            pv->sheet_name ? pv->sheet_name : ""));
+        g_autofree char *serialized = g_variant_print(card, FALSE);
+        g_autofree char *payload = g_strconcat("search:", serialized, NULL);
+        return gdk_content_provider_new_typed(G_TYPE_STRING, payload);
     }
-    // 中栏槽位拖拽：仅当槽位已有图像时才允许拖拽
-    GdkPixbuf *pb = slot_get_pixbuf(pic);
-    if (!pb) return NULL;
+    if (!slot_get_img_id(pic)) return NULL;
     const char *region = (const char*)g_object_get_data(G_OBJECT(pic), "slot_region");
     int index = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "slot_index"));
     char *payload = g_strdup_printf("%s:%d", region ? region : "", index);
@@ -204,12 +190,13 @@ static int limit_from_status(const char *status) {
 }
 
 // 获取卡片在当前禁限卡表中允许的最大数量
-int get_card_limit(SearchUI *ui, int card_id) {
-    if (card_id <= 0) return 3;  // 默认3张
+int get_card_limit(SearchUI *ui, int card_id, uint32_t type) {
     
     GHashTable *forbidden_table = NULL;
     if (ui->forbidden_dropdown) {
         guint selected = gtk_drop_down_get_selected(ui->forbidden_dropdown);
+        if (selected == 4)
+            return (type & (0x1000000 | 0x4000000)) ? 0 : 3;  // 灵摆、连接
         if (selected == 0 && ui->ocg_forbidden) {
             forbidden_table = ui->ocg_forbidden;
         } else if (selected == 1 && ui->tcg_forbidden) {
@@ -221,7 +208,7 @@ int get_card_limit(SearchUI *ui, int card_id) {
         }
     }
     
-    if (forbidden_table) {
+    if (forbidden_table && card_id > 0) {
         int effective_id = get_effective_card_id_for_limit(card_id);
         const char *status = lookup_forbidden_status(forbidden_table, effective_id);
         if (!status && effective_id != card_id) {
@@ -287,108 +274,68 @@ gboolean on_drop_accept(GtkDropTarget *target, GdkDrop *drop, gpointer user_data
     return gdk_content_formats_match(fmts, string_formats);
 }
 
-void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpointer user_data) {
+gboolean on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpointer user_data) {
     (void)x; (void)y;
     SearchUI *ui = (SearchUI*)user_data;
     GtkWidget *pic = gtk_event_controller_get_widget(GTK_EVENT_CONTROLLER(target));
     const char *to_region = (const char*)g_object_get_data(G_OBJECT(pic), "slot_region");
     int to_index = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(pic), "slot_index"));
-    if (!value || !G_VALUE_HOLDS_STRING(value)) return;
+    if (!value || !G_VALUE_HOLDS_STRING(value)) return FALSE;
     const char *payload = g_value_get_string(value);
-    if (!payload) return;
-    // 支持两种 payload：
-    // 1) "region:index" 来自中栏槽位拖拽
-    // 2) "search:<cid>:<id>:<isExtra>:<isPrerelease>" 来自右栏行拖拽
+    if (!payload) return FALSE;
     if (g_str_has_prefix(payload, "search:")) {
-        int card_id = 0;  // cid，用于禁限卡检查和统计
-        int img_id = 0;   // id，用于图片URL
-        int is_extra = 0;
-        const char *en_name_str = NULL;  // GENESYS 分值查找用
-        // 解析 search:cid:id:isExtra:isPrerelease:en_name（isPrerelease 字段保留兼容，
-        // 是否先行卡由 load_card_image 按卡片数据自行判断）
-        const char *p = payload + 7;
-        const char *colon1 = strchr(p, ':');
-        if (colon1) {
-            card_id = atoi(p);
-            const char *colon2 = strchr(colon1 + 1, ':');
-            if (colon2) {
-                img_id = atoi(colon1 + 1);
-                const char *colon3 = strchr(colon2 + 1, ':');
-                if (colon3) {
-                    is_extra = atoi(colon2 + 1);
-                    const char *colon4 = strchr(colon3 + 1, ':');
-                    if (colon4) {
-                        // en_name 是第5个冒号之后直到行尾
-                        en_name_str = colon4 + 1;
-                    }
-                } else {
-                    is_extra = atoi(colon2 + 1);
-                }
-            }
-        }
-        if (card_id <= 0 || img_id <= 0) return;
-        
-        // 检查禁限卡表限制
-        int limit = get_card_limit(ui, card_id);
-        if (limit == 0) return;  // 禁止卡，不能加入
-        
-        int current_count = count_card_in_deck(ui, card_id, is_extra ? TRUE : FALSE);
-        if (current_count >= limit) return;  // 已达到上限
-        
+        g_autoptr(GVariant) card = g_variant_parse(G_VARIANT_TYPE("(iiuss)"),
+                                                    payload + 7, NULL, NULL, NULL);
+        if (!card) return FALSE;
+
+        int card_id, img_id;
+        uint32_t type;
+        const char *en_name, *sheet_name;
+        g_variant_get(card, "(iiu&s&s)", &card_id, &img_id, &type, &en_name, &sheet_name);
+        if (card_id <= 0 || img_id <= 0) return FALSE;
+
+        gboolean is_extra = card_type_is_extra(type);
+        int limit = get_card_limit(ui, card_id, type);
+        if (limit == 0 || count_card_in_deck(ui, card_id, is_extra) >= limit)
+            return FALSE;
+
         // 类型限制
-        if (g_strcmp0(to_region, "main") == 0 && is_extra) return;
-        if (g_strcmp0(to_region, "extra") == 0 && !is_extra) return;
+        if (g_strcmp0(to_region, "main") == 0 && is_extra) return FALSE;
+        if (g_strcmp0(to_region, "extra") == 0 && !is_extra) return FALSE;
         // 选择目标数组与计数
         GPtrArray *to_arr = NULL; int *to_count = NULL; GtkLabel *to_label = NULL;
         if (g_strcmp0(to_region, "main") == 0) { to_arr = ui->main_pics; to_count = &ui->main_idx; to_label = ui->main_count; }
         else if (g_strcmp0(to_region, "extra") == 0) { to_arr = ui->extra_pics; to_count = &ui->extra_idx; to_label = ui->extra_count; }
         else if (g_strcmp0(to_region, "side") == 0) { to_arr = ui->side_pics; to_count = &ui->side_idx; to_label = ui->side_count; }
-        if (!to_arr || !to_count) return;
-        if (to_index < 0 || to_index >= (int)to_arr->len) return;
-        // 自动放置：若目标与前一个都空，放到第一个空位
-        int place_index = to_index;
-        GtkWidget *prev = (to_index > 0) ? GTK_WIDGET(g_ptr_array_index(to_arr, to_index - 1)) : NULL;
-        GtkWidget *to_chk = GTK_WIDGET(g_ptr_array_index(to_arr, to_index));
-        gboolean prev_empty = !prev || slot_get_pixbuf(prev) == NULL;
-        gboolean target_empty = slot_get_pixbuf(to_chk) == NULL;
-        if (prev_empty && target_empty) {
-            int first_empty = array_find_first_empty(to_arr);
-            if (first_empty >= 0) place_index = first_empty;
-        }
-        // 若目标槽位已被占用，则是「插入到中间」：尾部整体右移一格
-        // （末张卡移到 *to_count 位置）并把计数 +1。
-        // 此前的 end_to = *to_count - 1 会直接覆盖末张卡且计数不变 —— 静默丢失一张卡。
-        GtkWidget *place_w = GTK_WIDGET(g_ptr_array_index(to_arr, place_index));
-        if (place_index < *to_count && slot_get_pixbuf(place_w) != NULL) {
-            if (*to_count >= (int)to_arr->len) {
-                return;  // 区域已满，无处插入（保持卡组不变）
-            }
-            array_shift_right(to_arr, place_index, *to_count);
-            *to_count += 1;
-        } else if (*to_count < place_index + 1) {
-            // 填入空洞或扩展到新槽位
-            *to_count = place_index + 1;
-        }
+        if (!to_arr || !to_count) return FALSE;
+        if (to_index < 0 || to_index >= (int)to_arr->len) return FALSE;
+        if (*to_count >= (int)to_arr->len) return FALSE;
+
+        int place_index = MIN(to_index, *to_count);
+        GtkWidget *place_w = g_ptr_array_index(to_arr, place_index);
+        array_shift_right(to_arr, place_index, *to_count);
+        (*to_count)++;
+        slot_clear_card(place_w);
         // 记录类型标记和卡片ID（用于统计禁限卡数量）
-        slot_set_is_extra(place_w, is_extra ? TRUE : FALSE);
+        slot_set_is_extra(place_w, is_extra);
         g_object_set_data(G_OBJECT(place_w), "card_id", GINT_TO_POINTER(card_id));
         g_object_set_data(G_OBJECT(place_w), "img_id", GINT_TO_POINTER(img_id));
         // 存储英文和名（GENESYS 分值查找用）
-        slot_set_en_name(place_w, (en_name_str && *en_name_str) ? en_name_str : NULL);
+        slot_set_en_name(place_w, *en_name ? en_name : NULL);
+        slot_set_card_details(place_w, type, sheet_name);
         // 立即设置角标数据（图片加载后会显示）
         apply_overlay_to_widget(place_w, ui);
         
         // 统一走异步加载路径：先行卡本地文件后台线程读取（此前为同步 IO），
         // 普通卡先查内存/磁盘缓存（此前拖放绕过磁盘缓存），未命中才发起网络
         // 下载，且下载结果会写入磁盘缓存（此前 cache_id=0 不入缓存）
-        if (img_id > 0) {
-            load_card_image(place_w, img_id, ui->session);
-        }
+        reload_missing_card_images(to_arr, *to_count, ui->session);
         update_count_label(to_label, *to_count);
         update_genesys_score(ui);
         update_deck_overlays(ui);
         ui->hovered_slot_img_id = 0;
-        return;
+        ui->hover_generation++;
+        return TRUE;
     }
     // 原有 region:index 处理
     char from_region[8] = {0};
@@ -401,6 +348,6 @@ void on_drop(GtkDropTarget *target, const GValue *value, double x, double y, gpo
         from_region[len] = '\0';
         from_index = atoi(colon + 1);
     }
-    if (from_index < 0 || from_region[0] == '\0') return;
-    perform_move(ui, from_region, from_index, to_region, to_index);
+    if (from_index < 0 || from_region[0] == '\0') return FALSE;
+    return perform_move(ui, from_region, from_index, to_region, to_index);
 }

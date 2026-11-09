@@ -1,16 +1,15 @@
 #include "image_loader.h"
+#include "deck_slot.h"
 #include "app_path.h"
 #include "pixbuf_utils.h"
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <glib/gstdio.h>
-#include <unistd.h>
+#include <string.h>
 
 // 全局缓存变量
 static GHashTable *thumb_cache = NULL;       // 缩略图缓存
 static GHashTable *fullsize_cache = NULL;    // 全尺寸图片缓存
 static char *cache_dir = NULL;               // 缓存目录路径
-static GHashTable *pending_downloads = NULL; // 待处理下载
-static GMutex cache_mutex;                   // 缓存互斥锁
 
 // 缓存容量控制：避免内存无限增长
 #define THUMB_CACHE_MAX_ENTRIES 700
@@ -36,24 +35,13 @@ static gboolean is_mem_cache_enabled(void) {
     return mem_cache_enabled;
 }
 
-// 搜索结果快速切换异画时，同一目标上可能同时存在多个网络/磁盘回调。
-// 只有仍对应当前 art_expected_id 的回调才允许更新 UI。
-static gboolean image_target_matches_expected(ImageLoadCtx *ctx) {
-    if (!ctx || ctx->expected_img_id <= 0) return TRUE;
-    if (!ctx->target || !GTK_IS_WIDGET(ctx->target)) return FALSE;
-    int expected = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(ctx->target), "art_expected_id"));
-    return expected <= 0 || expected == ctx->expected_img_id;
-}
-
-// 缩略图逻辑尺寸（与 UI 中 thumb-fixed 保持一致）
-#define THUMB_W 68
-#define THUMB_H 99
+#define THUMB_CACHE_SCALE 2
 
 static GdkPixbuf* create_thumb_pixbuf(GdkPixbuf *src, int scale_factor) {
     if (!src) return NULL;
     if (scale_factor < 1) scale_factor = 1;
-    const int tw = THUMB_W * scale_factor;
-    const int th = THUMB_H * scale_factor;
+    const int tw = SLOT_THUMB_W * scale_factor;
+    const int th = SLOT_THUMB_H * scale_factor;
 
     const int w = gdk_pixbuf_get_width(src);
     const int h = gdk_pixbuf_get_height(src);
@@ -89,7 +77,7 @@ static void cache_order_push(GQueue *order, const char *key) {
 }
 
 // 启动时的磁盘缓存清理（后台线程执行）：统计 <card_id>.png 文件数，
-// 超过上限时按 mtime 从旧到新删除；同时清理崩溃残留的临时写盘文件
+// 超过上限时按 mtime 从旧到新删除。
 typedef struct {
     char *name;
     gint64 mtime;
@@ -119,14 +107,6 @@ static void disk_cache_cleanup_thread(GTask *task, gpointer source_object, gpoin
     GArray *entries = g_array_new(FALSE, FALSE, sizeof(DiskCacheEntry));
     const char *name;
     while ((name = g_dir_read_name(gdir)) != NULL) {
-        // 崩溃残留的临时写盘文件（<id>.png.tmp.<pid>）直接删除
-        if (strstr(name, ".png.tmp.") != NULL) {
-            gchar *full = g_build_filename(dir, name, NULL);
-            g_unlink(full);
-            g_free(full);
-            continue;
-        }
-
         // 只统计本缓存生成的 <card_id>.png
         size_t len = strlen(name);
         if (len <= 4 || !g_str_has_suffix(name, ".png")) continue;
@@ -178,696 +158,371 @@ static void disk_cache_cleanup_finished(GObject *source, GAsyncResult *res, gpoi
     if (err) g_error_free(err);
 }
 
-// 全局取消标志（使用计数器而不是GCancellable列表）
-// 每次开始新搜索时递增，回调检查这个值来判断是否应该继续
-static guint64 global_cancel_generation = 0;
-static GMutex cancel_generation_mutex;
-
-// 下载队列管理
-#define MAX_CONCURRENT_DOWNLOADS 6  // 最大并发下载数
-static GQueue *download_queue = NULL;        // 待下载队列
-static int active_downloads = 0;             // 当前活跃下载数
-static GMutex download_queue_mutex;          // 队列互斥锁
-
-// 内部结构：解码任务数据
 typedef struct {
-    GBytes *image_data;
-    ImageLoadCtx *ctx;
-    guint64 cancel_generation;  // 创建时的取消代次
-} DecodeTaskData;
+    GtkWidget *widget;
+    GtkStack *stack;
+    SoupSession *session;
+    int img_id;
+    int scale;
+    gboolean thumbnail;
+    gboolean local_only;
+    char *local_path;
+} ImageTarget;
 
-// 前向声明
-static void decode_task_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable);
-static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer user_data);
-static void image_response_cb(GObject *source, GAsyncResult *res, gpointer user_data);
-static void process_download_queue(SoupSession *session);
-static void start_download(SoupSession *session, ImageLoadCtx *ctx);
+typedef struct {
+    SoupSession *session;
+    GPtrArray *targets;
+    int img_id;
+} ImageDownload;
 
-static void free_image_load_ctx(ImageLoadCtx *ctx) {
-    if (!ctx) return;
-    if (ctx->target && G_IS_OBJECT(ctx->target)) {
-        g_object_remove_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
-    }
-    if (ctx->stack && G_IS_OBJECT(ctx->stack)) {
-        g_object_remove_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
-    }
-    g_free(ctx->url);
-    g_free(ctx);
+// Target ownership, the request map and the queue belong to the UI thread.
+#define MAX_CONCURRENT_DOWNLOADS 6
+static GHashTable *pending_downloads;
+static GQueue *download_queue;
+static guint active_downloads;
+static char *thumb_cache_dir;
+
+static int image_expected_id(GtkWidget *widget) {
+    int art_id = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(widget), "art_expected_id"));
+    return art_id > 0 ? art_id : slot_get_img_id(widget);
 }
 
-// 从 pending_downloads 中整体取走指定 URL 的等待队列，容器和元素的所有权转移给调用者。
-// 元素不在此处释放，由容器自身的元素析构函数（见 load_image_async）统一释放。
-static GPtrArray* detach_waiting_contexts(const char *url) {
-    if (!url) return NULL;
+static gboolean image_target_is_current(const ImageTarget *target) {
+    return target->widget && image_expected_id(target->widget) == target->img_id &&
+           g_object_get_data(G_OBJECT(target->widget), "loading-image") == target;
+}
 
-    GPtrArray *result = NULL;
-    g_mutex_lock(&cache_mutex);
-    if (pending_downloads) {
-        gpointer orig_key = NULL, value = NULL;
-        if (g_hash_table_lookup_extended(pending_downloads, url, &orig_key, &value)) {
-            result = (GPtrArray*)value;
-            // steal 不触发 key/value 析构函数，key 需在此手动释放
-            g_hash_table_steal(pending_downloads, url);
-            g_free(orig_key);
+static void set_image_spinner(GtkStack *stack, gboolean loading) {
+    GtkSpinner *spinner = stack ? g_object_get_data(G_OBJECT(stack), "image-spinner") : NULL;
+    if (!spinner) return;
+    gtk_spinner_set_spinning(spinner, loading);
+    gtk_widget_set_visible(GTK_WIDGET(spinner), loading);
+}
+
+static void image_target_free(gpointer data) {
+    ImageTarget *target = data;
+    if (target->widget) {
+        if (g_object_get_data(G_OBJECT(target->widget), "loading-image") == target) {
+            set_image_spinner(target->stack, FALSE);
+            g_object_set_data(G_OBJECT(target->widget), "loading-image", NULL);
         }
+        g_object_remove_weak_pointer(G_OBJECT(target->widget), (gpointer *)&target->widget);
     }
-    g_mutex_unlock(&cache_mutex);
-    return result;
+    if (target->stack)
+        g_object_remove_weak_pointer(G_OBJECT(target->stack), (gpointer *)&target->stack);
+    g_object_unref(target->session);
+    g_free(target->local_path);
+    g_free(target);
 }
 
-static void free_waiting_contexts(GPtrArray *waiting) {
-    if (!waiting) return;
-    // 元素由容器的元素析构函数逐个释放（含弱指针 detach）
-    g_ptr_array_unref(waiting);
+static void image_download_free(gpointer data) {
+    ImageDownload *download = data;
+    g_object_unref(download->session);
+    g_ptr_array_unref(download->targets);
+    g_free(download);
+}
+
+static void schedule_disk_cleanup(const char *directory) {
+    g_autoptr(GTask) task = g_task_new(NULL, NULL, disk_cache_cleanup_finished, NULL);
+    g_task_set_task_data(task, g_strdup(directory), g_free);
+    g_task_run_in_thread(task, disk_cache_cleanup_thread);
 }
 
 void init_image_cache(void) {
-    g_mutex_init(&cache_mutex);
-    g_mutex_init(&cancel_generation_mutex);
-    g_mutex_init(&download_queue_mutex);
-    
+    if (download_queue) return;
+
     if (is_mem_cache_enabled()) {
-        thumb_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_object_unref);
-        fullsize_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_object_unref);
+        thumb_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_object_unref);
+        fullsize_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_object_unref);
         thumb_cache_order = g_queue_new();
         fullsize_cache_order = g_queue_new();
     }
-    pending_downloads = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)g_ptr_array_unref);
-    download_queue = g_queue_new();
-    
-    // 创建缓存目录
-    if (is_portable_mode()) {
-        // 便携模式：程序所在目录下的 img 子目录
-        const char *prog_dir = get_program_directory();
-        cache_dir = g_build_filename(prog_dir, "img", NULL);
-    } else {
-        // 系统安装模式：使用 XDG_CACHE_HOME
-        const char *cache_home = g_get_user_cache_dir();
-        cache_dir = g_build_filename(cache_home, "ygo-deck-builder", "images", NULL);
-    }
-    g_mkdir_with_parents(cache_dir, 0755);
 
-    // 启动时在后台线程执行磁盘缓存清理，不阻塞界面初始化
-    {
-        gchar *dir_copy = g_strdup(cache_dir);
-        GTask *cleanup_task = g_task_new(NULL, NULL, disk_cache_cleanup_finished, NULL);
-        g_task_set_task_data(cleanup_task, dir_copy, g_free);
-        g_task_run_in_thread(cleanup_task, disk_cache_cleanup_thread);
-        g_object_unref(cleanup_task);
-    }
+    pending_downloads = g_hash_table_new(g_direct_hash, g_direct_equal);
+    download_queue = g_queue_new();
+    cache_dir = is_portable_mode()
+        ? g_build_filename(get_program_directory(), "img", NULL)
+        : g_build_filename(g_get_user_cache_dir(), "ygo-deck-builder", "images", NULL);
+    thumb_cache_dir = g_build_filename(cache_dir, "thumbs", NULL);
+    g_mkdir_with_parents(thumb_cache_dir, 0755);
+    schedule_disk_cleanup(cache_dir);
+    schedule_disk_cleanup(thumb_cache_dir);
 }
 
 void cleanup_image_cache(void) {
-    g_mutex_lock(&cache_mutex);
-    if (thumb_cache) {
-        g_hash_table_destroy(thumb_cache);
-        thumb_cache = NULL;
-    }
-    if (fullsize_cache) {
-        g_hash_table_destroy(fullsize_cache);
-        fullsize_cache = NULL;
-    }
-    if (pending_downloads) {
-        g_hash_table_destroy(pending_downloads);
-        pending_downloads = NULL;
-    }
+    g_clear_pointer(&thumb_cache, g_hash_table_unref);
+    g_clear_pointer(&fullsize_cache, g_hash_table_unref);
+    if (thumb_cache_order) g_queue_free_full(thumb_cache_order, g_free);
+    if (fullsize_cache_order) g_queue_free_full(fullsize_cache_order, g_free);
+    thumb_cache_order = fullsize_cache_order = NULL;
+    g_clear_pointer(&pending_downloads, g_hash_table_unref);
+    if (download_queue) g_queue_free_full(download_queue, image_download_free);
+    download_queue = NULL;
 
-    if (thumb_cache_order) {
-        g_queue_free_full(thumb_cache_order, g_free);
-        thumb_cache_order = NULL;
-    }
-    if (fullsize_cache_order) {
-        g_queue_free_full(fullsize_cache_order, g_free);
-        fullsize_cache_order = NULL;
-    }
-
-    // 注意：此处刻意不 g_free(cache_dir)、也不 g_mutex_clear 三个互斥锁。
-    // cleanup_image_cache 在 g_application_run 返回后调用，此时后台 GTask 工作线程
-    // （解码/写盘）可能仍在运行：decode_task_thread 会读取全局 cache_dir
-    // （save_to_disk_cache）并通过 is_cancelled 锁定 cancel_generation_mutex。
-    // 在进程即将退出时释放它们只会造成 use-after-free 与锁定已销毁互斥锁的
-    // 未定义行为；这些内存随进程结束由操作系统回收。
-    g_mutex_unlock(&cache_mutex);
-    
-    g_mutex_lock(&download_queue_mutex);
-    if (download_queue) {
-        // 清理队列中的所有上下文
-        gpointer item;
-        while ((item = g_queue_pop_head(download_queue)) != NULL) {
-            ImageLoadCtx *ctx = (ImageLoadCtx*)item;
-            if (ctx->target) {
-                g_object_remove_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
-            }
-            if (ctx->stack) {
-                g_object_remove_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
-            }
-            g_free(ctx->url);
-            g_free(ctx);
-        }
-        g_queue_free(download_queue);
-        download_queue = NULL;
-    }
-    g_mutex_unlock(&download_queue_mutex);
-    // 同上：互斥锁保持有效，避免仍在退出的工作线程锁定已销毁的锁
+    // Running decode jobs still read the cache paths until process exit.
 }
 
-GdkPixbuf* load_from_disk_cache(int card_id) {
-    if (!cache_dir) return NULL;
-    char *filename = g_strdup_printf("%s/%d.png", cache_dir, card_id);
-    GError *err = NULL;
-    GdkPixbuf *pb = gdk_pixbuf_new_from_file(filename, &err);
-    if (err) {
-        g_error_free(err);
-        pb = NULL;
-    }
-    g_free(filename);
-    return pb;
+static GdkPixbuf *load_cached_image(const char *directory, int img_id) {
+    if (!directory) return NULL;
+    g_autofree char *path = g_strdup_printf("%s/%d.png", directory, img_id);
+    return gdk_pixbuf_new_from_file(path, NULL);
 }
 
-void save_to_disk_cache(int card_id, GdkPixbuf *pixbuf) {
-    if (!cache_dir || !pixbuf) return;
-    char *filename = g_strdup_printf("%s/%d.png", cache_dir, card_id);
-    // 先写临时文件再 rename：写盘可能来自工作线程，避免并发写同一文件产生半截 PNG
-    char *tmpfile = g_strdup_printf("%s.tmp.%d", filename, (int)getpid());
-    GError *err = NULL;
-    if (gdk_pixbuf_save(pixbuf, tmpfile, "png", &err, NULL)) {
-        g_rename(tmpfile, filename);
-    } else {
-        if (err) g_error_free(err);
-        g_unlink(tmpfile);
-    }
-    g_free(tmpfile);
-    g_free(filename);
+GdkPixbuf *load_from_disk_cache(int img_id) {
+    return load_cached_image(cache_dir, img_id);
 }
 
-GdkPixbuf* get_thumb_from_cache(int card_id) {
-    if (!is_mem_cache_enabled()) return NULL;
-    GdkPixbuf *result = NULL;
-    g_mutex_lock(&cache_mutex);
-    if (thumb_cache) {
-        char key[32];
-        g_snprintf(key, sizeof(key), "%d", card_id);
-        result = (GdkPixbuf*)g_hash_table_lookup(thumb_cache, key);
-    }
-    g_mutex_unlock(&cache_mutex);
-    return result;
+static void save_cached_image(const char *directory, int img_id, GdkPixbuf *pixbuf) {
+    if (!directory || !pixbuf) return;
+    g_autofree char *path = g_strdup_printf("%s/%d.png", directory, img_id);
+    g_autofree char *bytes = NULL;
+    gsize size;
+    if (gdk_pixbuf_save_to_buffer(pixbuf, &bytes, &size, "png", NULL, NULL))
+        g_file_set_contents_full(path, bytes, size, G_FILE_SET_CONTENTS_CONSISTENT, 0644, NULL);
 }
 
-GdkPixbuf* get_fullsize_from_cache(int card_id) {
-    if (!is_mem_cache_enabled()) return NULL;
-    GdkPixbuf *result = NULL;
-    g_mutex_lock(&cache_mutex);
-    if (fullsize_cache) {
-        char key[32];
-        g_snprintf(key, sizeof(key), "%d", card_id);
-        result = (GdkPixbuf*)g_hash_table_lookup(fullsize_cache, key);
-    }
-    g_mutex_unlock(&cache_mutex);
-    return result;
+static void cache_memory_image(GHashTable *cache, GQueue *order, guint max_entries,
+                               int img_id, GdkPixbuf *pixbuf) {
+    if (!cache || !pixbuf) return;
+    char *key = g_strdup_printf("%d", img_id);
+    g_hash_table_replace(cache, key, g_object_ref(pixbuf));
+    cache_order_push(order, key);
+    evict_cache_if_needed(cache, order, max_entries);
 }
 
-// 获取当前取消代次（用于在开始异步操作前记录）
-guint64 get_cancel_generation(void) {
-    guint64 gen;
-    g_mutex_lock(&cancel_generation_mutex);
-    gen = global_cancel_generation;
-    g_mutex_unlock(&cancel_generation_mutex);
-    return gen;
+static void apply_image(GtkWidget *widget, GtkStack *stack, int img_id, GdkPixbuf *pixbuf) {
+    if (GTK_IS_DRAWING_AREA(widget)) {
+        g_object_set_data(G_OBJECT(widget), "img_id", GINT_TO_POINTER(img_id));
+        slot_set_pixbuf(widget, pixbuf);
+    } else if (GTK_IS_PICTURE(widget)) {
+        g_autoptr(GdkTexture) texture = pixbuf_utils_texture_from_pixbuf(pixbuf);
+        if (!texture) return;
+        gtk_picture_set_paintable(GTK_PICTURE(widget), GDK_PAINTABLE(texture));
+        g_object_set_data(G_OBJECT(widget), "displayed-image-id", GINT_TO_POINTER(img_id));
+    }
+    if (stack) gtk_stack_set_visible_child_name(stack, "picture");
 }
 
-// 检查是否已被取消（比较当前代次与记录的代次）
-gboolean is_cancelled(guint64 recorded_generation) {
-    guint64 current;
-    g_mutex_lock(&cancel_generation_mutex);
-    current = global_cancel_generation;
-    g_mutex_unlock(&cancel_generation_mutex);
-    return recorded_generation != current;
+static void process_download_queue(void);
+
+typedef struct {
+    GBytes *bytes;
+    int img_id;
+} DecodeData;
+
+typedef struct {
+    GdkPixbuf *full;
+    GdkPixbuf *thumbnail;
+} DecodedImage;
+
+static void decoded_image_free(gpointer data) {
+    DecodedImage *image = data;
+    if (!image) return;
+    g_clear_object(&image->full);
+    g_clear_object(&image->thumbnail);
+    g_free(image);
 }
 
-void cancel_all_pending(void) {
-    // 仅递增取消代次，不实际取消任何GCancellable
-    // 这样libsoup的请求会自然完成，但回调会检测到代次变化并跳过处理
-    g_mutex_lock(&cancel_generation_mutex);
-    global_cancel_generation++;
-    g_mutex_unlock(&cancel_generation_mutex);
-    
-    // 清空下载队列（这些还没开始下载）
-    // 同时移除 pending_downloads 里对应 URL 的条目：否则会一直残留，重复搜索会不断累积。
-    // 锁顺序必须与 load_image_async 一致：cache_mutex -> download_queue_mutex，避免死锁。
-    g_mutex_lock(&cache_mutex);
-    g_mutex_lock(&download_queue_mutex);
-    if (download_queue) {
-        gpointer item;
-        while ((item = g_queue_pop_head(download_queue)) != NULL) {
-            ImageLoadCtx *ctx = (ImageLoadCtx*)item;
-
-            if (pending_downloads && ctx->url) {
-                // 移除条目时，value 析构函数 unref 等待队列，
-                // 队列的元素析构函数会逐个 detach 弱指针并释放等待中的 ctx。
-                // 若缺了这一步，等待中的 ctx 会随队列一起泄漏且弱指针悬空，
-                // 控件销毁时 GObject 会向已释放内存写 NULL（use-after-free）。
-                g_hash_table_remove(pending_downloads, ctx->url);
-            }
-
-            if (ctx->target) {
-                g_object_remove_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
-            }
-            if (ctx->stack) {
-                g_object_remove_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
-            }
-            g_free(ctx->url);
-            g_free(ctx);
-        }
-    }
-    g_mutex_unlock(&download_queue_mutex);
-    g_mutex_unlock(&cache_mutex);
-    
-    // 不要清空 pending_downloads！
-    // 活跃的下载回调仍然会访问这个哈希表
-    // 让回调函数自己清理（它们会检测到代次变化并跳过处理UI，但仍会从哈希表中移除条目）
-}
-
-const char* get_cache_dir(void) {
-    return cache_dir;
-}
-
-// 后台线程：解码图片
-static void decode_task_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable) {
-    (void)source_object;
-    (void)cancellable;
-    
-    if (!task_data) {
-        g_task_return_pointer(task, NULL, NULL);
-        return;
-    }
-    
-    DecodeTaskData *data = (DecodeTaskData*)task_data;
-    
-    // 检查是否已被取消
-    if (is_cancelled(data->cancel_generation)) {
-        g_task_return_pointer(task, NULL, NULL);
-        return;
-    }
-    
-    GdkPixbuf *pixbuf = NULL;
-    if (data->image_data) {
-        gsize size;
-        const guint8 *bytes_data = g_bytes_get_data(data->image_data, &size);
-        
-        if (size > 0 && !is_cancelled(data->cancel_generation)) {
-            GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
-            GError *err = NULL;
-            if (gdk_pixbuf_loader_write(loader, bytes_data, size, &err)) {
-                gdk_pixbuf_loader_close(loader, NULL);
-                pixbuf = gdk_pixbuf_loader_get_pixbuf(loader);
-                if (pixbuf) {
-                    pixbuf = g_object_ref(pixbuf);
-                }
-            } else {
-                if (err) g_error_free(err);
-            }
-            g_object_unref(loader);
-        }
-    }
-    
-    // 在工作线程完成 PNG 编码写盘：libpng 压缩单张可达数十毫秒，
-    // 留在主线程回调中会让每张新图的落地都阻塞一次 UI
-    if (pixbuf && data->ctx && data->ctx->cache_id > 0 && !is_cancelled(data->cancel_generation)) {
-        save_to_disk_cache(data->ctx->cache_id, pixbuf);
-    }
-
-    if (pixbuf) {
-        g_task_return_pointer(task, pixbuf, (GDestroyNotify)g_object_unref);
-    } else {
-        g_task_return_pointer(task, NULL, NULL);
-    }
-}
-
-// 解码完成回调
-static void decode_task_finished(GObject *source, GAsyncResult *res, gpointer user_data) {
+static void decode_image_thread(GTask *task, gpointer source, gpointer task_data,
+                                GCancellable *cancellable) {
     (void)source;
-    DecodeTaskData *data = (DecodeTaskData*)user_data;
-    
-    if (!data || !data->ctx) {
-        g_warning("decode_task_finished: data or ctx is NULL!");
-        if (data) {
-            if (data->image_data) g_bytes_unref(data->image_data);
-            g_free(data);
-        }
+    (void)cancellable;
+    DecodeData *data = task_data;
+    g_autoptr(GInputStream) input = g_memory_input_stream_new_from_bytes(data->bytes);
+    GdkPixbuf *full = gdk_pixbuf_new_from_stream(input, NULL, NULL);
+    if (!full) {
+        g_task_return_pointer(task, NULL, NULL);
         return;
     }
-    
-    ImageLoadCtx *ctx = data->ctx;
-    GTask *task = G_TASK(res);
-    GError *err = NULL;
-    GdkPixbuf *pixbuf = (GdkPixbuf*)g_task_propagate_pointer(task, &err);
-    
-    if (err) {
-        g_error_free(err);
-    }
 
-    // 仅在需要缩略图时懒生成，避免每行持有大图导致内存飙升
-    GdkPixbuf *thumb_pixbuf = NULL;
-    
-    // 使用代次检查代替 g_cancellable_is_cancelled
-    if (pixbuf && !is_cancelled(data->cancel_generation) && ctx->target &&
-        image_target_matches_expected(ctx)) {
-        // 额外的类型检查以确保对象仍然有效
-        if (GTK_IS_WIDGET(ctx->target) && GTK_IS_DRAWING_AREA(ctx->target)) {
-            GdkPixbuf *ui_pixbuf = pixbuf;
-            if (ctx->scale_to_thumb) {
-                int sf = gtk_widget_get_scale_factor(GTK_WIDGET(ctx->target));
-                if (!thumb_pixbuf) thumb_pixbuf = create_thumb_pixbuf(pixbuf, sf);
-                ui_pixbuf = thumb_pixbuf ? thumb_pixbuf : pixbuf;
-            }
-            // 清空缓存的 surface（触发 destroy notify 如果有的话）
-            g_object_set_data_full(G_OBJECT(ctx->target), "cached_surface", NULL, NULL);
-            g_object_set_data_full(G_OBJECT(ctx->target), "cached_render", NULL, NULL);
-            
-            // 目标是DrawingArea（卡组槽位）
-            g_object_set_data_full(G_OBJECT(ctx->target), "pixbuf", g_object_ref(ui_pixbuf), 
-                                   (GDestroyNotify)g_object_unref);
-            gtk_widget_queue_draw(ctx->target);
-            
-            if (ctx->stack && GTK_IS_STACK(ctx->stack)) {
-                gtk_stack_set_visible_child_name(ctx->stack, "picture");
-            }
-            
-            // 添加到缩略图缓存（只缓存缩略图；如禁用内存缓存则跳过）
-            if (is_mem_cache_enabled() && ctx->add_to_thumb_cache && ctx->cache_id > 0) {
-                int sf = 1;
-                if (ctx->target && GTK_IS_WIDGET(ctx->target)) sf = gtk_widget_get_scale_factor(GTK_WIDGET(ctx->target));
-                if (!thumb_pixbuf) thumb_pixbuf = create_thumb_pixbuf(pixbuf, sf);
-                g_mutex_lock(&cache_mutex);
-                if (!thumb_cache) {
-                    thumb_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, 
-                                                       (GDestroyNotify)g_object_unref);
-                }
-                char *key = g_strdup_printf("%d", ctx->cache_id);
-                g_hash_table_replace(thumb_cache, key, g_object_ref(thumb_pixbuf ? thumb_pixbuf : pixbuf));
-                if (thumb_cache_order) {
-                    cache_order_push(thumb_cache_order, key);
-                    evict_cache_if_needed(thumb_cache, thumb_cache_order, THUMB_CACHE_MAX_ENTRIES);
-                }
-                g_mutex_unlock(&cache_mutex);
-            }
-            
-            // 全尺寸内存缓存仅在启用内存缓存时写入；磁盘写盘已移至解码工作线程
-            if (ctx->cache_id > 0 && is_mem_cache_enabled()) {
-                g_mutex_lock(&cache_mutex);
-                char *key = g_strdup_printf("%d", ctx->cache_id);
-                if (!fullsize_cache) {
-                    fullsize_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
-                                                           (GDestroyNotify)g_object_unref);
-                }
-                g_hash_table_replace(fullsize_cache, g_strdup(key), g_object_ref(pixbuf));
-                if (fullsize_cache_order) {
-                    cache_order_push(fullsize_cache_order, key);
-                    evict_cache_if_needed(fullsize_cache, fullsize_cache_order, FULLSIZE_CACHE_MAX_ENTRIES);
-                }
-                g_mutex_unlock(&cache_mutex);
-                g_free(key);
-            }
-        } else if (GTK_IS_PICTURE(ctx->target)) {
-            // 目标是GtkPicture（左侧预览）
-            GdkTexture *tex = pixbuf_utils_texture_from_pixbuf(pixbuf);
-            if (tex) {
-                gtk_picture_set_paintable(GTK_PICTURE(ctx->target), GDK_PAINTABLE(tex));
-                if (ctx->stack && GTK_IS_STACK(ctx->stack)) {
-                    gtk_stack_set_visible_child_name(ctx->stack, "picture");
-                }
-                g_object_unref(tex);
-            }
+    DecodedImage *image = g_new0(DecodedImage, 1);
+    image->full = full;
+    image->thumbnail = create_thumb_pixbuf(full, THUMB_CACHE_SCALE);
+    save_cached_image(cache_dir, data->img_id, image->full);
+    save_cached_image(thumb_cache_dir, data->img_id, image->thumbnail);
+    g_task_return_pointer(task, image, decoded_image_free);
+}
+
+static void finish_download(ImageDownload *download, DecodedImage *image) {
+    if (pending_downloads)
+        g_hash_table_remove(pending_downloads, GINT_TO_POINTER(download->img_id));
+    if (image) {
+        cache_memory_image(fullsize_cache, fullsize_cache_order, FULLSIZE_CACHE_MAX_ENTRIES,
+                           download->img_id, image->full);
+        cache_memory_image(thumb_cache, thumb_cache_order, THUMB_CACHE_MAX_ENTRIES,
+                           download->img_id, image->thumbnail);
+        for (guint i = 0; i < download->targets->len; i++) {
+            ImageTarget *target = g_ptr_array_index(download->targets, i);
+            if (!image_target_is_current(target)) continue;
+
+            GdkPixbuf *pixbuf = target->thumbnail && target->scale <= THUMB_CACHE_SCALE
+                ? image->thumbnail : image->full;
+            apply_image(target->widget, target->stack, target->img_id, pixbuf);
         }
     }
-    
-    // 处理同URL的其他等待请求
-    // 注意：即使被取消也需要清理等待上下文，只是不更新UI
-    gboolean cancelled = is_cancelled(data->cancel_generation);
-    GPtrArray *waiting = detach_waiting_contexts(ctx->url);
-    if (waiting) {
-        for (guint i = 0; i < waiting->len; i++) {
-            ImageLoadCtx *waiting_ctx = (ImageLoadCtx*)g_ptr_array_index(waiting, i);
-            if (!waiting_ctx) continue;
-
-            // 只有在未取消且有有效pixbuf时才更新UI
-            if (!cancelled && pixbuf && waiting_ctx->target &&
-                image_target_matches_expected(waiting_ctx)) {
-                // 额外的类型检查以确保对象仍然有效
-                if (GTK_IS_WIDGET(waiting_ctx->target) && GTK_IS_DRAWING_AREA(waiting_ctx->target)) {
-                    GdkPixbuf *ui_pixbuf = pixbuf;
-                    if (waiting_ctx->scale_to_thumb) {
-                        int sf = gtk_widget_get_scale_factor(GTK_WIDGET(waiting_ctx->target));
-                        if (!thumb_pixbuf) thumb_pixbuf = create_thumb_pixbuf(pixbuf, sf);
-                        ui_pixbuf = thumb_pixbuf ? thumb_pixbuf : pixbuf;
-                    }
-
-                    // 清空缓存的 surface（触发 destroy notify 如果有的话）
-                    g_object_set_data_full(G_OBJECT(waiting_ctx->target), "cached_surface", NULL, NULL);
-                    g_object_set_data_full(G_OBJECT(waiting_ctx->target), "cached_render", NULL, NULL);
-
-                    g_object_set_data_full(G_OBJECT(waiting_ctx->target), "pixbuf",
-                                           g_object_ref(ui_pixbuf), (GDestroyNotify)g_object_unref);
-                    gtk_widget_queue_draw(waiting_ctx->target);
-                    if (waiting_ctx->stack && GTK_IS_WIDGET(waiting_ctx->stack) && GTK_IS_STACK(waiting_ctx->stack)) {
-                        gtk_stack_set_visible_child_name(waiting_ctx->stack, "picture");
-                    }
-                } else if (GTK_IS_WIDGET(waiting_ctx->target) && GTK_IS_PICTURE(waiting_ctx->target)) {
-                    GdkTexture *tex = pixbuf_utils_texture_from_pixbuf(pixbuf);
-                    if (tex) {
-                        gtk_picture_set_paintable(GTK_PICTURE(waiting_ctx->target),
-                                                 GDK_PAINTABLE(tex));
-                        g_object_unref(tex);
-                    }
-                    if (waiting_ctx->stack && GTK_IS_WIDGET(waiting_ctx->stack) && GTK_IS_STACK(waiting_ctx->stack)) {
-                        gtk_stack_set_visible_child_name(waiting_ctx->stack, "picture");
-                    }
-                }
-            }
-
-            // 等待上下文不在此处释放，统一交给下方 unref 时容器的元素析构函数
-        }
-        g_ptr_array_unref(waiting);
-    }
-    
-    if (pixbuf) g_object_unref(pixbuf);
-    if (thumb_pixbuf) g_object_unref(thumb_pixbuf);
-    if (data->image_data) g_bytes_unref(data->image_data);
-    
-    // 保存session用于处理队列
-    SoupSession *session = NULL;
-    if (ctx->target && GTK_IS_WIDGET(ctx->target)) {
-        // 尝试从target获取session（如果之前保存过）
-        // 额外检查 GTK_IS_WIDGET 确保对象仍然有效
-        session = (SoupSession*)g_object_get_data(G_OBJECT(ctx->target), "_loader_session");
-    }
-    
-    // 注意：需要在使用session之后清理，因为session可能来自target
-    free_image_load_ctx(ctx);
-    g_free(data);
-    
-    // 下载完成，处理队列中的下一个请求
-    g_mutex_lock(&download_queue_mutex);
+    decoded_image_free(image);
+    image_download_free(download);
     active_downloads--;
-    g_mutex_unlock(&download_queue_mutex);
-    
-    if (session) {
-        process_download_queue(session);
-    }
+    process_download_queue();
 }
 
-// HTTP响应回调
-static void image_response_cb(GObject *source, GAsyncResult *res, gpointer user_data) {
+static void decode_image_finished(GObject *source, GAsyncResult *result, gpointer user_data) {
+    (void)source;
+    GTask *task = G_TASK(result);
+    DecodeData *data = g_task_get_task_data(task);
+    g_bytes_unref(data->bytes);
+    finish_download(user_data, g_task_propagate_pointer(task, NULL));
+}
+
+static void image_response_cb(GObject *source, GAsyncResult *result, gpointer user_data) {
+    ImageDownload *download = user_data;
     SoupSession *session = SOUP_SESSION(source);
-    ImageLoadCtx *ctx = (ImageLoadCtx*)user_data;
-    
-    if (!ctx) {
-        g_warning("image_response_cb: ctx is NULL!");
+    g_autoptr(GBytes) bytes = soup_session_send_and_read_finish(session, result, NULL);
+    SoupMessage *message = soup_session_get_async_result_message(session, result);
+    if (!bytes || !message || !SOUP_STATUS_IS_SUCCESSFUL(soup_message_get_status(message))) {
+        finish_download(download, NULL);
         return;
     }
-    
-    // 检查是否已取消（代次变化）
-    gboolean cancelled = is_cancelled(ctx->cancel_generation);
-    
-    GError *err = NULL;
-    GBytes *image_data = soup_session_send_and_read_finish(session, res, &err);
-    
-    if (!image_data || cancelled) {
-        if (err) {
-            // 不记录取消的错误
-            if (!g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {
-                g_warning("图片下载失败 %s: %s", ctx->url ? ctx->url : "unknown", err->message);
-            }
-            g_error_free(err);
-        }
-        if (image_data) {
-            g_bytes_unref(image_data);
-        }
-        
-        // 从待处理下载中移除，并清理所有等待的上下文
-        free_waiting_contexts(detach_waiting_contexts(ctx->url));
-        free_image_load_ctx(ctx);
-        
-        // 下载失败，减少计数并处理队列
-        g_mutex_lock(&download_queue_mutex);
-        active_downloads--;
-        g_mutex_unlock(&download_queue_mutex);
-        process_download_queue(session);
-        return;
-    }
-    
-    if (err) {
-        g_error_free(err);
-        if (image_data) {
-            g_bytes_unref(image_data);
-        }
-        free_waiting_contexts(detach_waiting_contexts(ctx->url));
-        free_image_load_ctx(ctx);
-        
-        // 下载失败，减少计数并处理队列
-        g_mutex_lock(&download_queue_mutex);
-        active_downloads--;
-        g_mutex_unlock(&download_queue_mutex);
-        process_download_queue(session);
-        return;
-    }
-    
-    // 启动解码任务
-    DecodeTaskData *data = g_new0(DecodeTaskData, 1);
-    data->image_data = image_data;
-    data->ctx = ctx;
-    data->cancel_generation = ctx->cancel_generation;  // 继承上下文的取消代次
-    
-    GTask *task = g_task_new(NULL, NULL, decode_task_finished, data);
-    g_task_set_task_data(task, data, NULL);
-    g_task_run_in_thread(task, decode_task_thread);
-    g_object_unref(task);
+
+    DecodeData *data = g_new(DecodeData, 1);
+    data->bytes = g_steal_pointer(&bytes);
+    data->img_id = download->img_id;
+    g_autoptr(GTask) task = g_task_new(NULL, NULL, decode_image_finished, download);
+    g_task_set_task_data(task, data, g_free);
+    g_task_run_in_thread(task, decode_image_thread);
 }
 
-// 开始一个下载
-static void start_download(SoupSession *session, ImageLoadCtx *ctx) {
-    if (!session || !ctx || !ctx->url) return;
-    
-    // 保存session到target以便后续使用
-    if (ctx->target && GTK_IS_WIDGET(ctx->target)) {
-        g_object_set_data(G_OBJECT(ctx->target), "_loader_session", session);
-    }
-    
-    // 创建HTTP消息（检查返回值，URL可能无效）
-    SoupMessage *msg = soup_message_new("GET", ctx->url);
-    if (!msg) {
-        g_warning("无效的URL，无法创建soup消息: %s", ctx->url);
-        // 下载不会开始，同 URL 的等待请求永远不会被回调处理，一并释放
-        free_waiting_contexts(detach_waiting_contexts(ctx->url));
-        // 清理上下文
-        free_image_load_ctx(ctx);
-        
-        // 减少活跃下载计数
-        g_mutex_lock(&download_queue_mutex);
-        active_downloads--;
-        g_mutex_unlock(&download_queue_mutex);
-        
-        // 继续处理队列
-        process_download_queue(session);
-        return;
-    }
-    
-    // 发起HTTP请求，异步读取完整响应体，避免在主线程同步读取导致卡顿
-    soup_session_send_and_read_async(session, msg, G_PRIORITY_DEFAULT, NULL, image_response_cb, ctx);
-    g_object_unref(msg);  // soup_session_send_and_read_async 会内部增加引用
-}
+static void process_download_queue(void) {
+    while (download_queue && active_downloads < MAX_CONCURRENT_DOWNLOADS) {
+        ImageDownload *download = g_queue_pop_head(download_queue);
+        if (!download) break;
 
-// 处理下载队列
-static void process_download_queue(SoupSession *session) {
-    if (!session) return;
-    
-    // 被丢弃的排队请求的 URL：其等待队列必须一并清理，否则 pending_downloads
-    // 会残留一个永远不会被下载的条目，之后同一 URL 的请求只会入队而永不完成
-    GPtrArray *orphaned_urls = NULL;
-    
-    g_mutex_lock(&download_queue_mutex);
-    
-    // 启动尽可能多的下载（不超过最大并发数）
-    while (active_downloads < MAX_CONCURRENT_DOWNLOADS) {
-        ImageLoadCtx *ctx = (ImageLoadCtx*)g_queue_pop_head(download_queue);
-        if (!ctx) break;  // 队列为空
-        
-        // 检查目标是否仍然有效
-        if (!ctx->target) {
-            // 目标已销毁（弱指针自动设为NULL），清理上下文
-            // 注意：不要调用 g_object_remove_weak_pointer，因为对象已不存在
-            if (ctx->url) {
-                if (!orphaned_urls) {
-                    orphaned_urls = g_ptr_array_new_with_free_func(g_free);
-                }
-                g_ptr_array_add(orphaned_urls, g_strdup(ctx->url));
-            }
-            free_image_load_ctx(ctx);
+        for (guint i = download->targets->len; i > 0; i--) {
+            if (!image_target_is_current(g_ptr_array_index(download->targets, i - 1)))
+                g_ptr_array_remove_index_fast(download->targets, i - 1);
+        }
+        if (!download->targets->len) {
+            g_hash_table_remove(pending_downloads, GINT_TO_POINTER(download->img_id));
+            image_download_free(download);
             continue;
         }
-        
+
+        g_autofree char *url = g_strdup_printf("https://cdn.233.momobako.com/ygoimg/jp/%d.webp",
+                                               download->img_id);
+        g_autoptr(SoupMessage) message = soup_message_new("GET", url);
         active_downloads++;
-        g_mutex_unlock(&download_queue_mutex);
-        
-        // 启动下载
-        start_download(session, ctx);
-        
-        g_mutex_lock(&download_queue_mutex);
-    }
-    
-    g_mutex_unlock(&download_queue_mutex);
-    
-    // 在锁外清理：锁顺序必须保持 cache_mutex -> download_queue_mutex（见 cancel_all_pending），
-    // 因此不能在持有 download_queue_mutex 时去拿 cache_mutex
-    if (orphaned_urls) {
-        for (guint i = 0; i < orphaned_urls->len; i++) {
-            free_waiting_contexts(detach_waiting_contexts((const char*)g_ptr_array_index(orphaned_urls, i)));
-        }
-        g_ptr_array_unref(orphaned_urls);
+        soup_session_send_and_read_async(download->session, message, G_PRIORITY_DEFAULT,
+                                         NULL, image_response_cb, download);
     }
 }
 
-void load_image_async(SoupSession *session, const char *url, ImageLoadCtx *ctx) {
-    if (!session || !url || !ctx) return;
-    
-    // 记录当前取消代次
-    ctx->cancel_generation = get_cancel_generation();
-    
-    // 添加弱引用（必须在任何使用ctx之前设置）
-    if (ctx->target) {
-        g_object_add_weak_pointer(G_OBJECT(ctx->target), (gpointer*)&ctx->target);
+static void enqueue_download(ImageTarget *target) {
+    gpointer key = GINT_TO_POINTER(target->img_id);
+    ImageDownload *download = g_hash_table_lookup(pending_downloads, key);
+    if (!download) {
+        download = g_new0(ImageDownload, 1);
+        download->img_id = target->img_id;
+        download->session = g_object_ref(target->session);
+        download->targets = g_ptr_array_new_with_free_func(image_target_free);
+        g_hash_table_insert(pending_downloads, key, download);
+        g_queue_push_tail(download_queue, download);
     }
-    if (ctx->stack) {
-        g_object_add_weak_pointer(G_OBJECT(ctx->stack), (gpointer*)&ctx->stack);
+    g_ptr_array_add(download->targets, target);
+    process_download_queue();
+}
+
+static void load_image_thread(GTask *task, gpointer source, gpointer task_data,
+                              GCancellable *cancellable) {
+    (void)source;
+    (void)cancellable;
+    const ImageTarget *target = task_data;
+    GdkPixbuf *pixbuf = NULL;
+    if (target->local_path) {
+        if (target->thumbnail)
+            pixbuf = gdk_pixbuf_new_from_file_at_scale(target->local_path,
+                SLOT_THUMB_W * target->scale, SLOT_THUMB_H * target->scale, TRUE, NULL);
+        else
+            pixbuf = gdk_pixbuf_new_from_file(target->local_path, NULL);
+    } else if (!target->local_only) {
+        if (target->thumbnail && target->scale <= THUMB_CACHE_SCALE)
+            pixbuf = load_cached_image(thumb_cache_dir, target->img_id);
+        if (!pixbuf) {
+            g_autoptr(GdkPixbuf) full = load_from_disk_cache(target->img_id);
+            if (target->thumbnail && full) {
+                if (target->scale <= THUMB_CACHE_SCALE) {
+                    pixbuf = create_thumb_pixbuf(full, THUMB_CACHE_SCALE);
+                    save_cached_image(thumb_cache_dir, target->img_id, pixbuf);
+                } else {
+                    pixbuf = create_thumb_pixbuf(full, target->scale);
+                }
+            } else {
+                pixbuf = g_steal_pointer(&full);
+            }
+        }
     }
-    
-    // 检查是否已有相同URL的下载
-    g_mutex_lock(&cache_mutex);
-    GPtrArray *waiting = (GPtrArray*)g_hash_table_lookup(pending_downloads, url);
-    if (waiting) {
-        // 已有下载进行中，加入等待队列
-        g_ptr_array_add(waiting, ctx);
-        g_mutex_unlock(&cache_mutex);
-        return;
+    g_task_return_pointer(task, pixbuf, g_object_unref);
+}
+
+static void load_image_finished(GObject *source, GAsyncResult *result, gpointer user_data) {
+    (void)source;
+    ImageTarget *target = user_data;
+    g_autoptr(GdkPixbuf) pixbuf = g_task_propagate_pointer(G_TASK(result), NULL);
+    if (image_target_is_current(target)) {
+        if (pixbuf) {
+            if (!target->local_only) {
+                if (!target->thumbnail)
+                    cache_memory_image(fullsize_cache, fullsize_cache_order, FULLSIZE_CACHE_MAX_ENTRIES,
+                                       target->img_id, pixbuf);
+                else if (target->scale <= THUMB_CACHE_SCALE)
+                    cache_memory_image(thumb_cache, thumb_cache_order, THUMB_CACHE_MAX_ENTRIES,
+                                       target->img_id, pixbuf);
+            }
+            apply_image(target->widget, target->stack, target->img_id, pixbuf);
+        } else if (!target->local_only && pending_downloads) {
+            enqueue_download(target);
+            return;
+        }
     }
-    
-    // 创建新的等待队列
-    // 队列拥有其中所有 ctx：数组在任何路径下被释放时（如 cancel_all_pending
-    // 移除条目、cleanup_image_cache 销毁表），元素析构函数会逐个 detach 弱指针
-    // 并释放 ctx，避免悬空弱指针在控件销毁时写已释放内存
-    waiting = g_ptr_array_new_with_free_func((GDestroyNotify)free_image_load_ctx);
-    g_hash_table_insert(pending_downloads, g_strdup(url), waiting);
-    g_mutex_unlock(&cache_mutex);
-    
-    // 加入下载队列或立即开始下载
-    g_mutex_lock(&download_queue_mutex);
-    if (active_downloads < MAX_CONCURRENT_DOWNLOADS) {
-        active_downloads++;
-        g_mutex_unlock(&download_queue_mutex);
-        start_download(session, ctx);
-    } else {
-        // 队列已满，加入等待队列
-        g_queue_push_tail(download_queue, ctx);
-        g_mutex_unlock(&download_queue_mutex);
+    image_target_free(target);
+}
+
+void load_card_picture_async(SoupSession *session, GtkWidget *widget, GtkStack *stack,
+                             int img_id, gboolean thumbnail, gboolean local_only,
+                             const char *local_path) {
+    if (!session || !widget || img_id <= 0 || image_expected_id(widget) != img_id ||
+        (local_only && !local_path)) return;
+    ImageTarget *current = g_object_get_data(G_OBJECT(widget), "loading-image");
+    if (current && current->img_id == img_id) return;
+
+    int scale = MAX(1, gtk_widget_get_scale_factor(widget));
+    GHashTable *cache = thumbnail && scale <= THUMB_CACHE_SCALE ? thumb_cache : fullsize_cache;
+    if (!local_only && cache) {
+        char key[32];
+        g_snprintf(key, sizeof(key), "%d", img_id);
+        GdkPixbuf *pixbuf = g_hash_table_lookup(cache, key);
+        if (pixbuf) {
+            g_object_set_data(G_OBJECT(widget), "loading-image", NULL);
+            set_image_spinner(stack, FALSE);
+            apply_image(widget, stack, img_id, pixbuf);
+            return;
+        }
     }
+
+    ImageTarget *target = g_new0(ImageTarget, 1);
+    target->widget = widget;
+    target->stack = stack;
+    target->img_id = img_id;
+    target->thumbnail = thumbnail;
+    target->scale = scale;
+    target->local_only = local_only;
+    target->local_path = g_strdup(local_path);
+    target->session = g_object_ref(session);
+    g_object_set_data(G_OBJECT(widget), "loading-image", target);
+    set_image_spinner(stack, TRUE);
+    g_object_add_weak_pointer(G_OBJECT(widget), (gpointer *)&target->widget);
+    if (stack) g_object_add_weak_pointer(G_OBJECT(stack), (gpointer *)&target->stack);
+
+    g_autoptr(GTask) task = g_task_new(NULL, NULL, load_image_finished, target);
+    g_task_set_task_data(task, target, NULL);
+    g_task_run_in_thread(task, load_image_thread);
 }

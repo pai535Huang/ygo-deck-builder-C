@@ -45,7 +45,7 @@ static CardInfo* count_unique_cards(const int *cards, int count, int *unique_cou
 
         // 超出 27 位范围的 ID（负数或 9 位先行卡码等）写入时会回绕为无关卡片，
         // 跳过并警告，避免导出静默损坏的卡组
-        if (card_id < 0 || card_id > DECK_URL_MAX_CARD_ID) {
+        if (card_id <= 0 || card_id > DECK_URL_MAX_CARD_ID) {
             g_warning("卡片 ID %d 超出 URL 协议 27 位范围，已跳过", card_id);
             continue;
         }
@@ -242,40 +242,67 @@ bool deck_decode_from_url(
     *side_cards = NULL;
     *main_count = *extra_count = *side_count = 0;
     
-    // 检查是否包含必要的参数
-    if (!strstr(url, "ygotype=deck")) {
-        g_set_error(error, g_quark_from_string("deck-url"), 1,
-                   "URL不包含ygotype=deck参数");
+    g_autoptr(GUri) uri = url ? g_uri_parse(url, G_URI_FLAGS_ENCODED_QUERY, NULL) : NULL;
+    if (!uri || !g_uri_get_host(uri) || !*g_uri_get_host(uri) ||
+        (g_ascii_strcasecmp(g_uri_get_scheme(uri), "http") != 0 &&
+         g_ascii_strcasecmp(g_uri_get_scheme(uri), "https") != 0) ||
+        !g_uri_get_query(uri)) {
+        g_set_error_literal(error, g_quark_from_static_string("deck-url"), 1,
+                            "无效的卡组 URL");
         return false;
     }
-    
-    // 提取d参数的值（匹配 "?d=" 或 "&d="，避免误匹配其他以 d 结尾的参数名）
-    const char *d_param = strstr(url, "?d=");
-    if (!d_param) d_param = strstr(url, "&d=");
-    if (!d_param) {
-        // 空卡组也是有效的
+
+    GUriParamsIter params;
+    g_uri_params_iter_init(&params, g_uri_get_query(uri), -1, "&", G_URI_PARAMS_NONE);
+    g_autofree char *deck_type = NULL;
+    g_autofree char *version = NULL;
+    g_autofree char *base64_data = NULL;
+    g_autoptr(GError) param_error = NULL;
+    for (;;) {
+        g_autofree char *name = NULL;
+        g_autofree char *value = NULL;
+        if (!g_uri_params_iter_next(&params, &name, &value, &param_error)) break;
+
+        char **field = NULL;
+        if (g_str_equal(name, "ygotype")) field = &deck_type;
+        else if (g_str_equal(name, "v")) field = &version;
+        else if (g_str_equal(name, "d")) field = &base64_data;
+        if (!field) continue;
+        if (*field) {
+            g_set_error(error, g_quark_from_static_string("deck-url"), 1,
+                        "重复的卡组 URL 参数: %s", name);
+            return false;
+        }
+        *field = g_steal_pointer(&value);
+    }
+    if (param_error || g_strcmp0(deck_type, "deck") != 0 ||
+        g_strcmp0(version, "1") != 0) {
+        g_set_error_literal(error, g_quark_from_static_string("deck-url"), 1,
+                            "无效的卡组类型或协议版本");
+        return false;
+    }
+
+    // A v1 link without d is the existing representation of an empty deck.
+    if (!base64_data) {
         *main_cards = g_new(int, 1);
         *extra_cards = g_new(int, 1);
         *side_cards = g_new(int, 1);
         return true;
     }
 
-    d_param += 3; // 跳过 "d="（含前置分隔符）
-    
-    // 提取d参数值（到&或字符串结尾）
-    const char *param_end = strchr(d_param, '&');
-    gsize param_len = param_end ? (gsize)(param_end - d_param) : strlen(d_param);
-    char *base64_data = g_strndup(d_param, param_len);
-    
-    // 解码Base64Url为位数组
+    const int max_bits = 16 + 29 * (255 + 15 + 15);
+    const gsize max_encoded_length = (((max_bits + 7) / 8) * 8 + 5) / 6;
+    if (strlen(base64_data) > max_encoded_length) {
+        g_set_error_literal(error, g_quark_from_static_string("deck-url"), 2,
+                            "卡组 URL 数据超出长度限制");
+        return false;
+    }
     int bit_count;
-    bool *bits = base64url_to_bits(base64_data, &bit_count);
-    g_free(base64_data);
-    
+    g_autofree bool *bits = base64url_to_bits(base64_data, &bit_count);
+
     if (!bits || bit_count < 16) {
         g_set_error(error, g_quark_from_string("deck-url"), 2,
                    "Base64Url解码失败或数据不完整");
-        g_free(bits);
         return false;
     }
     
@@ -289,10 +316,25 @@ bool deck_decode_from_url(
     if (bit_count < required_bits) {
         g_set_error(error, g_quark_from_string("deck-url"), 3,
                    "数据长度不足，期望至少%d位，实际%d位", required_bits, bit_count);
-        g_free(bits);
         return false;
     }
     
+    const int padded_bits = ((required_bits + 7) / 8) * 8;
+    if (bit_count > ((padded_bits + 5) / 6) * 6 ||
+        bits_to_int(bits, required_bits, bit_count - required_bits) != 0) {
+        g_set_error_literal(error, g_quark_from_static_string("deck-url"), 3,
+                            "卡组数据包含无效的尾部位");
+        return false;
+    }
+
+    for (int pos = 16; pos < required_bits; pos += 29) {
+        if (bits_to_int(bits, pos, 2) == 0 || bits_to_int(bits, pos + 2, 27) == 0) {
+            g_set_error_literal(error, g_quark_from_static_string("deck-url"), 3,
+                                "卡组数据包含无效的卡片编号或张数");
+            return false;
+        }
+    }
+
     int bit_pos = 16;
     
     // 解码主卡组
@@ -355,6 +397,5 @@ bool deck_decode_from_url(
         bit_pos += 29;
     }
     
-    g_free(bits);
     return true;
 }

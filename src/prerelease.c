@@ -1,12 +1,11 @@
 #include "prerelease.h"
 #include "app_path.h"
-#include "archive_path.h"
+#include "data_directory.h"
+#include <errno.h>
 #include <libsoup/soup.h>
 #include <json-glib/json-glib.h>
 #include <glib/gstdio.h>
 #include <sqlite3.h>
-#include <archive.h>
-#include <archive_entry.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -148,163 +147,23 @@ static gchar *get_prerelease_json_path(void) {
     return filepath;
 }
 
-/**
- * 确保目录存在
- */
-static gboolean ensure_directory_exists(const char *path) {
-    if (g_mkdir_with_parents(path, 0755) == -1) {
-        g_warning("Failed to create directory: %s", path);
-        return FALSE;
-    }
-    return TRUE;
-}
+static GMutex prerelease_install_mutex;
+static GMutex prerelease_update_mutex;
+static guint prerelease_install_generation;
 
-/**
- * 递归删除目录及其内容
- */
-static gboolean remove_directory_recursive(const char *path) {
-    GDir *dir = g_dir_open(path, 0, NULL);
-    if (!dir) {
-        return FALSE;
-    }
-    
-    const gchar *name;
-    while ((name = g_dir_read_name(dir)) != NULL) {
-        gchar *full_path = g_build_filename(path, name, NULL);
-        
-        if (g_file_test(full_path, G_FILE_TEST_IS_DIR)) {
-            // 递归删除子目录
-            remove_directory_recursive(full_path);
-        } else {
-            // 删除文件
-            remove(full_path);
-        }
-        
-        g_free(full_path);
-    }
-    
-    g_dir_close(dir);
-    
-    // 删除空目录
-    if (rmdir(path) != 0) {
-        g_warning("Failed to remove directory: %s", path);
-        return FALSE;
-    }
-    
-    return TRUE;
-}
-
-/**
- * 清空先行卡目录（图片、JSON、ETag）
- */
 gboolean clear_prerelease_data(void) {
-    gchar *data_dir = get_prerelease_data_dir();
-    if (!data_dir) {
-        return FALSE;
-    }
-
-    gboolean success = TRUE;
-    // 如果目录存在，递归删除；目录本就不存在视为成功
-    if (g_file_test(data_dir, G_FILE_TEST_IS_DIR)) {
-        g_message("Clearing pre-release directory: %s", data_dir);
-        success = remove_directory_recursive(data_dir);
-    }
-
-    g_free(data_dir);
-    return success;
+    g_autofree char *dir = get_prerelease_data_dir();
+    g_mutex_lock(&prerelease_install_mutex);
+    prerelease_install_generation++;
+    gboolean removed = data_directory_remove(dir);
+    g_mutex_unlock(&prerelease_install_mutex);
+    return removed;
 }
 
-/**
- * 解压YPK文件（ZIP格式），只保留pic目录和test-release.cdb
- */
-static gboolean extract_ypk_file(const char *ypk_path, const char *dest_dir) {
-    struct archive *a;
-    struct archive *ext;
-    struct archive_entry *entry;
-    int r;
-    
-    a = archive_read_new();
-    archive_read_support_format_zip(a);
-    ext = archive_write_disk_new();
-    // 同上：拒绝 ".." 并阻止写穿符号链接
-    archive_write_disk_set_options(ext, ARCHIVE_EXTRACT_TIME | ARCHIVE_EXTRACT_PERM |
-                                        ARCHIVE_EXTRACT_SECURE_NODOTDOT |
-                                        ARCHIVE_EXTRACT_SECURE_SYMLINKS);
-    
-    if ((r = archive_read_open_filename(a, ypk_path, 10240))) {
-        g_warning("Failed to open archive: %s", archive_error_string(a));
-        archive_read_free(a);
-        archive_write_free(ext);
-        return FALSE;
-    }
-    
-    while (archive_read_next_header(a, &entry) == ARCHIVE_OK) {
-        const char *current_file = archive_entry_pathname(entry);
-
-        // Zip Slip 防护：YPK 来自网络下载，"pics/../../x" 之类的条目会写到目标目录之外
-        if (!archive_entry_path_is_safe(current_file)) {
-            g_warning("跳过不安全的压缩包条目: %s", current_file ? current_file : "(null)");
-            archive_read_data_skip(a);
-            continue;
-        }
-        
-        // 只处理pics目录下的文件和test-release.cdb
-        gboolean should_extract = FALSE;
-        gchar *output_path = NULL;
-        
-        if (g_str_has_prefix(current_file, "pics/")) {
-            // 提取pics目录下的文件
-            output_path = g_build_filename(dest_dir, current_file, NULL);
-            should_extract = TRUE;
-        } else if (g_strcmp0(current_file, "test-release.cdb") == 0 ||
-                   g_strcmp0(current_file, "./test-release.cdb") == 0) {
-            // 提取test-release.cdb
-            output_path = g_build_filename(dest_dir, "test-release.cdb", NULL);
-            should_extract = TRUE;
-        }
-        
-        if (should_extract && output_path) {
-            // 设置输出路径
-            archive_entry_set_pathname(entry, output_path);
-            
-            // 确保父目录存在
-            gchar *parent_dir = g_path_get_dirname(output_path);
-            ensure_directory_exists(parent_dir);
-            g_free(parent_dir);
-            
-            // 写入文件
-            r = archive_write_header(ext, entry);
-            if (r == ARCHIVE_OK) {
-                const void *buff;
-                size_t size;
-                la_int64_t offset;
-                
-                while ((r = archive_read_data_block(a, &buff, &size, &offset)) == ARCHIVE_OK) {
-                    if (archive_write_data_block(ext, buff, size, offset) != ARCHIVE_OK) {
-                        g_warning("Error writing data: %s", archive_error_string(ext));
-                        break;
-                    }
-                }
-                if (r != ARCHIVE_EOF) {
-                    g_warning("Error reading data: %s", archive_error_string(a));
-                }
-                
-                archive_write_finish_entry(ext);
-            }
-            
-            g_free(output_path);
-        } else {
-            // 跳过不需要的文件
-            archive_read_data_skip(a);
-        }
-    }
-    
-    archive_read_close(a);
-    archive_read_free(a);
-    archive_write_close(ext);
-    archive_write_free(ext);
-    
-    return TRUE;
+static gboolean prerelease_archive_entry(const char *name) {
+    if (g_str_has_prefix(name, "./")) name += 2;
+    return g_str_has_prefix(name, "pics/") ||
+           g_str_equal(name, PRERELEASE_CDB_FILENAME);
 }
 
 /**
@@ -315,7 +174,7 @@ static JsonNode *parse_cdb_to_json(const char *cdb_path) {
     sqlite3_stmt *stmt;
     int rc;
     
-    rc = sqlite3_open(cdb_path, &db);
+    rc = sqlite3_open_v2(cdb_path, &db, SQLITE_OPEN_READONLY, NULL);
     if (rc != SQLITE_OK) {
         g_warning("Cannot open database: %s", sqlite3_errmsg(db));
         sqlite3_close(db);
@@ -339,7 +198,7 @@ static JsonNode *parse_cdb_to_json(const char *cdb_path) {
     }
     
     int count = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         json_builder_begin_object(builder);
         
         // id
@@ -423,6 +282,11 @@ static JsonNode *parse_cdb_to_json(const char *cdb_path) {
     sqlite3_finalize(stmt);
     sqlite3_close(db);
     
+    if (rc != SQLITE_DONE || count == 0) {
+        g_object_unref(builder);
+        return NULL;
+    }
+
     g_message("Parsed %d pre-release cards from CDB", count);
     
     JsonNode *root = json_builder_get_root(builder);
@@ -437,6 +301,7 @@ static JsonNode *parse_cdb_to_json(const char *cdb_path) {
 typedef struct {
     PrereleaseUpdateCallback callback;
     gpointer user_data;
+    guint generation;
 } UpdateContext;
 
 typedef struct {
@@ -505,25 +370,6 @@ static gchar *read_prerelease_etag(void) {
     return contents;
 }
 
-static void write_prerelease_etag(const char *etag) {
-    if (!etag || !*etag) {
-        return;
-    }
-
-    gchar *path = get_prerelease_etag_path();
-    if (!path) {
-        return;
-    }
-
-    GError *error = NULL;
-    if (!g_file_set_contents(path, etag, -1, &error)) {
-        g_warning("Failed to save pre-release ETag: %s", error->message);
-        g_error_free(error);
-    }
-
-    g_free(path);
-}
-
 static gpointer update_prerelease_thread(gpointer data) {
     UpdateContext *ctx = (UpdateContext *)data;
     PrereleaseUpdateResult result = PRERELEASE_UPDATE_FAILED;
@@ -537,6 +383,21 @@ static gpointer update_prerelease_thread(gpointer data) {
     GOutputStream *output = NULL;
     GFile *file = NULL;
     GError *error = NULL;
+    g_autofree char *stage = NULL;
+    g_autofree char *replacement = NULL;
+    g_autofree char *backup = NULL;
+    g_autofree char *parent = NULL;
+    g_autofree char *cdb_path = NULL;
+    g_autofree char *json_path = NULL;
+    g_autofree char *etag_path = NULL;
+    g_autoptr(JsonNode) json_root = NULL;
+    g_autoptr(JsonGenerator) generator = NULL;
+
+    g_mutex_lock(&prerelease_update_mutex);
+    g_mutex_lock(&prerelease_install_mutex);
+    gboolean current = ctx->generation == prerelease_install_generation;
+    g_mutex_unlock(&prerelease_install_mutex);
+    if (!current) goto out;
 
     if (!data_dir) {
         g_warning("Failed to resolve pre-release data directory");
@@ -626,59 +487,54 @@ static gpointer update_prerelease_thread(gpointer data) {
     g_clear_object(&input);
     g_clear_object(&file);
 
-    g_message("Pre-release cards downloaded successfully, replacing local data");
-
-    // 完整下载成功后才清空旧数据；网络失败时旧数据保持不变
-    if (!clear_prerelease_data()) {
-        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "清空旧先行卡数据失败");
-        goto out;
-    }
-    ensure_directory_exists(data_dir);
-
-    g_message("Extracting YPK archive...");
-    if (!extract_ypk_file(ypk_path, data_dir)) {
-        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "解压先行卡压缩包失败");
+    parent = g_path_get_dirname(data_dir);
+    stage = g_build_filename(parent, ".prerelease-update-XXXXXX", NULL);
+    if (g_mkdir_with_parents(parent, 0755) != 0 || !g_mkdtemp(stage)) {
+        error = g_error_new(G_FILE_ERROR, g_file_error_from_errno(errno),
+                            "Cannot create staging directory: %s", g_strerror(errno));
+        g_clear_pointer(&stage, g_free);
         goto out;
     }
 
-    gchar *cdb_path = g_build_filename(data_dir, PRERELEASE_CDB_FILENAME, NULL);
-    JsonNode *json_root = parse_cdb_to_json(cdb_path);
-    g_free(cdb_path);
+    replacement = g_build_filename(stage, "pre-release", NULL);
+    backup = g_build_filename(stage, "previous", NULL);
+    if (g_mkdir(replacement, 0755) != 0) {
+        error = g_error_new(G_FILE_ERROR, g_file_error_from_errno(errno),
+                            "Cannot create replacement directory: %s", g_strerror(errno));
+        goto out;
+    }
+    if (!data_directory_extract_zip(ypk_path, replacement, prerelease_archive_entry, &error))
+        goto out;
 
+    cdb_path = g_build_filename(replacement, PRERELEASE_CDB_FILENAME, NULL);
+    json_root = parse_cdb_to_json(cdb_path);
     if (!json_root) {
-        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "解析先行卡 CDB 失败");
+        error = g_error_new_literal(G_IO_ERROR, G_IO_ERROR_INVALID_DATA,
+                                    "Cannot parse pre-release CDB");
         goto out;
     }
 
-    gboolean saved = FALSE;
-    gchar *json_path = get_prerelease_json_path();
-    if (json_path) {
-        JsonGenerator *gen = json_generator_new();
-        json_generator_set_root(gen, json_root);
-        json_generator_set_pretty(gen, TRUE);
+    json_path = g_build_filename(replacement, PRERELEASE_JSON_FILENAME, NULL);
+    generator = json_generator_new();
+    json_generator_set_root(generator, json_root);
+    json_generator_set_pretty(generator, TRUE);
+    if (!json_generator_to_file(generator, json_path, &error)) goto out;
 
-        GError *json_error = NULL;
-        if (!json_generator_to_file(gen, json_path, &json_error)) {
-            g_warning("Failed to save JSON file: %s", json_error->message);
-            g_error_free(json_error);
-        } else {
-            g_message("Pre-release JSON saved to %s", json_path);
-            saved = TRUE;
+    if (etag_to_store) {
+        etag_path = g_build_filename(replacement, PRERELEASE_ETAG_FILENAME, NULL);
+        if (!g_file_set_contents(etag_path, etag_to_store, -1, &error)) goto out;
+    }
+
+    g_mutex_lock(&prerelease_install_mutex);
+    if (ctx->generation == prerelease_install_generation) {
+        g_mutex_lock(&prerelease_cache_mutex);
+        if (data_directory_replace(data_dir, replacement, backup, &error)) {
+            prerelease_json_mtime = 0;
+            result = PRERELEASE_UPDATE_UPDATED;
         }
-
-        g_object_unref(gen);
-        g_free(json_path);
+        g_mutex_unlock(&prerelease_cache_mutex);
     }
-
-    json_node_free(json_root);
-
-    if (!saved) {
-        error = g_error_new(G_IO_ERROR, G_IO_ERROR_FAILED, "保存先行卡 JSON 失败");
-        goto out;
-    }
-
-    write_prerelease_etag(etag_to_store);
-    result = PRERELEASE_UPDATE_UPDATED;
+    g_mutex_unlock(&prerelease_install_mutex);
 
 out:
     if (error) {
@@ -701,6 +557,10 @@ out:
     g_free(local_etag);
     g_free(data_dir);
 
+    if (stage && (result == PRERELEASE_UPDATE_UPDATED || !backup ||
+                  !g_file_test(backup, G_FILE_TEST_EXISTS | G_FILE_TEST_IS_SYMLINK)))
+        data_directory_remove(stage);
+    g_mutex_unlock(&prerelease_update_mutex);
     update_finish(ctx, result);
     return NULL;
 }
@@ -709,6 +569,9 @@ void update_prerelease_cards(PrereleaseUpdateCallback callback, gpointer user_da
     UpdateContext *ctx = g_new0(UpdateContext, 1);
     ctx->callback = callback;
     ctx->user_data = user_data;
+    g_mutex_lock(&prerelease_install_mutex);
+    ctx->generation = prerelease_install_generation;
+    g_mutex_unlock(&prerelease_install_mutex);
 
     GThread *thread = g_thread_new("prerelease-update", update_prerelease_thread, ctx);
     g_thread_unref(thread);

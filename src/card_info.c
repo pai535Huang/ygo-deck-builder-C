@@ -83,6 +83,10 @@
 #define LINK_MARKER_TOP_RIGHT     0x100
 
 // 返回类别字符串，多个类别用逗号分隔
+gboolean card_type_is_extra(uint32_t type) {
+    return (type & TYPE_MONSTER) && (type & (TYPE_FUSION | TYPE_SYNCHRO | TYPE_XYZ | TYPE_LINK));
+}
+
 void get_card_types(uint32_t type, char* out, size_t out_size) {
     if (!out || out_size == 0) return;
     out[0] = '\0';

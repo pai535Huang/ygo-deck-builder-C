@@ -5,6 +5,8 @@
 #include <stddef.h>
 #include <glib.h>
 
+gboolean card_type_is_extra(uint32_t type);
+
 // 将十进制 type 分解为类别字符串，写入 out，多个类别用逗号分隔
 void get_card_types(uint32_t type, char* out, size_t out_size);
 

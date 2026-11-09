@@ -10,6 +10,7 @@ typedef struct {
     int id;   // 数据库ID，用于图片URL
     int cid;  // 卡片ID，用于禁限卡表和卡组统计
     char *original_name;
+    char *sheet_name;
     char *en_name;  // 英文名，用于 GENESYS 分值查找
     uint32_t type;  // 用于程序内部判断
     char *types;    // 用于UI显示
@@ -36,7 +37,6 @@ typedef struct {
     GtkStack *left_stack;
     GtkPicture *left_picture;
     GtkLabel *left_label;
-    GtkSpinner *left_spinner;
     // 槽位管理
     GPtrArray *main_pics;
     GPtrArray *extra_pics;
@@ -71,9 +71,9 @@ typedef struct {
     gboolean filter_by_spell;
     gboolean filter_by_trap;
     // 搜索结果图片加载队列
-    GPtrArray *search_image_queue;
-    guint search_image_queue_pos;
-    guint search_image_loader_id;
+    GtkAdjustment *search_vadjustment;
+    guint search_image_source;
+    guint search_image_tick;
     // 批量渲染队列
     GPtrArray *pending_results;  // 存储待渲染的JsonObject
     guint pending_results_pos;

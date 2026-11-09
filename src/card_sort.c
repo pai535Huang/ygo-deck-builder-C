@@ -1,5 +1,6 @@
 #include "card_sort.h"
 #include "deck_slot.h"
+#include "card_info.h"
 #include "prerelease.h"
 #include "offline_data.h"
 #include <json-glib/json-glib.h>
@@ -11,6 +12,8 @@ typedef struct {
     gboolean is_extra;
     GdkPixbuf *pixbuf;
     char *en_name;
+    char *sheet_name;
+    gpointer needs_metadata;
     uint32_t type;
     int level;
 } CardSortData;
@@ -20,6 +23,7 @@ static void free_card_sort_data(CardSortData *data) {
     if (!data) return;
     if (data->pixbuf) g_object_unref(data->pixbuf);
     g_free(data->en_name);
+    g_free(data->sheet_name);
     g_free(data);
 }
 
@@ -142,21 +146,23 @@ static void fill_sort_fields_from_json(JsonObject *obj, CardSortData *data) {
     if (json_object_has_member(obj, "type")) {
         data->type = (uint32_t)json_object_get_int_member(obj, "type");
     }
+    uint32_t raw_level = 0;
     if (json_object_has_member(obj, "level")) {
-        data->level = json_object_get_int_member(obj, "level");
+        raw_level = json_object_get_int_member(obj, "level");
     }
 
-    if ((data->type == 0 || data->level == 0) && json_object_has_member(obj, "data")) {
+    if ((data->type == 0 || raw_level == 0) && json_object_has_member(obj, "data")) {
         JsonObject *inner = json_object_get_object_member(obj, "data");
         if (inner) {
             if (data->type == 0 && json_object_has_member(inner, "type")) {
                 data->type = (uint32_t)json_object_get_int_member(inner, "type");
             }
-            if (data->level == 0 && json_object_has_member(inner, "level")) {
-                data->level = json_object_get_int_member(inner, "level");
+            if (raw_level == 0 && json_object_has_member(inner, "level")) {
+                raw_level = json_object_get_int_member(inner, "level");
             }
         }
     }
+    parse_level_and_scales(raw_level, &data->level, NULL, NULL);
 }
 
 // 从先行卡/离线数据获取排序所需信息（本地读取，避免主线程网络阻塞）
@@ -221,6 +227,9 @@ static void sort_region_with_compare(GPtrArray *pics, int *count, GtkLabel *coun
             CardSortData *card_data = fetch_card_data_fast(img_id, card_id, pixbuf, is_extra);
             if (card_data) {
                 card_data->en_name = g_strdup(slot_get_en_name(pic));
+                card_data->sheet_name = g_strdup(slot_get_sheet_name(pic));
+                if (!card_data->type) card_data->type = slot_get_card_type(pic);
+                card_data->needs_metadata = g_object_get_data(G_OBJECT(pic), "needs-card-metadata");
                 g_ptr_array_add(cards, card_data);
             }
         }
@@ -232,11 +241,7 @@ static void sort_region_with_compare(GPtrArray *pics, int *count, GtkLabel *coun
     // 清空原槽位
     for (int i = 0; i < (int)pics->len; i++) {
         GtkWidget *pic = GTK_WIDGET(g_ptr_array_index(pics, i));
-        slot_set_pixbuf(pic, NULL);
-        slot_set_is_extra(pic, FALSE);
-        g_object_set_data(G_OBJECT(pic), "card_id", GINT_TO_POINTER(0));
-        g_object_set_data(G_OBJECT(pic), "img_id", GINT_TO_POINTER(0));
-        slot_set_en_name(pic, NULL);
+        slot_clear_card(pic);
     }
 
     // 按排序后的顺序重新放置卡片
@@ -251,6 +256,8 @@ static void sort_region_with_compare(GPtrArray *pics, int *count, GtkLabel *coun
         g_object_set_data(G_OBJECT(pic), "card_id", GINT_TO_POINTER(card->card_id));
         g_object_set_data(G_OBJECT(pic), "img_id", GINT_TO_POINTER(card->img_id));
         slot_set_en_name(pic, card->en_name);
+        slot_set_card_details(pic, card->type, card->sheet_name);
+        g_object_set_data(G_OBJECT(pic), "needs-card-metadata", card->needs_metadata);
     }
 
     *count = cards->len;

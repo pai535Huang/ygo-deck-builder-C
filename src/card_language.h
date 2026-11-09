@@ -6,6 +6,7 @@
 #include <libsoup/soup.h>
 
 const char *card_english_name(JsonObject *card);
+const char *card_deck_sheet_name(JsonObject *card);
 const char *card_original_name(JsonObject *card);
 const char *card_name_for_language(const char *original, const char *english);
 char *card_display_metadata(const char *metadata);

@@ -1,8 +1,12 @@
+#define _POSIX_C_SOURCE 200809L
+
 // 单元测试：取消“启用先行卡”后清空本地先行卡数据。
 // 通过 XDG_DATA_HOME 指向临时目录，避免触碰真实用户数据。
 #include <glib.h>
 #include <glib/gstdio.h>
 #include "prerelease.h"
+#include "data_directory.h"
+#include <unistd.h>
 
 static gchar *make_temp_data_home(void) {
     gchar *tmp = g_dir_make_tmp("ygo-prerelease-clear-XXXXXX", NULL);
@@ -34,8 +38,17 @@ test_clear_removes_all_data(void)
     g_assert_true(g_file_set_contents(image_path, "image", -1, &error));
     g_assert_no_error(error);
 
+    g_autofree char *outside = g_build_filename(data_home, "outside", NULL);
+    g_autofree char *sentinel = g_build_filename(outside, "keep", NULL);
+    g_autofree char *link = g_build_filename(pics_dir, "linked", NULL);
+    g_assert_cmpint(g_mkdir(outside, 0700), ==, 0);
+    g_assert_true(g_file_set_contents(sentinel, "keep", -1, NULL));
+    g_assert_cmpint(symlink(outside, link), ==, 0);
+
     g_assert_true(clear_prerelease_data());
     g_assert_false(g_file_test(data_dir, G_FILE_TEST_EXISTS));
+    g_assert_true(g_file_test(sentinel, G_FILE_TEST_IS_REGULAR));
+    g_assert_true(data_directory_remove(outside));
 
     g_remove(image_path);
     g_remove(etag_path);
@@ -66,6 +79,33 @@ test_clear_missing_directory_is_ok(void)
     g_free(data_home);
 }
 
+static void test_failed_replacement_keeps_previous_data(void) {
+    g_autofree char *root = g_dir_make_tmp("ygo-replace-XXXXXX", NULL);
+    g_assert_nonnull(root);
+    g_autofree char *live = g_build_filename(root, "live", NULL);
+    g_autofree char *replacement = g_build_filename(root, "replacement", NULL);
+    g_autofree char *backup = g_build_filename(root, "previous", NULL);
+    g_autofree char *original = g_build_filename(live, "cards.json", NULL);
+    g_assert_cmpint(g_mkdir(live, 0700), ==, 0);
+    g_assert_true(g_file_set_contents(original, "previous cards", -1, NULL));
+
+    g_autoptr(GError) error = NULL;
+    g_assert_false(data_directory_replace(live, replacement, backup, &error));
+    g_assert_nonnull(error);
+    g_assert_true(g_file_test(original, G_FILE_TEST_IS_REGULAR));
+
+    g_assert_cmpint(g_mkdir(replacement, 0700), ==, 0);
+    g_autofree char *new_cards = g_build_filename(replacement, "cards.json", NULL);
+    g_assert_true(g_file_set_contents(new_cards, "new cards", -1, NULL));
+    g_clear_error(&error);
+    g_assert_true(data_directory_replace(live, replacement, backup, &error));
+    g_assert_no_error(error);
+    g_autofree char *contents = NULL;
+    g_assert_true(g_file_get_contents(original, &contents, NULL, NULL));
+    g_assert_cmpstr(contents, ==, "new cards");
+    g_assert_true(data_directory_remove(root));
+}
+
 int
 main(int argc, char *argv[])
 {
@@ -74,6 +114,7 @@ main(int argc, char *argv[])
 
     g_test_add_func("/prerelease/clear-removes-all-data", test_clear_removes_all_data);
     g_test_add_func("/prerelease/clear-missing-directory", test_clear_missing_directory_is_ok);
+    g_test_add_func("/prerelease/replace-keeps-previous-data", test_failed_replacement_keeps_previous_data);
 
     return g_test_run();
 }

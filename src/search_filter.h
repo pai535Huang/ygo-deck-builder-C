@@ -5,14 +5,6 @@
 #include <json-glib/json-glib.h>
 #include "app_types.h"
 
-// 搜索结果图片加载数据结构
-typedef struct {
-    int img_id;
-    gboolean is_prerelease;
-    GtkWidget *target;
-    GtkStack *stack;
-} SearchImageToLoad;
-
 // 搜索与过滤相关回调
 void on_search_clicked(GtkButton *btn, gpointer user_data);
 void on_monster_filter_toggled(GtkCheckButton *btn, gpointer user_data);
@@ -27,13 +19,14 @@ void search_ui_watch_alt_art(SearchUI *ui);
 void search_response_cb(GObject *source, GAsyncResult *res, gpointer user_data);
 
 // 图片加载队列管理
-gboolean search_load_next_image(gpointer user_data);
+void search_ui_watch_viewport(SearchUI *ui, GtkAdjustment *adjustment);
 
 // 批量渲染管理
 void queue_result_for_render(SearchUI *ui, JsonObject *obj);
 gboolean batch_render_results(gpointer user_data);
 void add_result_row_immediate(SearchUI *ui, JsonObject *obj);
 void refresh_search_result_language(SearchUI *ui);
+void refresh_search_result_rules(SearchUI *ui);
 
 // 禁限卡表变化回调
 void on_forbidden_dropdown_changed(GtkDropDown *dropdown, GParamSpec *pspec, gpointer user_data);
