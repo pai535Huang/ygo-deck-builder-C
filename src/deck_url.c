@@ -2,7 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-// 协议字段限制（见 docs/deck encoding and decoding.md）：
+// 协议字段限制（见 docs/deck-url.md）：
 // 卡片 ID 为 27 位二进制，单卡数量为 2 位（1-3）
 #define DECK_URL_MAX_CARD_ID 134217727  /* 2^27 - 1 */
 #define DECK_URL_MAX_COPIES  3

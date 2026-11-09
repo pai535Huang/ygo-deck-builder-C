@@ -28,8 +28,7 @@ static int max_copies(const int *arr, int n) {
     return worst;
 }
 
-static void test_roundtrip_doc_example(void) {
-    // 文档示例卡组：单卡多张
+static void test_roundtrip_multiple_copies(void) {
     int main_cards[] = {89631139, 89631139, 89631139};
     int extra_cards[] = {44508094, 44508094};
     int side_cards[] = {14087893};
@@ -234,7 +233,7 @@ static void test_real_world_url(void) {
 }
 
 int main(void) {
-    test_roundtrip_doc_example();
+    test_roundtrip_multiple_copies();
     test_roundtrip_multi_unique();
     test_empty_deck();
     test_missing_ygotype();

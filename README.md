@@ -1,95 +1,47 @@
 # YGODBR
 
-一个基于 **GTK4** 和 **libadwaita** 的桌面端游戏王卡组编辑器。
+YGODBR 是面向 Linux 的游戏王卡组编辑器，基于 GTK 4 和 libadwaita。
 
 ![YGODBR 主界面，展示闪刀姬卡组、卡片预览和搜索结果](screenshot-sky-striker.png)
 
-## 项目特色
-- 提供完整的卡组编辑器体验，包括查卡、编辑卡组、导入/导出等功能
-- 支持在线/离线双模式，可从在线API（https://ygocdb.com/api）/本地数据库获取信息
-- 基于 GTK4 和 Adwaita 的现代化界面，适配 Linux 桌面环境
-- 自动生成本地图片缓存，降低对在线 API 的占用
-- 支持 GENESYS 规则模式，实时显示卡组总分
-- 卡图左上角显示禁限数量/GENESYS 分值角标，直观展示卡片状态
-- 支持异画切换：有异画的卡可在搜索结果中选择版本，并记住每张卡上次选择的异画
-
-## 依赖环境
-
-以下依赖以 `meson.build` 为准。
-
-### 1. 构建工具链依赖
-- C 编译器：GCC 或 Clang（支持 C11）
-- Meson >= 0.59.0
-- Ninja
-- pkg-config
-
-### 2. 编译依赖（开发头文件）
-- GTK4 >= 4.8
-- libadwaita-1 >= 1.2
-- json-glib-1.0
-- libsoup-3.0
-- gdk-pixbuf-2.0
-- libarchive
-- sqlite3
-- libxml2
-
-### 3. 运行时依赖
-- gtk4
-- libadwaita-1
-- json-glib-1.0
-- libsoup-3.0
-- gdk-pixbuf-2.0
-- libarchive
-- sqlite3
-- libxml2
+- 在线查卡，也可开启「离线数据」下载卡库并使用进阶筛选。支持先行卡和中英文界面。
+- 拖放编辑卡组、切换异画，支持 OCG、TCG、亚洲英文和简体中文禁限卡表，以及 GENESYS 计分。
+- 导入和导出 `.ydk` 文件或 [YGO-DA 卡组链接](docs/deck-url.md)，也可导出 PDF 卡表。
 
 ## 构建与运行
-简单运行方法如下：
 
-1. 安装依赖（以 Debian/Ubuntu 为例）：
-	```bash
-	sudo apt install build-essential clang meson ninja-build pkg-config \
-	  libgtk-4-dev libadwaita-1-dev libjson-glib-dev libsoup-3.0-dev \
-	  libgdk-pixbuf-2.0-dev libarchive-dev libsqlite3-dev libxml2-dev
-	```
-2. （可选）仅运行程序所需依赖：
-	```bash
-	sudo apt install libgtk-4-1 libadwaita-1-0 libjson-glib-1.0-0 libsoup-3.0-0 \
-	  libgdk-pixbuf-2.0-0 libarchive13 libsqlite3-0 libxml2
-	```
-3. 	```bash
-	meson setup build
-	```
-4. 	```bash
-	meson compile -C build
-	```
-5. （可选）运行单元测试：
-	```bash
-	meson test -C build
-	```
-6. 	```bash
-	./build/src/ygo-deck-builder
-	```
+需要支持 C11 的编译器、Meson ≥ 0.59、Ninja、GTK ≥ 4.14 和 libadwaita ≥ 1.5。以下命令适用于 Ubuntu 24.04。
 
-`tests/` 下的单元测试覆盖卡组 URL 编解码、压缩包条目名安全性（Zip Slip）、JsonNode 深拷贝独立性、`strings.conf` 字段解析与 `settings.conf` 布尔配置持久化。
+```sh
+sudo apt install build-essential meson ninja-build pkg-config libglib2.0-dev \
+  libgtk-4-dev libadwaita-1-dev libjson-glib-dev libsoup-3.0-dev \
+  libgdk-pixbuf-2.0-dev libarchive-dev libsqlite3-dev libxml2-dev
+```
 
-安装方法（包括系统级安装和便携模式）参见 [INSTALL.md](INSTALL.md)。
+在仓库根目录执行以下命令。
 
-## 使用说明
-- 在「主菜单 → 首选项 → 界面语言」可实时切换跟随系统、简体中文或 English。系统文件选择器的内置文案由桌面环境或启动时的工具包语言决定。
-- 英文界面使用卡库提供的官方英文卡名。预览时从 Konami 卡片数据库获取英文卡文并缓存，无英文版本或未缓存且无法联网时显示原始卡文。
-- 启动后可通过搜索栏检索卡片并自由编辑自己的卡组，支持类似 YGOPro 的点击和拖拽互动
-- 通过顶部菜单栏进行各种操作
-- 禁限卡表自动下载并可切换 OCG/TCG/简中版本，卡组内卡的数量会受到所选择卡表的限制
-- 应用菜单中的“启用先行卡”勾选后会持久化到配置；之后每次启动自动检查先行卡更新，上游 ETag 未变化时不会重复下载，断网时保留已有数据；取消勾选会清空本地先行卡数据
-- 图片缓存默认存储在 ~/.cache/ygo-deck-builder 中，可手动清除
-- 可以从文件/URL导入卡组，编辑好的卡组也可以导出为文件/URL
+```sh
+meson setup build
+meson compile -C build
+./build/src/ygo-deck-builder
+```
 
-## 待实现
-- ~~支持更多种筛选与排序（如限定种族/属性/攻击/守备的检索）~~
-- ~~利用 YGO-DA 协议（https://www.zybuluo.com/feihuaduo/note/1824534）将编辑好的卡组导出为分享 URL 或从其他人分享的 URL 直接加载卡组~~
-- 修复一些已知 bug
-- 进一步优化性能
+运行测试用 `meson test -C build`。
+
+## 安装与数据目录
+
+执行 `sudo meson install -C build` 安装程序和桌面启动项。卸载时执行 `sudo ninja -C build uninstall`。
+
+默认使用 XDG 目录。设置对应的环境变量可更改位置。
+
+| 用途 | 环境变量 | 默认目录 |
+| --- | --- | --- |
+| 配置 | `XDG_CONFIG_HOME` | `~/.config/ygo-deck-builder/` |
+| 卡库与禁限卡表 | `XDG_DATA_HOME` | `~/.local/share/ygo-deck-builder/` |
+| 缓存 | `XDG_CACHE_HOME` | `~/.cache/ygo-deck-builder/` |
+
+便携模式只需在可执行文件旁创建 `.portable`（例如 `touch build/src/.portable`）。下次启动时，程序会把配置、数据和缓存写入可执行文件所在目录。
 
 ## 许可证
-本项目采用 MIT 许可证。详见 [LICENSE](LICENSE) 文件。
+
+[MIT](LICENSE)
